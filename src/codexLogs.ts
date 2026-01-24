@@ -104,7 +104,12 @@ export function pickSessionForProcess(
 
 function getEventTimestamp(ev: any): number {
   const ts = ev.ts || ev.timestamp || ev.time || ev.created_at || ev.createdAt;
-  if (typeof ts === "number") return ts;
+  if (typeof ts === "number") {
+    if (ts < 100_000_000_000) {
+      return ts * 1000;
+    }
+    return ts;
+  }
   if (typeof ts === "string") {
     const parsed = Date.parse(ts);
     if (!Number.isNaN(parsed)) return parsed;
