@@ -169,6 +169,7 @@ function matchesQuery(agent, query) {
     agent.summary?.lastMessage,
     agent.summary?.lastTool,
     agent.summary?.lastPrompt,
+    agent.lastEventAt,
     agent.cmd,
     agent.cwd,
     agent.sessionPath,
@@ -278,6 +279,9 @@ function renderPanel(agent) {
     ["last message", summary.lastMessage],
     ["last prompt", summary.lastPrompt],
   ].filter((entry) => entry[1]);
+  const lastEventAt = agent.lastEventAt
+    ? new Date(agent.lastEventAt).toLocaleTimeString()
+    : null;
   const showMetadata = searchQuery.trim().length > 0;
   panelContent.innerHTML = `
     <div class="panel-section">
@@ -303,6 +307,7 @@ function renderPanel(agent) {
                 .join("")
             : "<div>-</div>"
         }
+        ${lastEventAt ? `<div><span class="panel-key">last event</span>${escapeHtml(lastEventAt)}</div>` : ""}
         <div><span class="panel-key">cpu</span>${escapeHtml(formatPercent(agent.cpu))}</div>
         <div><span class="panel-key">mem</span>${escapeHtml(formatBytes(agent.mem))}</div>
       </div>

@@ -21,6 +21,12 @@ All configuration is via environment variables.
 - `CONSENSUS_REDACT_PII`
   - Default: enabled
   - Set to `0` to disable redaction.
+- `CONSENSUS_EVENT_ACTIVE_MS`
+  - Default: `8000`
+  - Window after the last event to mark an agent active.
+- `CONSENSUS_CPU_ACTIVE`
+  - Default: `5`
+  - CPU threshold for marking an agent active.
 
 ## Example
 ```bash

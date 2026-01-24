@@ -20,6 +20,7 @@ interface TailState {
   offset: number;
   partial: string;
   events: EventSummary[];
+  lastEventAt?: number;
   lastCommand?: EventSummary;
   lastEdit?: EventSummary;
   lastMessage?: EventSummary;
@@ -268,6 +269,7 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     state.offset = 0;
     state.partial = "";
     state.events = [];
+    state.lastEventAt = undefined;
     state.lastCommand = undefined;
     state.lastEdit = undefined;
     state.lastMessage = undefined;
@@ -332,6 +334,7 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
         isError,
       };
       state.events.push(entry);
+      state.lastEventAt = Math.max(state.lastEventAt || 0, ts);
       if (kind === "command") state.lastCommand = entry;
       if (kind === "edit") state.lastEdit = entry;
       if (kind === "message") state.lastMessage = entry;
@@ -341,13 +344,16 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       if (state.events.length > MAX_EVENTS) {
         state.events = state.events.slice(-MAX_EVENTS);
       }
-    } else if (isError) {
+    } else {
+      state.lastEventAt = Math.max(state.lastEventAt || 0, ts);
+      if (isError) {
       state.lastError = {
         ts,
         type: typeof type === "string" ? type : "event",
         summary: "error",
         isError,
       };
+      }
     }
   }
 
@@ -363,6 +369,7 @@ export function summarizeTail(state: TailState): {
   model?: string;
   hasError: boolean;
   summary: WorkSummary;
+  lastEventAt?: number;
 } {
   const title = state.lastPrompt?.summary;
   const doing =
@@ -372,6 +379,7 @@ export function summarizeTail(state: TailState): {
     state.events[state.events.length - 1]?.summary;
   const events = state.events.slice(-20);
   const hasError = !!state.lastError || events.some((event) => event.isError);
+  const lastEventAt = state.lastEventAt || events[events.length - 1]?.ts;
   const summary: WorkSummary = {
     current: doing,
     lastCommand: state.lastCommand?.summary,
@@ -380,5 +388,5 @@ export function summarizeTail(state: TailState): {
     lastTool: state.lastTool?.summary,
     lastPrompt: state.lastPrompt?.summary,
   };
-  return { doing, title, events, model: state.model, hasError, summary };
+  return { doing, title, events, model: state.model, hasError, summary, lastEventAt };
 }

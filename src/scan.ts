@@ -5,6 +5,7 @@ import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import type { AgentKind, AgentSnapshot, SnapshotPayload, WorkSummary } from "./types.js";
+import { deriveState } from "./activity.js";
 import {
   listRecentSessions,
   pickSessionForProcess,
@@ -187,6 +188,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     let hasError = false;
     let title: string | undefined;
     let summary: WorkSummary | undefined;
+    let lastEventAt: number | undefined;
 
     if (session) {
       const tail = await updateTail(session.path);
@@ -198,6 +200,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
         hasError = tailSummary.hasError;
         title = normalizeTitle(tailSummary.title);
         summary = tailSummary.summary;
+        lastEventAt = tailSummary.lastEventAt;
       }
     }
 
@@ -214,7 +217,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const repoRoot = cwdRaw ? findRepoRoot(cwdRaw) : null;
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
 
-    const state = hasError ? "error" : cpu > 5 ? "active" : "idle";
+    const state = deriveState({ cpu, hasError, lastEventAt });
     const cmdRaw = proc.cmd || proc.name || "";
     const cmd = redactText(cmdRaw) || cmdRaw;
     const cmdShort = shortenCmd(cmd);
@@ -229,6 +232,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       id,
       pid: proc.pid,
       startedAt,
+      lastEventAt,
       title: redactText(computedTitle) || computedTitle,
       cmd,
       cmdShort,

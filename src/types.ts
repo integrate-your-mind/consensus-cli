@@ -21,6 +21,7 @@ export interface AgentSnapshot {
   id: string;
   pid: number;
   startedAt?: number;
+  lastEventAt?: number;
   title?: string;
   cmd: string;
   cmdShort: string;
