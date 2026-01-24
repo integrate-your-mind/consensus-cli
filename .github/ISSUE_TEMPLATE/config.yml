@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and support
+    url: https://github.com/integrate-your-mind/consensus-cli/discussions
+    about: Please start a discussion for help or usage questions.

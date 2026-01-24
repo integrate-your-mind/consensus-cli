@@ -1,0 +1,56 @@
+{
+  "name": "consensus-cli",
+  "version": "0.1.0",
+  "private": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/integrate-your-mind/consensus-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/integrate-your-mind/consensus-cli/issues"
+  },
+  "homepage": "https://github.com/integrate-your-mind/consensus-cli#readme",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "consensus": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "public",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "scan": "node dist/scan.js",
+    "tail": "node dist/tail.js",
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "node --test --import tsx tests/unit/**/*.test.ts",
+    "test:integration": "node --test --import tsx tests/integration/**/*.test.ts",
+    "test:watch": "node --test --watch --import tsx tests/unit/**/*.test.ts tests/integration/**/*.test.ts",
+    "test:ui": "playwright test",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pidusage": "^3.0.2",
+    "ps-list": "^8.1.1",
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.0",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.2",
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.15.7",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
