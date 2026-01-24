@@ -320,16 +320,33 @@ body {
   margin-top: 6px;
   background: var(--idle);
   box-shadow: 0 0 10px transparent;
+  transform-origin: center;
 }
 
 .lane-pill.active {
   background: var(--active);
   box-shadow: 0 0 12px rgba(81, 195, 165, 0.5);
+  animation: lanePulse 1.3s ease-in-out infinite;
 }
 
 .lane-pill.error {
   background: var(--error);
   box-shadow: 0 0 12px rgba(209, 88, 75, 0.5);
+}
+
+@keyframes lanePulse {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 10px rgba(81, 195, 165, 0.35);
+  }
+  50% {
+    transform: scale(1.35);
+    box-shadow: 0 0 16px rgba(81, 195, 165, 0.6);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 10px rgba(81, 195, 165, 0.35);
+  }
 }
 
 .lane-copy {

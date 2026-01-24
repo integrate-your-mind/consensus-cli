@@ -399,9 +399,14 @@ function draw() {
     const palette = statePalette[item.agent.state] || statePalette.idle;
     const memMB = item.agent.mem / (1024 * 1024);
     const heightBase = Math.min(120, Math.max(18, memMB * 0.4));
+    const isActive = item.agent.state === "active";
     const pulse =
-      item.agent.state === "active" && !reducedMotion
+      isActive && !reducedMotion
         ? 4 + Math.sin(time / 200) * 3
+        : 0;
+    const pulsePhase =
+      isActive && !reducedMotion
+        ? (Math.sin(time / 240) + 1) / 2
         : 0;
     const idleScale = item.agent.state === "idle" ? 0.6 : 1;
     const height = heightBase * idleScale + pulse;
@@ -424,6 +429,31 @@ function draw() {
       palette.stroke,
       null
     );
+
+    if (isActive) {
+      const glowAlpha = 0.12 + pulsePhase * 0.22;
+      const capAlpha = 0.16 + pulsePhase * 0.28;
+      ctx.save();
+      drawDiamond(
+        ctx,
+        x,
+        y + tileH * 0.02,
+        tileW * 0.92,
+        tileH * 0.46,
+        `rgba(87, 242, 198, ${glowAlpha})`,
+        null
+      );
+      drawDiamond(
+        ctx,
+        x,
+        y - height - tileH * 0.18,
+        roofSize * 0.82,
+        roofSize * 0.42,
+        `rgba(87, 242, 198, ${capAlpha})`,
+        null
+      );
+      ctx.restore();
+    }
 
     if (selected && selected.id === item.agent.id) {
       drawDiamond(ctx, x, y, tileW + 10, tileH + 6, "rgba(0,0,0,0)", "#57f2c6");
