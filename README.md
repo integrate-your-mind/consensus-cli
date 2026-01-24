@@ -1,4 +1,4 @@
-# consensus
+# consensus-cli
 
 Live isometric atlas for Codex CLI processes, rendered in a local browser.
 

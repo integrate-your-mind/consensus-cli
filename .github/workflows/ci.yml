@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - init-oss
 
 jobs:
   build:
