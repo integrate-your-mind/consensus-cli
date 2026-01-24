@@ -5,7 +5,7 @@ import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import type { AgentKind, AgentSnapshot, SnapshotPayload, WorkSummary } from "./types.js";
-import { deriveState } from "./activity.js";
+import { deriveStateWithHold } from "./activity.js";
 import {
   listRecentSessions,
   pickSessionForProcess,
@@ -17,6 +17,7 @@ import { redactText } from "./redact.js";
 
 const execFileAsync = promisify(execFile);
 const repoCache = new Map<string, string | null>();
+const activityCache = new Map<string, { lastActiveAt?: number; lastSeenAt: number }>();
 
 function isCodexProcess(cmd: string | undefined, name: string | undefined, matchRe?: RegExp): boolean {
   if (!cmd && !name) return false;
@@ -148,6 +149,7 @@ function findRepoRoot(cwd: string): string | null {
 }
 
 export async function scanCodexProcesses(): Promise<SnapshotPayload> {
+  const now = Date.now();
   const matchEnv = process.env.CONSENSUS_PROCESS_MATCH;
   let matchRe: RegExp | undefined;
   if (matchEnv) {
@@ -173,6 +175,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
   const sessions = await listRecentSessions(codexHome);
 
   const agents: AgentSnapshot[] = [];
+  const seenIds = new Set<string>();
   for (const proc of codexProcs) {
     const stats = usage[proc.pid] || ({} as pidusage.Status);
     const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
@@ -217,12 +220,22 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const repoRoot = cwdRaw ? findRepoRoot(cwdRaw) : null;
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
 
-    const state = deriveState({ cpu, hasError, lastEventAt });
+    const id = `${proc.pid}`;
+    const cached = activityCache.get(id);
+    const activity = deriveStateWithHold({
+      cpu,
+      hasError,
+      lastEventAt,
+      previousActiveAt: cached?.lastActiveAt,
+      now,
+    });
+    const state = activity.state;
+    activityCache.set(id, { lastActiveAt: activity.lastActiveAt, lastSeenAt: now });
+    seenIds.add(id);
     const cmdRaw = proc.cmd || proc.name || "";
     const cmd = redactText(cmdRaw) || cmdRaw;
     const cmdShort = shortenCmd(cmd);
     const kind = inferKind(cmd);
-    const id = `${proc.pid}`;
     const startedAt = startMs ? Math.floor(startMs / 1000) : undefined;
 
     const computedTitle = title || deriveTitle(doing, repoName, proc.pid);
@@ -250,7 +263,13 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     });
   }
 
-  return { ts: Date.now(), agents };
+  for (const id of activityCache.keys()) {
+    if (!seenIds.has(id)) {
+      activityCache.delete(id);
+    }
+  }
+
+  return { ts: now, agents };
 }
 
 const isDirectRun = process.argv[1] && process.argv[1].endsWith("scan.js");

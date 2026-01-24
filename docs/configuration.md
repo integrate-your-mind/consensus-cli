@@ -27,6 +27,9 @@ All configuration is via environment variables.
 - `CONSENSUS_CPU_ACTIVE`
   - Default: `5`
   - CPU threshold for marking an agent active.
+- `CONSENSUS_ACTIVE_HOLD_MS`
+  - Default: `15000`
+  - Keep agents active for this long after activity.
 
 ## Example
 ```bash

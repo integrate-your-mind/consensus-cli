@@ -66,6 +66,7 @@ consensus dev server running on http://127.0.0.1:8787
 - `CONSENSUS_REDACT_PII`: set to `0` to disable redaction (default enabled).
 - `CONSENSUS_EVENT_ACTIVE_MS`: active window after last event in ms (default `8000`).
 - `CONSENSUS_CPU_ACTIVE`: CPU threshold for active state (default `5`).
+- `CONSENSUS_ACTIVE_HOLD_MS`: keep active state this long after activity (default `15000`).
 
 Full config details: `docs/configuration.md`
 
