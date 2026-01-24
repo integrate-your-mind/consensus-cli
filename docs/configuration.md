@@ -22,13 +22,13 @@ All configuration is via environment variables.
   - Default: enabled
   - Set to `0` to disable redaction.
 - `CONSENSUS_EVENT_ACTIVE_MS`
-  - Default: `8000`
+  - Default: `300000`
   - Window after the last event to mark an agent active.
 - `CONSENSUS_CPU_ACTIVE`
-  - Default: `5`
+  - Default: `1`
   - CPU threshold for marking an agent active.
 - `CONSENSUS_ACTIVE_HOLD_MS`
-  - Default: `15000`
+  - Default: `600000`
   - Keep agents active for this long after activity.
 
 ## Example

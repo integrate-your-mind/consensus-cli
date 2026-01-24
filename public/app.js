@@ -49,6 +49,53 @@ let searchMatches = new Set();
 const layout = new Map();
 const occupied = new Map();
 
+function ensureSelectedVisible(agent) {
+  if (!agent || !panel.classList.contains("open")) return;
+  if (view.dragging) return;
+  const panelRect = panel.getBoundingClientRect();
+  if (panelRect.width >= window.innerWidth * 0.8) return;
+  const key = keyForAgent(agent);
+  const coord = layout.get(key);
+  if (!coord) return;
+
+  const screen = isoToScreen(coord.x, coord.y, tileW, tileH);
+  const memMB = (agent.mem || 0) / (1024 * 1024);
+  const heightBase = Math.min(120, Math.max(18, memMB * 0.4));
+  const idleScale = agent.state === "idle" ? 0.6 : 1;
+  const height = heightBase * idleScale;
+
+  const targetX = view.x + screen.x * view.scale;
+  const targetY = view.y + screen.y * view.scale;
+  const halfW = (tileW / 2) * view.scale;
+  const halfH = (tileH / 2) * view.scale;
+  const padding = 36;
+  const viewportWidth = window.innerWidth - panelRect.width;
+  const viewportHeight = window.innerHeight;
+
+  const left = targetX - halfW;
+  const right = targetX + halfW;
+  const top = targetY - (height + tileH * 0.6) * view.scale;
+  const bottom = targetY + (halfH + tileH * 0.6) * view.scale;
+
+  let dx = 0;
+  let dy = 0;
+  if (right > viewportWidth - padding) {
+    dx = viewportWidth - padding - right;
+  } else if (left < padding) {
+    dx = padding - left;
+  }
+  if (top < padding) {
+    dy = padding - top;
+  } else if (bottom > viewportHeight - padding) {
+    dy = viewportHeight - padding - bottom;
+  }
+
+  if (dx !== 0 || dy !== 0) {
+    view.x += dx;
+    view.y += dy;
+  }
+}
+
 function resize() {
   deviceScale = window.devicePixelRatio || 1;
   canvas.width = window.innerWidth * deviceScale;
@@ -369,13 +416,16 @@ function draw() {
     ctx.fillStyle = "rgba(228, 230, 235, 0.6)";
     ctx.font = "16px Space Grotesk";
     ctx.textAlign = "center";
-    ctx.fillText("No codex processes found", 0, 0);
-    ctx.restore();
-    requestAnimationFrame(draw);
-    return;
+  ctx.fillText("No codex processes found", 0, 0);
+  ctx.restore();
+  requestAnimationFrame(draw);
+  return;
   }
 
   updateLayout(agents);
+  if (selected) {
+    ensureSelectedVisible(selected);
+  }
 
   const drawList = agents
     .map((agent) => {

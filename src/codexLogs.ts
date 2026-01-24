@@ -7,6 +7,7 @@ import { redactText } from "./redact.js";
 
 const SESSION_WINDOW_MS = 30 * 60 * 1000;
 const SESSION_SCAN_INTERVAL_MS = 5000;
+const SESSION_ID_SCAN_INTERVAL_MS = 60000;
 const MAX_READ_BYTES = 512 * 1024;
 const MAX_EVENTS = 50;
 
@@ -21,6 +22,7 @@ interface TailState {
   partial: string;
   events: EventSummary[];
   lastEventAt?: number;
+  inFlight?: boolean;
   lastCommand?: EventSummary;
   lastEdit?: EventSummary;
   lastMessage?: EventSummary;
@@ -33,6 +35,8 @@ interface TailState {
 let cachedSessions: SessionFile[] = [];
 let lastSessionScan = 0;
 const tailStates = new Map<string, TailState>();
+const sessionIdCache = new Map<string, string | null>();
+const sessionIdLastScan = new Map<string, number>();
 
 export function resolveCodexHome(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.CONSENSUS_CODEX_HOME || env.CODEX_HOME;
@@ -67,6 +71,35 @@ async function walk(dir: string, out: SessionFile[], windowMs: number): Promise<
   );
 }
 
+async function findSessionFile(
+  dir: string,
+  sessionId: string
+): Promise<SessionFile | undefined> {
+  let entries: fs.Dirent[];
+  try {
+    entries = await fsp.readdir(dir, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const found = await findSessionFile(fullPath, sessionId);
+      if (found) return found;
+      continue;
+    }
+    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+    if (!entry.name.includes(sessionId)) continue;
+    try {
+      const stat = await fsp.stat(fullPath);
+      return { path: fullPath, mtimeMs: stat.mtimeMs };
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 export async function listRecentSessions(
   codexHome: string,
   windowMs: number = SESSION_WINDOW_MS
@@ -82,6 +115,32 @@ export async function listRecentSessions(
   results.sort((a, b) => b.mtimeMs - a.mtimeMs);
   cachedSessions = results;
   return results;
+}
+
+export async function findSessionById(
+  codexHome: string,
+  sessionId: string
+): Promise<SessionFile | undefined> {
+  const now = Date.now();
+  const lastScan = sessionIdLastScan.get(sessionId) || 0;
+  if (now - lastScan < SESSION_ID_SCAN_INTERVAL_MS) {
+    const cached = sessionIdCache.get(sessionId);
+    if (cached) {
+      try {
+        const stat = await fsp.stat(cached);
+        return { path: cached, mtimeMs: stat.mtimeMs };
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+
+  sessionIdLastScan.set(sessionId, now);
+  const sessionsDir = path.join(codexHome, "sessions");
+  const found = await findSessionFile(sessionsDir, sessionId);
+  sessionIdCache.set(sessionId, found ? found.path : null);
+  return found;
 }
 
 export function pickSessionForProcess(
@@ -320,6 +379,8 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
   const lines = combined.split(/\r?\n/);
   state.partial = lines.pop() || "";
 
+  const startRe = /(turn|item|response)\.started/i;
+  const endRe = /(turn|item|response)\.(completed|failed|errored)/i;
   for (const line of lines) {
     if (!line.trim()) continue;
     let ev: any;
@@ -331,6 +392,10 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     const ts = getEventTimestamp(ev);
     const { summary, kind, isError, model, type } = summarizeEvent(ev);
     if (model) state.model = model;
+    if (typeof type === "string") {
+      if (startRe.test(type)) state.inFlight = true;
+      if (endRe.test(type)) state.inFlight = false;
+    }
     if (summary) {
       const entry: EventSummary = {
         ts,
@@ -375,6 +440,7 @@ export function summarizeTail(state: TailState): {
   hasError: boolean;
   summary: WorkSummary;
   lastEventAt?: number;
+  inFlight?: boolean;
 } {
   const title = state.lastPrompt?.summary;
   const doing =
@@ -393,5 +459,14 @@ export function summarizeTail(state: TailState): {
     lastTool: state.lastTool?.summary,
     lastPrompt: state.lastPrompt?.summary,
   };
-  return { doing, title, events, model: state.model, hasError, summary, lastEventAt };
+  return {
+    doing,
+    title,
+    events,
+    model: state.model,
+    hasError,
+    summary,
+    lastEventAt,
+    inFlight: state.inFlight,
+  };
 }

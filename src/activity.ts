@@ -1,13 +1,14 @@
 import type { AgentState } from "./types.js";
 
-const DEFAULT_CPU_THRESHOLD = 5;
-const DEFAULT_EVENT_WINDOW_MS = 8000;
-const DEFAULT_ACTIVE_HOLD_MS = 15000;
+const DEFAULT_CPU_THRESHOLD = 1;
+const DEFAULT_EVENT_WINDOW_MS = 300000;
+const DEFAULT_ACTIVE_HOLD_MS = 600000;
 
 export interface ActivityInput {
   cpu: number;
   hasError: boolean;
   lastEventAt?: number;
+  inFlight?: boolean;
   now?: number;
   cpuThreshold?: number;
   eventWindowMs?: number;
@@ -25,7 +26,8 @@ export function deriveState(input: ActivityInput): AgentState {
   const eventActive =
     typeof input.lastEventAt === "number" &&
     now - input.lastEventAt <= eventWindowMs;
-  return cpuActive || eventActive ? "active" : "idle";
+  const inFlight = !!input.inFlight;
+  return cpuActive || eventActive || inFlight ? "active" : "idle";
 }
 
 export interface ActivityHoldInput extends ActivityInput {

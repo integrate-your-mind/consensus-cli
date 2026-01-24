@@ -8,6 +8,7 @@ import type { AgentKind, AgentSnapshot, SnapshotPayload, WorkSummary } from "./t
 import { deriveStateWithHold } from "./activity.js";
 import {
   listRecentSessions,
+  findSessionById,
   pickSessionForProcess,
   resolveCodexHome,
   summarizeTail,
@@ -25,6 +26,7 @@ function isCodexProcess(cmd: string | undefined, name: string | undefined, match
     return matchRe.test(cmd || "") || matchRe.test(name || "");
   }
   const cmdLine = cmd || "";
+  if (cmdLine.includes("/codex/vendor/")) return false;
   if (name === "codex") return true;
   if (cmdLine === "codex" || cmdLine.startsWith("codex ")) return true;
   if (cmdLine.includes("/codex") || cmdLine.includes(" codex ")) return true;
@@ -71,6 +73,21 @@ function parseDoingFromCmd(cmd: string): string | undefined {
   }
   if (cmd.includes("app-server")) return "app-server";
   if (cmd.startsWith("codex")) return "codex";
+  return undefined;
+}
+
+function extractSessionId(cmd: string): string | undefined {
+  const parts = cmd.split(/\s+/g);
+  const resumeIndex = parts.indexOf("resume");
+  if (resumeIndex !== -1) {
+    const token = parts[resumeIndex + 1];
+    if (token && /^[0-9a-fA-F-]{16,}$/.test(token)) return token;
+  }
+  const sessionFlag = parts.findIndex((part) => part === "--session" || part === "--session-id");
+  if (sessionFlag !== -1) {
+    const token = parts[sessionFlag + 1];
+    if (token && /^[0-9a-fA-F-]{16,}$/.test(token)) return token;
+  }
   return undefined;
 }
 
@@ -131,6 +148,29 @@ async function getCwdsForPids(pids: number[]): Promise<Map<number, string>> {
   return result;
 }
 
+async function getStartTimesForPids(pids: number[]): Promise<Map<number, number>> {
+  const result = new Map<number, number>();
+  if (pids.length === 0) return result;
+  if (process.platform === "win32") return result;
+  try {
+    const { stdout } = await execFileAsync("ps", ["-o", "pid=,lstart=", "-p", pids.join(",")]);
+    const lines = stdout.split(/\r?\n/).filter(Boolean);
+    for (const line of lines) {
+      const match = line.match(/^\s*(\d+)\s+(.*)$/);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      const dateStr = match[2].trim();
+      const parsed = Date.parse(dateStr);
+      if (!Number.isNaN(parsed)) {
+        result.set(pid, parsed);
+      }
+    }
+  } catch {
+    return result;
+  }
+  return result;
+}
+
 function findRepoRoot(cwd: string): string | null {
   if (repoCache.has(cwd)) return repoCache.get(cwd) || null;
   let current = cwd;
@@ -171,6 +211,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
   }
 
   const cwds = await getCwdsForPids(pids);
+  const startTimes = await getStartTimesForPids(pids);
   const codexHome = resolveCodexHome();
   const sessions = await listRecentSessions(codexHome);
 
@@ -182,9 +223,17 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const mem = typeof stats.memory === "number" ? stats.memory : 0;
 
     const elapsed = (stats as pidusage.Status & { elapsed?: number }).elapsed;
-    const startMs = typeof elapsed === "number" ? Date.now() - elapsed : undefined;
+    const startMs =
+      typeof elapsed === "number"
+        ? Date.now() - elapsed
+        : startTimes.get(proc.pid);
 
-    const session = pickSessionForProcess(sessions, startMs);
+    const cmdRaw = proc.cmd || proc.name || "";
+    const sessionId = extractSessionId(cmdRaw);
+    const session =
+      (sessionId && sessions.find((item) => item.path.includes(sessionId))) ||
+      (sessionId ? await findSessionById(codexHome, sessionId) : undefined) ||
+      pickSessionForProcess(sessions, startMs);
     let doing: string | undefined;
     let events: AgentSnapshot["events"];
     let model: string | undefined;
@@ -192,6 +241,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     let title: string | undefined;
     let summary: WorkSummary | undefined;
     let lastEventAt: number | undefined;
+    let inFlight = false;
 
     if (session) {
       const tail = await updateTail(session.path);
@@ -204,6 +254,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
         title = normalizeTitle(tailSummary.title);
         summary = tailSummary.summary;
         lastEventAt = tailSummary.lastEventAt;
+        inFlight = !!tailSummary.inFlight;
       }
     }
 
@@ -226,13 +277,13 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       cpu,
       hasError,
       lastEventAt,
+      inFlight,
       previousActiveAt: cached?.lastActiveAt,
       now,
     });
     const state = activity.state;
     activityCache.set(id, { lastActiveAt: activity.lastActiveAt, lastSeenAt: now });
     seenIds.add(id);
-    const cmdRaw = proc.cmd || proc.name || "";
     const cmd = redactText(cmdRaw) || cmdRaw;
     const cmdShort = shortenCmd(cmd);
     const kind = inferKind(cmd);

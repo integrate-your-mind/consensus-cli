@@ -4,13 +4,25 @@ import { deriveState, deriveStateWithHold } from "../../src/activity.ts";
 
 test("marks active when recent event exists", () => {
   const now = Date.now();
-  const state = deriveState({ cpu: 0.1, hasError: false, lastEventAt: now - 1000, now });
+  const state = deriveState({
+    cpu: 0.1,
+    hasError: false,
+    lastEventAt: now - 1000,
+    now,
+    eventWindowMs: 5000,
+  });
   assert.equal(state, "active");
 });
 
 test("marks idle when no recent activity", () => {
   const now = Date.now();
-  const state = deriveState({ cpu: 0.1, hasError: false, lastEventAt: now - 20000, now });
+  const state = deriveState({
+    cpu: 0.1,
+    hasError: false,
+    lastEventAt: now - 20000,
+    now,
+    eventWindowMs: 5000,
+  });
   assert.equal(state, "idle");
 });
 
@@ -27,6 +39,7 @@ test("holds active state for a grace window", () => {
     lastEventAt: now - 1000,
     now,
     holdMs: 10000,
+    eventWindowMs: 5000,
   });
   assert.equal(first.state, "active");
   const second = deriveStateWithHold({
@@ -36,6 +49,7 @@ test("holds active state for a grace window", () => {
     previousActiveAt: first.lastActiveAt,
     now: now + 5000,
     holdMs: 10000,
+    eventWindowMs: 5000,
   });
   assert.equal(second.state, "active");
   const third = deriveStateWithHold({
@@ -45,6 +59,7 @@ test("holds active state for a grace window", () => {
     previousActiveAt: first.lastActiveAt,
     now: now + 15001,
     holdMs: 10000,
+    eventWindowMs: 5000,
   });
   assert.equal(third.state, "idle");
 });
