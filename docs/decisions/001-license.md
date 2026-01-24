@@ -9,10 +9,10 @@ Pick a license that is permissive and supports commercial adoption.
 - GPLv3
 
 ## Decision
-MIT.
+Apache-2.0.
 
 ## Tradeoffs
-- MIT is permissive and simple, but has no explicit patent grant.
+- Apache-2.0 is permissive with an explicit patent grant, but longer text.
 
 ## Revisit
-If patent protection becomes a priority, consider Apache-2.0.
+If we ever want strong copyleft, revisit GPL/AGPL options.

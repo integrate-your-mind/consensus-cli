@@ -116,7 +116,7 @@ See `ROADMAP.md`.
 See `SUPPORT.md`.
 
 ## License and trademark
-MIT License. See `LICENSE`.
+Apache-2.0 License. See `LICENSE`.
 
 "consensus" is a project name used by the maintainer. Please do not imply
 endorsement or use logos without permission.

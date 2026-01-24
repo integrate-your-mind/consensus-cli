@@ -8,3 +8,4 @@ This project follows Semantic Versioning.
 ## 0.1.0 - 2026-01-24
 - Initial public release.
 - Improve work summaries and recent events (latest-first, event-only fallback).
+- License: Apache-2.0.
