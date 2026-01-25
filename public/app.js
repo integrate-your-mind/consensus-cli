@@ -9,8 +9,10 @@ const panelClose = document.getElementById("panel-close");
 const statusEl = document.getElementById("status");
 const countEl = document.getElementById("count");
 const activeList = document.getElementById("active-list");
+const serverList = document.getElementById("server-list");
 const searchInput = document.getElementById("search");
 const laneTitle = document.querySelector(".lane-title");
+const serverTitle = document.querySelector(".server-title");
 
 const tileW = 96;
 const tileH = 48;
@@ -23,6 +25,11 @@ const statePalette = {
   active: { top: "#3d8f7f", left: "#2d6d61", right: "#275b52", stroke: "#54cdb1" },
   idle: { top: "#384a57", left: "#2b3943", right: "#25323b", stroke: "#4f6b7a" },
   error: { top: "#82443c", left: "#6d3530", right: "#5a2c28", stroke: "#d1584b" },
+};
+const serverPalette = {
+  active: { top: "#7d6a2b", left: "#665725", right: "#54481f", stroke: "#f5c453" },
+  idle: { top: "#353b42", left: "#272c33", right: "#1f242a", stroke: "#6b7380" },
+  error: statePalette.error,
 };
 const stateOpacity = {
   active: 1,
@@ -119,12 +126,16 @@ function hashString(input) {
   return Math.abs(hash);
 }
 
-function keyForAgent(agent) {
+function groupKeyForAgent(agent) {
   return agent.repo || agent.cwd || agent.cmd || agent.id;
 }
 
-function assignCoordinate(key) {
-  const hash = hashString(key);
+function keyForAgent(agent) {
+  return `${groupKeyForAgent(agent)}::${agent.id}`;
+}
+
+function assignCoordinate(key, baseKey) {
+  const hash = hashString(baseKey || key);
   const baseX = (hash % 16) - 8;
   const baseY = ((hash >> 4) % 16) - 8;
   const maxRadius = 20;
@@ -152,9 +163,10 @@ function updateLayout(newAgents) {
   const activeKeys = new Set();
   for (const agent of newAgents) {
     const key = keyForAgent(agent);
+    const baseKey = groupKeyForAgent(agent);
     activeKeys.add(key);
     if (!layout.has(key)) {
-      assignCoordinate(key);
+      assignCoordinate(key, baseKey);
     }
   }
 
@@ -170,8 +182,14 @@ function setStatus(text) {
   statusEl.textContent = text;
 }
 
-function setCount(count) {
-  countEl.textContent = `${count} agent${count === 1 ? "" : "s"}`;
+function setCount(agentCount, serverCount) {
+  const agentLabel = `${agentCount} agent${agentCount === 1 ? "" : "s"}`;
+  if (typeof serverCount === "number") {
+    const serverLabel = `${serverCount} server${serverCount === 1 ? "" : "s"}`;
+    countEl.textContent = `${agentLabel} • ${serverLabel}`;
+    return;
+  }
+  countEl.textContent = agentLabel;
 }
 
 function formatBytes(bytes) {
@@ -198,6 +216,26 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/\"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function isServerKind(kind) {
+  return kind === "app-server" || kind === "opencode-server";
+}
+
+function paletteFor(agent) {
+  if (isServerKind(agent.kind)) {
+    return serverPalette[agent.state] || serverPalette.idle;
+  }
+  return statePalette[agent.state] || statePalette.idle;
+}
+
+function accentFor(agent) {
+  return isServerKind(agent.kind) ? "#f5c453" : "#57f2c6";
+}
+
+function accentGlow(agent, alpha) {
+  const tint = isServerKind(agent.kind) ? "245, 196, 83" : "87, 242, 198";
+  return `rgba(${tint}, ${alpha})`;
 }
 
 function labelFor(agent) {
@@ -267,10 +305,10 @@ function drawTag(ctx, x, y, text, accent) {
   ctx.restore();
 }
 
-function renderActiveList(items) {
-  if (!activeList) return;
+function renderLaneList(items, container, emptyLabel) {
+  if (!container) return;
   if (!items.length) {
-    activeList.innerHTML = "<div class=\"lane-meta\">No active agents.</div>";
+    container.innerHTML = `<div class="lane-meta">${emptyLabel}</div>`;
     return;
   }
   const sorted = [...items].sort((a, b) => {
@@ -281,7 +319,7 @@ function renderActiveList(items) {
     return b.cpu - a.cpu;
   });
 
-  activeList.innerHTML = sorted
+  container.innerHTML = sorted
     .map((agent) => {
       const doingRaw = agent.summary?.current || agent.doing || agent.cmdShort || "";
       const doing = escapeHtml(truncate(doingRaw, 80));
@@ -299,7 +337,7 @@ function renderActiveList(items) {
     })
     .join("");
 
-  Array.from(activeList.querySelectorAll(".lane-item")).forEach((item) => {
+  Array.from(container.querySelectorAll(".lane-item")).forEach((item) => {
     item.addEventListener("click", () => {
       const id = item.getAttribute("data-id");
       selected = sorted.find((agent) => agent.id === id) || null;
@@ -446,10 +484,14 @@ function draw() {
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   for (const item of drawList) {
-    const palette = statePalette[item.agent.state] || statePalette.idle;
+    const palette = paletteFor(item.agent);
     const memMB = item.agent.mem / (1024 * 1024);
     const heightBase = Math.min(120, Math.max(18, memMB * 0.4));
     const isActive = item.agent.state === "active";
+    const isServer = isServerKind(item.agent.kind);
+    const accent = accentFor(item.agent);
+    const accentStrong = isServer ? "rgba(245, 196, 83, 0.6)" : "rgba(87, 242, 198, 0.6)";
+    const accentSoft = isServer ? "rgba(245, 196, 83, 0.35)" : "rgba(87, 242, 198, 0.35)";
     const pulse =
       isActive && !reducedMotion
         ? 4 + Math.sin(time / 200) * 3
@@ -490,7 +532,7 @@ function draw() {
         y + tileH * 0.02,
         tileW * 0.92,
         tileH * 0.46,
-        `rgba(87, 242, 198, ${glowAlpha})`,
+        accentGlow(item.agent, glowAlpha),
         null
       );
       drawDiamond(
@@ -499,14 +541,14 @@ function draw() {
         y - height - tileH * 0.18,
         roofSize * 0.82,
         roofSize * 0.42,
-        `rgba(87, 242, 198, ${capAlpha})`,
+        accentGlow(item.agent, capAlpha),
         null
       );
       ctx.restore();
     }
 
     if (selected && selected.id === item.agent.id) {
-      drawDiamond(ctx, x, y, tileW + 10, tileH + 6, "rgba(0,0,0,0)", "#57f2c6");
+      drawDiamond(ctx, x, y, tileW + 10, tileH + 6, "rgba(0,0,0,0)", accent);
     }
 
     ctx.fillStyle = "rgba(10, 12, 15, 0.6)";
@@ -519,15 +561,21 @@ function draw() {
     const showActiveTag = topActiveIds.has(item.agent.id);
     if (isHovered || isSelected) {
       const label = truncate(labelFor(item.agent), 20);
-      drawTag(ctx, x, y - height - tileH * 0.6, label, "rgba(87, 242, 198, 0.6)");
+      drawTag(ctx, x, y - height - tileH * 0.6, label, accentStrong);
       const doing = truncate(item.agent.summary?.current || item.agent.doing || "", 36);
-      drawTag(ctx, x, y - height - tileH * 0.9, doing, "rgba(87, 242, 198, 0.35)");
+      drawTag(ctx, x, y - height - tileH * 0.9, doing, accentSoft);
+      if (isServer) {
+        drawTag(ctx, x, y + tileH * 0.2, "server", "rgba(79, 107, 122, 0.6)");
+      }
     } else if (showActiveTag) {
       const doing = truncate(
         item.agent.summary?.current || item.agent.doing || labelFor(item.agent),
         32
       );
-      drawTag(ctx, x, y - height - tileH * 0.7, doing, "rgba(87, 242, 198, 0.35)");
+      drawTag(ctx, x, y - height - tileH * 0.7, doing, accentSoft);
+      if (isServer) {
+        drawTag(ctx, x, y + tileH * 0.2, "server", "rgba(79, 107, 122, 0.6)");
+      }
     }
 
     hitList.push({
@@ -680,7 +728,9 @@ function connect() {
 
 function applySnapshot(payload) {
   agents = payload.agents || [];
-  setCount(agents.length);
+  const serverAgents = agents.filter((agent) => isServerKind(agent.kind));
+  const agentNodes = agents.filter((agent) => !isServerKind(agent.kind));
+  setCount(agentNodes.length, serverAgents.length);
   const query = searchQuery.trim().toLowerCase();
   searchMatches = new Set(
     query ? agents.filter((agent) => matchesQuery(agent, query)).map((agent) => agent.id) : []
@@ -689,12 +739,19 @@ function applySnapshot(payload) {
     ? agents.filter((agent) => searchMatches.has(agent.id))
     : agents;
   const listAgents = query
-    ? visibleAgents
-    : visibleAgents.filter((agent) => agent.state !== "idle");
+    ? visibleAgents.filter((agent) => !isServerKind(agent.kind))
+    : visibleAgents.filter((agent) => agent.state !== "idle" && !isServerKind(agent.kind));
+  const listServers = query
+    ? visibleAgents.filter((agent) => isServerKind(agent.kind))
+    : visibleAgents.filter((agent) => isServerKind(agent.kind));
   if (laneTitle) {
     laneTitle.textContent = query ? "search results" : "active agents";
   }
-  renderActiveList(listAgents);
+  if (serverTitle) {
+    serverTitle.textContent = query ? "server results" : "servers";
+  }
+  renderLaneList(listAgents, activeList, "No active agents.");
+  renderLaneList(listServers, serverList, "No servers detected.");
   if (selected) {
     selected = agents.find((agent) => agent.id === selected.id) || selected;
     renderPanel(selected);

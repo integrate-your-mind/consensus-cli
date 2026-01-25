@@ -282,6 +282,18 @@ body {
   gap: 8px;
 }
 
+#server-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.lane-divider {
+  height: 1px;
+  margin: 12px 0;
+  background: rgba(62, 78, 89, 0.6);
+}
+
 .lane-item {
   display: flex;
   align-items: flex-start;
