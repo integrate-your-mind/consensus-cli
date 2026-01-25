@@ -5,6 +5,9 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.4 - 2026-01-24
+- Fix OpenCode event tracking build error (pid activity typing).
+
 ## 0.1.3 - 2026-01-24
 - Add OpenCode integration (API sessions, event stream, storage fallback).
 - Autostart OpenCode server with opt-out and CLI flags.
