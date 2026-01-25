@@ -110,3 +110,77 @@ test("renders recent events", async ({ page }) => {
   await expect(page.locator("#panel-content")).toContainText("Recent Events");
   await expect(page.locator("#panel-content")).toContainText("cmd: ls");
 });
+
+test("updates active lane when opencode agent goes idle", async ({ page }) => {
+  await page.goto("/?mock=1");
+
+  await page.evaluate(() => {
+    window.__consensusMock.setSnapshot({
+      ts: Date.now(),
+      agents: [
+        {
+          id: "901",
+          pid: 901,
+          title: "OpenCode smoke",
+          cmd: "opencode",
+          cmdShort: "opencode",
+          kind: "opencode-tui",
+          cpu: 5,
+          mem: 90_000_000,
+          state: "active",
+          doing: "thinking",
+        },
+        {
+          id: "902",
+          pid: 902,
+          title: "OpenCode server",
+          cmd: "opencode serve",
+          cmdShort: "opencode serve",
+          kind: "opencode-server",
+          cpu: 0,
+          mem: 80_000_000,
+          state: "idle",
+          doing: "server",
+        },
+      ],
+    });
+  });
+
+  await expect(page.locator("#active-list")).toContainText("OpenCode smoke");
+  await expect(page.locator("#server-list")).toContainText("OpenCode server");
+
+  await page.evaluate(() => {
+    window.__consensusMock.setSnapshot({
+      ts: Date.now(),
+      agents: [
+        {
+          id: "901",
+          pid: 901,
+          title: "OpenCode smoke",
+          cmd: "opencode",
+          cmdShort: "opencode",
+          kind: "opencode-tui",
+          cpu: 0,
+          mem: 90_000_000,
+          state: "idle",
+          doing: "idle",
+        },
+        {
+          id: "902",
+          pid: 902,
+          title: "OpenCode server",
+          cmd: "opencode serve",
+          cmdShort: "opencode serve",
+          kind: "opencode-server",
+          cpu: 0,
+          mem: 80_000_000,
+          state: "idle",
+          doing: "server",
+        },
+      ],
+    });
+  });
+
+  await expect(page.locator("#active-list")).not.toContainText("OpenCode smoke");
+  await expect(page.locator("#server-list")).toContainText("OpenCode server");
+});
