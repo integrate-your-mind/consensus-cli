@@ -20,6 +20,11 @@ const gridScale = 2;
 
 const query = new URLSearchParams(window.location.search);
 const mockMode = query.get("mock") === "1";
+const wsOverrideRaw = query.get("ws");
+const wsOverride =
+  wsOverrideRaw && (wsOverrideRaw.startsWith("ws://") || wsOverrideRaw.startsWith("wss://"))
+    ? wsOverrideRaw
+    : null;
 
 const cliPalette = {
   codex: {
@@ -771,7 +776,8 @@ canvas.addEventListener("keydown", (event) => {
 
 function connect() {
   const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${wsProtocol}://${window.location.host}/ws`);
+  const wsUrl = wsOverride || `${wsProtocol}://${window.location.host}/ws`;
+  const ws = new WebSocket(wsUrl);
 
   ws.addEventListener("open", () => {
     setStatus("live");
