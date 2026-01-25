@@ -1,12 +1,16 @@
 # consensus-cli
 
-Live isometric atlas for Codex CLI processes, rendered in a local browser.
+[![npm](https://img.shields.io/npm/v/consensus-cli.svg?color=0f766e)](https://www.npmjs.com/package/consensus-cli)
+[![GitHub release](https://img.shields.io/github/v/release/integrate-your-mind/consensus-cli?display_name=tag&color=2563eb)](https://github.com/integrate-your-mind/consensus-cli/releases)
+[![License](https://img.shields.io/npm/l/consensus-cli.svg?color=6b7280)](LICENSE)
+
+Live isometric atlas for Codex and OpenCode sessions, rendered in a local browser.
 
 ## Status
 Beta. Local-only, no hosted service.
 
 ## Who it's for
-Developers running multiple Codex sessions who want a visual, at-a-glance view of activity.
+Developers running multiple Codex or OpenCode sessions who want a visual, at-a-glance view of activity.
 
 ## Core use cases
 - Track which agents are active right now.
@@ -15,7 +19,7 @@ Developers running multiple Codex sessions who want a visual, at-a-glance view o
 
 ## Scope (non-goals)
 - Does not start, stop, or manage processes.
-- Does not connect to remote Codex instances.
+- Does not connect to remote Codex or OpenCode instances.
 - No authentication or multi-user access.
 
 ## Quickstart
@@ -27,6 +31,7 @@ npm run dev
 The server prints the local URL (default `http://127.0.0.1:8787`).
 Consensus reads local Codex CLI sessions and does not require API keys.
 You just need Codex CLI installed and signed in (Pro subscription or team plan).
+If OpenCode is installed, Consensus will auto-start its local server.
 
 ## Run via npx
 ```bash
@@ -39,17 +44,18 @@ consensus dev server running on http://127.0.0.1:8787
 ```
 
 ## What you get
-- One tile per running `codex` process.
+- One tile per running `codex` or `opencode` process.
 - Activity state (active/idle/error) from CPU and recent events.
-- Best-effort "doing" summary from Codex session JSONL.
+- Best-effort "doing" summary from Codex session JSONL or OpenCode events.
 - Click a tile for details and recent events.
-- Active lane that highlights what is working right now.
+- Active lane for agents plus a dedicated lane for servers.
 
 ## How it works
-1) Scan OS process list for Codex.
-2) Resolve recent session JSONL under `CODEX_HOME/sessions/`.
-3) Poll and push snapshots over WebSocket.
-4) Render tiles on a canvas with isometric projection.
+1) Scan OS process list for Codex + OpenCode.
+2) Resolve Codex session JSONL under `CODEX_HOME/sessions/`.
+3) Query the OpenCode local server API and event stream (with storage fallback).
+4) Poll and push snapshots over WebSocket.
+5) Render tiles on a canvas with isometric projection.
 
 ## Install options
 - Local dev: `npm install` + `npm run dev`
