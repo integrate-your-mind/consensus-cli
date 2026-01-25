@@ -1,3 +1,6 @@
+import { deriveStateWithHold } from "./activity.js";
+import type { ActivityHoldResult } from "./activity.js";
+
 export type ClaudeKind = "claude-tui" | "claude-cli";
 
 export interface ClaudeCommandInfo {
@@ -7,6 +10,14 @@ export interface ClaudeCommandInfo {
   continued?: boolean;
   model?: string;
   print?: boolean;
+}
+
+export interface ClaudeActivityInput {
+  cpu: number;
+  info?: ClaudeCommandInfo | null;
+  previousActiveAt?: number;
+  now?: number;
+  cpuThreshold?: number;
 }
 
 const CLAUDE_BINARIES = new Set(["claude", "claude.exe"]);
@@ -110,4 +121,27 @@ export function summarizeClaudeCommand(command: string): ClaudeCommandInfo & { d
     return { ...info, doing: "claude print" };
   }
   return { ...info, doing: "claude" };
+}
+
+export function deriveClaudeState(input: ClaudeActivityInput): ActivityHoldResult {
+  const info = input.info ?? null;
+  const baseThreshold =
+    input.cpuThreshold ??
+    Number(process.env.CONSENSUS_CLAUDE_CPU_ACTIVE || process.env.CONSENSUS_CPU_ACTIVE || 1);
+  const hasWork = !!info?.prompt || !!info?.resume || !!info?.continued;
+  const isTui = info?.kind === "claude-tui";
+  const effectiveThreshold = isTui && !hasWork ? baseThreshold * 3 : baseThreshold;
+  const result = deriveStateWithHold({
+    cpu: input.cpu,
+    hasError: false,
+    lastEventAt: undefined,
+    inFlight: hasWork,
+    previousActiveAt: input.previousActiveAt,
+    now: input.now,
+    cpuThreshold: effectiveThreshold,
+  });
+  if (!hasWork && input.cpu <= effectiveThreshold) {
+    return { state: "idle", lastActiveAt: undefined };
+  }
+  return result;
 }

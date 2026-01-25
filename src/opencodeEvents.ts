@@ -155,7 +155,7 @@ function summarizeEvent(raw: any): {
     raw?.properties?.file;
   if (typeof pathHint === "string" && pathHint.trim() && lowerType.includes("file")) {
     const summary = redactText(`edit: ${pathHint.trim()}`) || `edit: ${pathHint.trim()}`;
-    return { summary, kind: "edit", isError, type };
+    return { summary, kind: "edit", isError, type, inFlight };
   }
 
   const tool =
@@ -178,7 +178,7 @@ function summarizeEvent(raw: any): {
     const trimmed = promptText.replace(/\s+/g, " ").trim();
     const snippet = trimmed.slice(0, 120);
     const summary = redactText(`prompt: ${snippet}`) || `prompt: ${snippet}`;
-    return { summary, kind: "prompt", isError, type };
+    return { summary, kind: "prompt", isError, type, inFlight };
   }
 
   const messageText =
@@ -190,15 +190,15 @@ function summarizeEvent(raw: any): {
     const trimmed = messageText.replace(/\s+/g, " ").trim();
     const snippet = trimmed.slice(0, 80);
     const summary = redactText(snippet) || snippet;
-    return { summary, kind: "message", isError, type };
+    return { summary, kind: "message", isError, type, inFlight };
   }
 
   if (type && type !== "event") {
     const summary = redactText(`event: ${type}`) || `event: ${type}`;
-    return { summary, kind: "other", isError, type };
+    return { summary, kind: "other", isError, type, inFlight };
   }
 
-  return { kind: "other", isError, type };
+  return { kind: "other", isError, type, inFlight };
 }
 
 function ensureActivity<T extends string | number>(
@@ -255,24 +255,53 @@ function handleRawEvent(raw: any): void {
   const sessionId = getSessionId(raw);
   const pid = getPid(raw);
   const { summary, kind, isError, type, inFlight } = summarizeEvent(raw);
-  if (!summary) return;
-  const entry: EventSummary = {
-    ts,
-    type: typeof type === "string" ? type : "event",
-    summary,
-    isError,
-  };
+  const entry: EventSummary | null = summary
+    ? {
+        ts,
+        type: typeof type === "string" ? type : "event",
+        summary,
+        isError,
+      }
+    : null;
   const now = nowMs();
   if (sessionId) {
     const state = ensureActivity(sessionId, sessionActivity, now);
-    recordEvent(state, entry, kind);
+    if (entry) {
+      recordEvent(state, entry, kind);
+    } else {
+      state.lastEventAt = Math.max(state.lastEventAt || 0, ts);
+      if (isError) {
+        state.lastError = {
+          ts,
+          type: typeof type === "string" ? type : "event",
+          summary: "error",
+          isError,
+        };
+      }
+    }
     if (typeof inFlight === "boolean") state.inFlight = inFlight;
   }
   if (typeof pid === "number") {
     const state = ensureActivity(pid, pidActivity, now);
-    recordEvent(state, entry, kind);
+    if (entry) {
+      recordEvent(state, entry, kind);
+    } else {
+      state.lastEventAt = Math.max(state.lastEventAt || 0, ts);
+      if (isError) {
+        state.lastError = {
+          ts,
+          type: typeof type === "string" ? type : "event",
+          summary: "error",
+          isError,
+        };
+      }
+    }
     if (typeof inFlight === "boolean") state.inFlight = inFlight;
   }
+}
+
+export function ingestOpenCodeEvent(raw: unknown): void {
+  handleRawEvent(raw);
 }
 
 function pruneStale(): void {

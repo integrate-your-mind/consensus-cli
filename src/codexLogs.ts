@@ -22,6 +22,7 @@ interface TailState {
   partial: string;
   events: EventSummary[];
   lastEventAt?: number;
+  lastMtimeMs?: number;
   inFlight?: boolean;
   lastCommand?: EventSummary;
   lastEdit?: EventSummary;
@@ -328,6 +329,8 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       partial: "",
       events: [],
     } as TailState);
+  const prevMtime = state.lastMtimeMs;
+  state.lastMtimeMs = stat.mtimeMs;
 
   if (stat.size < state.offset) {
     state.offset = 0;
@@ -381,13 +384,13 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
 
   const startRe = /(turn|item|response)\.started/i;
   const endRe = /(turn|item|response)\.(completed|failed|errored)/i;
-  for (const line of lines) {
-    if (!line.trim()) continue;
+  const processLine = (line: string): boolean => {
+    if (!line.trim()) return false;
     let ev: any;
     try {
       ev = JSON.parse(line);
     } catch {
-      continue;
+      return false;
     }
     const ts = getEventTimestamp(ev);
     const { summary, kind, isError, model, type } = summarizeEvent(ev);
@@ -414,20 +417,39 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       if (state.events.length > MAX_EVENTS) {
         state.events = state.events.slice(-MAX_EVENTS);
       }
-    } else {
-      state.lastEventAt = Math.max(state.lastEventAt || 0, ts);
-      if (isError) {
+      return true;
+    }
+    state.lastEventAt = Math.max(state.lastEventAt || 0, ts);
+    if (isError) {
       state.lastError = {
         ts,
         type: typeof type === "string" ? type : "event",
         summary: "error",
         isError,
       };
-      }
+      return true;
+    }
+    return true;
+  };
+
+  let parsedAny = false;
+  for (const line of lines) {
+    if (processLine(line)) parsedAny = true;
+  }
+  const candidate = state.partial.trim();
+  if (candidate.startsWith("{") && candidate.endsWith("}")) {
+    if (processLine(candidate)) {
+      parsedAny = true;
+      state.partial = "";
     }
   }
 
   state.offset = stat.size;
+  if (!state.lastEventAt && typeof stat.mtimeMs === "number") {
+    state.lastEventAt = stat.mtimeMs;
+  } else if (stat.size > prevOffset && prevMtime && prevMtime !== stat.mtimeMs) {
+    state.lastEventAt = Math.max(state.lastEventAt || 0, stat.mtimeMs);
+  }
   tailStates.set(sessionPath, state);
   return state;
 }

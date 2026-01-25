@@ -59,3 +59,32 @@ test("summarizes codex exec session logs", async () => {
 
   await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("parses trailing codex event without newline", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+
+  const lines = [
+    {
+      type: "item.completed",
+      ts: 10,
+      item: { type: "command_execution", command: "npm run build" },
+    },
+    {
+      type: "item.completed",
+      ts: 11,
+      item: { type: "assistant_message", content: "done" },
+    },
+  ];
+
+  await fs.writeFile(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+
+  const state = await updateTail(file);
+  assert.ok(state);
+
+  const summary = summarizeTail(state);
+  assert.equal(summary.summary.lastCommand, "cmd: npm run build");
+  assert.equal(summary.summary.lastMessage, "done");
+
+  await fs.rm(dir, { recursive: true, force: true });
+});

@@ -22,7 +22,8 @@ import {
   getOpenCodeActivityBySession,
 } from "./opencodeEvents.js";
 import { getOpenCodeSessionForDirectory } from "./opencodeStorage.js";
-import { summarizeClaudeCommand } from "./claudeCli.js";
+import { deriveOpenCodeState } from "./opencodeState.js";
+import { deriveClaudeState, summarizeClaudeCommand } from "./claudeCli.js";
 import { redactText } from "./redact.js";
 
 const execFileAsync = promisify(execFile);
@@ -347,6 +348,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
   const opencodePort = Number(process.env.CONSENSUS_OPENCODE_PORT || 4096);
   const opencodeResult = await getOpenCodeSessions(opencodeHost, opencodePort, {
     silent: true,
+    timeoutMs: Number(process.env.CONSENSUS_OPENCODE_TIMEOUT_MS || 1000),
   });
   await ensureOpenCodeServer(opencodeHost, opencodePort, opencodeResult);
   if (opencodeProcs.length) {
@@ -468,6 +470,13 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     });
   }
 
+  const opencodeEventWindowMs = Number(
+    process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS || 90_000
+  );
+  const opencodeHoldMs = Number(
+    process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS || 120_000
+  );
+  const cpuThreshold = Number(process.env.CONSENSUS_CPU_ACTIVE || 1);
   for (const proc of opencodeProcs) {
     const stats = usage[proc.pid] || ({} as pidusage.Status);
     const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
@@ -499,7 +508,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const repoRoot = cwdRaw ? findRepoRoot(cwdRaw) : null;
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
 
-    let lastEventAt = parseTimestamp(
+    const lastActivityAt = parseTimestamp(
       session?.lastActivity ||
         session?.lastActivityAt ||
         storageSession?.time?.updated ||
@@ -514,10 +523,8 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const statusRaw = typeof session?.status === "string" ? session.status : undefined;
     const status = statusRaw?.toLowerCase();
     const statusIsError = !!status && /error|failed|failure/.test(status);
-    const statusIsActive = !!status && /running|active|processing/.test(status);
     const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
     let hasError = statusIsError;
-    let inFlight = statusIsActive;
     const model = typeof session?.model === "string" ? session.model : undefined;
 
     let doing: string | undefined = sessionTitle;
@@ -525,6 +532,8 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     let events: AgentSnapshot["events"];
     const eventActivity =
       getOpenCodeActivityBySession(sessionId) || getOpenCodeActivityByPid(proc.pid);
+    let lastEventAt: number | undefined = eventActivity?.lastEventAt;
+    let inFlight = eventActivity?.inFlight;
     if (eventActivity) {
       events = eventActivity.events;
       summary = eventActivity.summary || summary;
@@ -532,6 +541,9 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       if (eventActivity.hasError) hasError = true;
       if (eventActivity.inFlight) inFlight = true;
       if (eventActivity.summary?.current) doing = eventActivity.summary.current;
+    }
+    if (!lastEventAt && statusIsIdle) {
+      lastEventAt = undefined;
     }
     if (!doing) {
       doing =
@@ -541,36 +553,35 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
 
     const id = `${proc.pid}`;
     const cached = activityCache.get(id);
-    const activity = deriveStateWithHold({
+    const kind = inferKind(cmdRaw);
+    const activity = deriveOpenCodeState({
       cpu,
       hasError,
-      lastEventAt,
+      lastEventAt: lastEventAt,
       inFlight,
+      status,
+      isServer: kind === "opencode-server",
       previousActiveAt: cached?.lastActiveAt,
       now,
+      cpuThreshold,
+      eventWindowMs: opencodeEventWindowMs,
+      holdMs: opencodeHoldMs,
     });
     let state = activity.state;
-    if (statusIsError) state = "error";
-    else if (statusIsActive) state = "active";
-    else if (statusIsIdle) state = "idle";
     const hasSignal =
-      statusIsActive ||
       statusIsIdle ||
       statusIsError ||
       typeof lastEventAt === "number" ||
-      !!inFlight;
+      typeof inFlight === "boolean";
     if (!opencodeApiAvailable && !hasSignal) state = "idle";
-    const cpuThreshold =
-      Number(process.env.CONSENSUS_CPU_ACTIVE || 1);
     if (!hasSignal && cpu <= cpuThreshold) {
       state = "idle";
     }
-    activityCache.set(id, { lastActiveAt: state === "active" ? activity.lastActiveAt : undefined, lastSeenAt: now });
+    activityCache.set(id, { lastActiveAt: activity.lastActiveAt, lastSeenAt: now });
     seenIds.add(id);
 
     const cmd = redactText(cmdRaw) || cmdRaw;
     const cmdShort = shortenCmd(cmd);
-    const kind = inferKind(cmd);
     const startedAt = startMs ? Math.floor(startMs / 1000) : undefined;
     const computedTitle = sessionTitle || deriveTitle(doing, repoName, proc.pid, kind);
     const safeSummary = sanitizeSummary(summary);
@@ -623,16 +634,14 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
 
     const id = `${proc.pid}`;
     const cached = activityCache.get(id);
-    const activity = deriveStateWithHold({
+    const activity = deriveClaudeState({
       cpu,
-      hasError: false,
-      lastEventAt: undefined,
-      inFlight: false,
+      info: claudeInfo,
       previousActiveAt: cached?.lastActiveAt,
       now,
     });
     const state = activity.state;
-    activityCache.set(id, { lastActiveAt: activity.lastActiveAt, lastSeenAt: now });
+    activityCache.set(id, { lastActiveAt: state === "active" ? activity.lastActiveAt : undefined, lastSeenAt: now });
     seenIds.add(id);
 
     const cmd = redactText(cmdRaw) || cmdRaw;
