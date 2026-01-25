@@ -201,12 +201,12 @@ function summarizeEvent(raw: any): {
   return { kind: "other", isError, type };
 }
 
-function ensureActivity(
-  key: string,
-  map: Map<string, ActivityState> | Map<number, ActivityState>,
+function ensureActivity<T extends string | number>(
+  key: T,
+  map: Map<T, ActivityState>,
   now: number
 ): ActivityState {
-  const existing = (map as any).get(key) as ActivityState | undefined;
+  const existing = map.get(key);
   if (existing) {
     existing.lastSeenAt = now;
     return existing;
@@ -216,7 +216,7 @@ function ensureActivity(
     summary: {},
     lastSeenAt: now,
   };
-  (map as any).set(key, fresh);
+  map.set(key, fresh);
   return fresh;
 }
 
