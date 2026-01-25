@@ -5,6 +5,10 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.6 - 2026-01-25
+- Treat Codex response items as activity only for assistant output/tool work (not user prompts).
+- Reduce false active state by using activity timestamps instead of generic event timestamps.
+
 ## 0.1.5 - 2026-01-25
 - Add Claude Code process detection with prompt/resume parsing.
 - Apply CLI-specific palettes (Codex/OpenCode/Claude Code) across tiles and lane items.
