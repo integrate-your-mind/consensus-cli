@@ -56,6 +56,45 @@ test("summarizes codex exec session logs", async () => {
   assert.equal(summary.summary.lastMessage, "All done");
   assert.equal(summary.events.length, 6);
   assert.ok(summary.events.some((event) => event.summary === "event: turn.completed"));
+  assert.equal(summary.lastActivityAt, 5_000);
+
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("treats assistant response items as activity but not user prompts", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+
+  const lines = [
+    {
+      type: "response_item",
+      ts: 1,
+      payload: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "ping" }],
+      },
+    },
+    {
+      type: "response_item",
+      ts: 2,
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "pong" }],
+      },
+    },
+  ];
+
+  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  const state = await updateTail(file);
+  assert.ok(state);
+
+  const summary = summarizeTail(state);
+  assert.equal(summary.summary.lastPrompt, "prompt: ping");
+  assert.equal(summary.summary.lastMessage, "pong");
+  assert.equal(summary.lastActivityAt, 2_000);
 
   await fs.rm(dir, { recursive: true, force: true });
 });

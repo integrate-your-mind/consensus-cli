@@ -22,6 +22,7 @@ interface TailState {
   partial: string;
   events: EventSummary[];
   lastEventAt?: number;
+  lastActivityAt?: number;
   lastMtimeMs?: number;
   inFlight?: boolean;
   lastCommand?: EventSummary;
@@ -201,7 +202,13 @@ function summarizeEvent(ev: any): {
   model?: string;
   type?: string;
 } {
-  const item = ev?.item || ev?.data?.item || ev?.delta?.item || ev?.message?.item;
+  const item =
+    ev?.item ||
+    ev?.data?.item ||
+    ev?.delta?.item ||
+    ev?.message?.item ||
+    ev?.payload ||
+    ev?.data?.payload;
   const rawType = ev?.type || ev?.event?.type || "event";
   const rawItemType = item?.type || item?.item_type || item?.itemType;
   const type =
@@ -222,6 +229,8 @@ function summarizeEvent(ev: any): {
   const model = extractModel(ev);
 
   const itemType = typeof rawItemType === "string" ? rawItemType : undefined;
+  const roleRaw = item?.role || item?.message?.role || ev?.role;
+  const role = typeof roleRaw === "string" ? roleRaw : undefined;
 
   const cmd =
     item?.command ||
@@ -251,10 +260,20 @@ function summarizeEvent(ev: any): {
     item?.tool_name ||
     item?.tool?.name ||
     item?.tool ||
+    item?.name ||
+    item?.call?.name ||
+    item?.function?.name ||
     ev?.tool_name ||
     ev?.tool?.name ||
     ev?.tool;
-  const toolTypes = new Set(["tool_call", "mcp_tool_call", "tool", "tool_execution"]);
+  const toolTypes = new Set([
+    "tool_call",
+    "mcp_tool_call",
+    "tool",
+    "tool_execution",
+    "function_call",
+    "function_call_output",
+  ]);
   if (
     typeof toolName === "string" &&
     toolName.trim() &&
@@ -273,18 +292,6 @@ function summarizeEvent(ev: any): {
     extractText(ev?.instruction) ||
     extractText(ev?.data?.input) ||
     extractText(ev?.data?.prompt);
-  if (
-    promptText &&
-    (itemType === "prompt" || /thread\.started|turn\.started|prompt/i.test(String(type)))
-  ) {
-    const trimmed = promptText.replace(/\s+/g, " ").trim();
-    if (trimmed) {
-      const snippet = trimmed.slice(0, 120);
-      const summary = redactText(`prompt: ${snippet}`) || `prompt: ${snippet}`;
-      return { summary, kind: "prompt", isError, model, type };
-    }
-  }
-
   const messageText =
     extractText(item?.content) ||
     extractText(item?.message) ||
@@ -294,9 +301,35 @@ function summarizeEvent(ev: any): {
   if (messageText && itemType !== "reasoning") {
     const trimmed = messageText.replace(/\s+/g, " ").trim();
     if (trimmed) {
-      const snippet = trimmed.slice(0, 80);
-      const summary = redactText(snippet) || snippet;
-      return { summary, kind: "message", isError, model, type };
+      const snippet = trimmed.slice(0, 120);
+      const isAssistant =
+        role === "assistant" ||
+        itemType === "assistant_message" ||
+        itemType === "assistant_response";
+      const isUser = role === "user" || itemType === "user_message";
+      if (isAssistant) {
+        const summary = redactText(snippet) || snippet;
+        return { summary, kind: "message", isError, model, type };
+      }
+      if (isUser) {
+        const summary = redactText(`prompt: ${snippet}`) || `prompt: ${snippet}`;
+        return { summary, kind: "prompt", isError, model, type };
+      }
+      if (role === "developer" || role === "system") {
+        return { kind: "other", isError, model, type };
+      }
+    }
+  }
+
+  if (
+    promptText &&
+    (itemType === "prompt" || /thread\.started|turn\.started|prompt/i.test(String(type)))
+  ) {
+    const trimmed = promptText.replace(/\s+/g, " ").trim();
+    if (trimmed) {
+      const snippet = trimmed.slice(0, 120);
+      const summary = redactText(`prompt: ${snippet}`) || `prompt: ${snippet}`;
+      return { summary, kind: "prompt", isError, model, type };
     }
   }
 
@@ -428,6 +461,10 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       if (kind === "message") state.lastMessage = entry;
       if (kind === "tool") state.lastTool = entry;
       if (kind === "prompt") state.lastPrompt = entry;
+      const activityKinds = new Set(["command", "edit", "tool", "message"]);
+      if (kind && activityKinds.has(kind)) {
+        state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
+      }
       if (isError) state.lastError = entry;
       if (state.events.length > MAX_EVENTS) {
         state.events = state.events.slice(-MAX_EVENTS);
@@ -478,6 +515,7 @@ export function summarizeTail(state: TailState): {
   hasError: boolean;
   summary: WorkSummary;
   lastEventAt?: number;
+  lastActivityAt?: number;
   inFlight?: boolean;
 } {
   const title = state.lastPrompt?.summary;
@@ -505,6 +543,13 @@ export function summarizeTail(state: TailState): {
     hasError,
     summary,
     lastEventAt,
+    lastActivityAt:
+      state.lastActivityAt ||
+      state.lastCommand?.ts ||
+      state.lastEdit?.ts ||
+      state.lastMessage?.ts ||
+      state.lastTool?.ts ||
+      state.lastPrompt?.ts,
     inFlight: state.inFlight,
   };
 }

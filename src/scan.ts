@@ -406,6 +406,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     let title: string | undefined;
     let summary: WorkSummary | undefined;
     let lastEventAt: number | undefined;
+    let lastActivityAt: number | undefined;
     let inFlight = false;
 
     if (session) {
@@ -419,6 +420,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
         title = normalizeTitle(tailSummary.title);
         summary = tailSummary.summary;
         lastEventAt = tailSummary.lastEventAt;
+        lastActivityAt = tailSummary.lastActivityAt;
         inFlight = !!tailSummary.inFlight;
       }
     }
@@ -441,7 +443,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const activity = deriveStateWithHold({
       cpu,
       hasError,
-      lastEventAt,
+      lastEventAt: lastActivityAt,
       inFlight,
       previousActiveAt: cached?.lastActiveAt,
       now,
