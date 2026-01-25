@@ -5,6 +5,13 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.3 - 2026-01-24
+- Add OpenCode integration (API sessions, event stream, storage fallback).
+- Autostart OpenCode server with opt-out and CLI flags.
+- Split servers into a dedicated lane with distinct palette.
+- Improve layout keys to prevent tile overlap.
+- Add OpenCode unit/integration tests and configuration docs.
+
 ## 0.1.2 - 2026-01-24
 - Lower CPU threshold for active detection.
 - Increase activity window defaults for long-running turns.
