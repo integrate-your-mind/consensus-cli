@@ -15,6 +15,18 @@ All configuration is via environment variables.
 - `CONSENSUS_CODEX_HOME`
   - Default: `~/.codex`
   - Override Codex home directory.
+- `CONSENSUS_OPENCODE_HOST`
+  - Default: `127.0.0.1`
+  - OpenCode server host.
+- `CONSENSUS_OPENCODE_PORT`
+  - Default: `4096`
+  - OpenCode server port.
+- `CONSENSUS_OPENCODE_AUTOSTART`
+  - Default: enabled
+  - Set to `0` to disable OpenCode server autostart.
+- `CONSENSUS_OPENCODE_EVENTS`
+  - Default: enabled
+  - Set to `0` to disable OpenCode event stream.
 - `CONSENSUS_PROCESS_MATCH`
   - Default: unset
   - Regex to match process name or command line.

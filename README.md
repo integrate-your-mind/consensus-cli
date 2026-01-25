@@ -62,6 +62,10 @@ consensus dev server running on http://127.0.0.1:8787
 - `CONSENSUS_PORT`: server port (default `8787`).
 - `CONSENSUS_POLL_MS`: polling interval in ms (default `1000`).
 - `CONSENSUS_CODEX_HOME`: override Codex home (default `~/.codex`).
+- `CONSENSUS_OPENCODE_HOST`: OpenCode server host (default `127.0.0.1`).
+- `CONSENSUS_OPENCODE_PORT`: OpenCode server port (default `4096`).
+- `CONSENSUS_OPENCODE_AUTOSTART`: set to `0` to disable OpenCode autostart.
+- `CONSENSUS_OPENCODE_EVENTS`: set to `0` to disable OpenCode event stream.
 - `CONSENSUS_PROCESS_MATCH`: regex to match codex processes.
 - `CONSENSUS_REDACT_PII`: set to `0` to disable redaction (default enabled).
 - `CONSENSUS_EVENT_ACTIVE_MS`: active window after last event in ms (default `300000`).

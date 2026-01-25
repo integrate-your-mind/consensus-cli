@@ -31,6 +31,9 @@ function printHelp(): void {
   process.stdout.write(`  --port <port>        Port (default 8787)\n`);
   process.stdout.write(`  --poll <ms>          Poll interval in ms\n`);
   process.stdout.write(`  --codex-home <path>  Override CODEX_HOME\n`);
+  process.stdout.write(`  --opencode-host <h>  OpenCode host (default 127.0.0.1)\n`);
+  process.stdout.write(`  --opencode-port <p>  OpenCode port (default 4096)\n`);
+  process.stdout.write(`  --no-opencode-autostart  Disable OpenCode server autostart\n`);
   process.stdout.write(`  --process-match <re> Regex for process matching\n`);
   process.stdout.write(`  --no-redact          Disable PII redaction\n`);
   process.stdout.write(`  -h, --help           Show help\n`);
@@ -47,6 +50,9 @@ const host = readArg("--host");
 const port = readArg("--port");
 const poll = readArg("--poll");
 const codexHome = readArg("--codex-home");
+const opencodeHost = readArg("--opencode-host");
+const opencodePort = readArg("--opencode-port");
+const noOpenCodeAutostart = hasFlag("--no-opencode-autostart");
 const match = readArg("--process-match");
 const noRedact = hasFlag("--no-redact");
 
@@ -54,6 +60,9 @@ if (host) env.CONSENSUS_HOST = host;
 if (port) env.CONSENSUS_PORT = port;
 if (poll) env.CONSENSUS_POLL_MS = poll;
 if (codexHome) env.CONSENSUS_CODEX_HOME = codexHome;
+if (opencodeHost) env.CONSENSUS_OPENCODE_HOST = opencodeHost;
+if (opencodePort) env.CONSENSUS_OPENCODE_PORT = opencodePort;
+if (noOpenCodeAutostart) env.CONSENSUS_OPENCODE_AUTOSTART = "0";
 if (match) env.CONSENSUS_PROCESS_MATCH = match;
 if (noRedact) env.CONSENSUS_REDACT_PII = "0";
 

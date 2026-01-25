@@ -14,6 +14,14 @@ import {
   summarizeTail,
   updateTail,
 } from "./codexLogs.js";
+import { getOpenCodeSessions } from "./opencodeApi.js";
+import { ensureOpenCodeServer } from "./opencodeServer.js";
+import {
+  ensureOpenCodeEventStream,
+  getOpenCodeActivityByPid,
+  getOpenCodeActivityBySession,
+} from "./opencodeEvents.js";
+import { getOpenCodeSessionForDirectory } from "./opencodeStorage.js";
 import { redactText } from "./redact.js";
 
 const execFileAsync = promisify(execFile);
@@ -33,10 +41,27 @@ function isCodexProcess(cmd: string | undefined, name: string | undefined, match
   return false;
 }
 
+function isOpenCodeProcess(cmd: string | undefined, name: string | undefined): boolean {
+  if (!cmd && !name) return false;
+  if (name === "opencode") return true;
+  if (!cmd) return false;
+  const firstToken = cmd.trim().split(/\s+/)[0];
+  const base = path.basename(firstToken);
+  if (base === "opencode") return true;
+  return false;
+}
+
 function inferKind(cmd: string): AgentKind {
   if (cmd.includes(" app-server")) return "app-server";
   if (cmd.includes(" exec")) return "exec";
-  if (cmd.includes(" codex") || cmd.startsWith("codex")) return "tui";
+  if (cmd.includes(" codex") || cmd.startsWith("codex") || cmd.includes("/codex")) return "tui";
+  if (cmd.includes(" opencode") || cmd.startsWith("opencode") || cmd.includes("/opencode")) {
+    if (cmd.includes(" serve") || cmd.includes("--serve") || cmd.includes(" web")) {
+      return "opencode-server";
+    }
+    if (cmd.includes(" run")) return "opencode-cli";
+    return "opencode-tui";
+  }
   return "unknown";
 }
 
@@ -48,6 +73,22 @@ function shortenCmd(cmd: string, max = 120): string {
 
 function parseDoingFromCmd(cmd: string): string | undefined {
   const parts = cmd.split(/\s+/g);
+  const openIndex = parts.findIndex(
+    (part) => part === "opencode" || part.endsWith("/opencode")
+  );
+  if (openIndex !== -1) {
+    const mode = parts[openIndex + 1];
+    if (mode === "serve" || mode === "web") return `opencode ${mode}`;
+    if (mode === "run") {
+      for (let i = openIndex + 2; i < parts.length; i += 1) {
+        const part = parts[i];
+        if (!part || part.startsWith("-")) continue;
+        return `opencode run: ${part}`;
+      }
+      return "opencode run";
+    }
+    return "opencode";
+  }
   const execIndex = parts.indexOf("exec");
   if (execIndex !== -1) {
     for (let i = execIndex + 1; i < parts.length; i += 1) {
@@ -91,15 +132,48 @@ function extractSessionId(cmd: string): string | undefined {
   return undefined;
 }
 
+function extractOpenCodeSessionId(cmd: string): string | undefined {
+  const parts = cmd.split(/\s+/g);
+  const sessionFlag = parts.findIndex(
+    (part) => part === "--session" || part === "--session-id" || part === "-s"
+  );
+  if (sessionFlag !== -1) {
+    const token = parts[sessionFlag + 1];
+    if (token) return token;
+  }
+  return undefined;
+}
+
 function normalizeTitle(value?: string): string | undefined {
   if (!value) return undefined;
   return value.replace(/^prompt:\s*/i, "").trim();
 }
 
+function parseTimestamp(value?: string | number): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value < 100_000_000_000 ? value * 1000 : value;
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function coerceNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return undefined;
+}
+
 function deriveTitle(
   doing: string | undefined,
   repo: string | undefined,
-  pid: number
+  pid: number,
+  kind: AgentKind
 ): string {
   if (doing) {
     const trimmed = doing.trim();
@@ -110,7 +184,8 @@ function deriveTitle(
     if (trimmed.startsWith("resume:")) return `Resume ${trimmed.slice(7).trim()}`;
   }
   if (repo) return repo;
-  return `codex#${pid}`;
+  const prefix = kind.startsWith("opencode") ? "opencode" : "codex";
+  return `${prefix}#${pid}`;
 }
 
 function sanitizeSummary(summary?: WorkSummary): WorkSummary | undefined {
@@ -141,6 +216,32 @@ async function getCwdsForPids(pids: number[]): Promise<Map<number, string>> {
       const pid = Number(match[1]);
       const cwd = match[2].trim();
       if (cwd) result.set(pid, cwd);
+    }
+    if (result.size > 0) {
+      return result;
+    }
+  } catch {
+    // fall through to lsof
+  }
+  try {
+    const { stdout } = await execFileAsync("lsof", [
+      "-a",
+      "-p",
+      pids.join(","),
+      "-d",
+      "cwd",
+      "-Fn",
+    ]);
+    let currentPid: number | null = null;
+    const lines = stdout.split(/\r?\n/).filter(Boolean);
+    for (const line of lines) {
+      if (line.startsWith("p")) {
+        const pid = Number(line.slice(1));
+        currentPid = Number.isNaN(pid) ? null : pid;
+      } else if (line.startsWith("n") && currentPid) {
+        const cwd = line.slice(1).trim();
+        if (cwd) result.set(currentPid, cwd);
+      }
     }
   } catch {
     return result;
@@ -201,8 +302,13 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
   }
   const processes = await psList();
   const codexProcs = processes.filter((proc) => isCodexProcess(proc.cmd, proc.name, matchRe));
-
-  const pids = codexProcs.map((proc) => proc.pid);
+  const codexPidSet = new Set(codexProcs.map((proc) => proc.pid));
+  const opencodeProcs = processes
+    .filter((proc) => isOpenCodeProcess(proc.cmd, proc.name))
+    .filter((proc) => !codexPidSet.has(proc.pid));
+  const pids = Array.from(
+    new Set([...codexProcs, ...opencodeProcs].map((proc) => proc.pid))
+  );
   let usage: Record<number, pidusage.Status> = {};
   try {
     usage = (await pidusage(pids)) as Record<number, pidusage.Status>;
@@ -214,6 +320,31 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
   const startTimes = await getStartTimesForPids(pids);
   const codexHome = resolveCodexHome();
   const sessions = await listRecentSessions(codexHome);
+  const opencodeHost = process.env.CONSENSUS_OPENCODE_HOST || "127.0.0.1";
+  const opencodePort = Number(process.env.CONSENSUS_OPENCODE_PORT || 4096);
+  const opencodeResult = await getOpenCodeSessions(opencodeHost, opencodePort, {
+    silent: true,
+  });
+  await ensureOpenCodeServer(opencodeHost, opencodePort, opencodeResult);
+  if (opencodeProcs.length) {
+    ensureOpenCodeEventStream(opencodeHost, opencodePort);
+  }
+  const opencodeSessions = opencodeResult.ok ? opencodeResult.sessions : [];
+  const opencodeApiAvailable = opencodeResult.ok;
+  const opencodeSessionsByPid = new Map<number, (typeof opencodeSessions)[number]>();
+  const opencodeSessionsByDir = new Map<string, (typeof opencodeSessions)[number]>();
+  for (const session of opencodeSessions) {
+    const pid = coerceNumber(session.pid);
+    if (typeof pid === "number") {
+      opencodeSessionsByPid.set(pid, session);
+    }
+    if (typeof session.directory === "string") {
+      opencodeSessionsByDir.set(session.directory, session);
+    }
+    if (typeof session.cwd === "string") {
+      opencodeSessionsByDir.set(session.cwd, session);
+    }
+  }
 
   const agents: AgentSnapshot[] = [];
   const seenIds = new Set<string>();
@@ -289,7 +420,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const kind = inferKind(cmd);
     const startedAt = startMs ? Math.floor(startMs / 1000) : undefined;
 
-    const computedTitle = title || deriveTitle(doing, repoName, proc.pid);
+    const computedTitle = title || deriveTitle(doing, repoName, proc.pid, kind);
     const safeSummary = sanitizeSummary(summary);
 
     agents.push({
@@ -306,6 +437,134 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       state,
       doing: redactText(doing) || doing,
       sessionPath: redactText(session?.path) || session?.path,
+      repo: repoName,
+      cwd,
+      model,
+      summary: safeSummary,
+      events,
+    });
+  }
+
+  for (const proc of opencodeProcs) {
+    const stats = usage[proc.pid] || ({} as pidusage.Status);
+    const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
+    const mem = typeof stats.memory === "number" ? stats.memory : 0;
+
+    const elapsed = (stats as pidusage.Status & { elapsed?: number }).elapsed;
+    const startMs =
+      typeof elapsed === "number"
+        ? Date.now() - elapsed
+        : startTimes.get(proc.pid);
+
+    const cmdRaw = proc.cmd || proc.name || "";
+    const sessionByPid = opencodeSessionsByPid.get(proc.pid);
+    const cwdMatch = cwds.get(proc.pid);
+    const sessionByDir = sessionByPid
+      ? undefined
+      : opencodeSessionsByDir.get(cwdMatch || "");
+    const session = sessionByPid || sessionByDir;
+    const storageSession =
+      !session && cwdMatch ? await getOpenCodeSessionForDirectory(cwdMatch) : undefined;
+    const sessionId =
+      session?.id || storageSession?.id || extractOpenCodeSessionId(cmdRaw);
+    const sessionTitle = normalizeTitle(
+      session?.title || session?.name || storageSession?.title
+    );
+    const sessionCwd = session?.cwd || session?.directory || storageSession?.directory;
+    const cwdRaw = sessionCwd || cwds.get(proc.pid);
+    const cwd = redactText(cwdRaw) || cwdRaw;
+    const repoRoot = cwdRaw ? findRepoRoot(cwdRaw) : null;
+    const repoName = repoRoot ? path.basename(repoRoot) : undefined;
+
+    let lastEventAt = parseTimestamp(
+      session?.lastActivity ||
+        session?.lastActivityAt ||
+        storageSession?.time?.updated ||
+        storageSession?.time?.created ||
+        session?.time?.updated ||
+        session?.time?.created ||
+        session?.updatedAt ||
+        session?.updated ||
+        session?.createdAt ||
+        session?.created
+    );
+    const statusRaw = typeof session?.status === "string" ? session.status : undefined;
+    const status = statusRaw?.toLowerCase();
+    const statusIsError = !!status && /error|failed|failure/.test(status);
+    const statusIsActive = !!status && /running|active|processing/.test(status);
+    const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
+    let hasError = statusIsError;
+    let inFlight = statusIsActive;
+    const model = typeof session?.model === "string" ? session.model : undefined;
+
+    let doing: string | undefined = sessionTitle;
+    let summary: WorkSummary | undefined;
+    let events: AgentSnapshot["events"];
+    const eventActivity =
+      getOpenCodeActivityBySession(sessionId) || getOpenCodeActivityByPid(proc.pid);
+    if (eventActivity) {
+      events = eventActivity.events;
+      summary = eventActivity.summary || summary;
+      lastEventAt = eventActivity.lastEventAt || lastEventAt;
+      if (eventActivity.hasError) hasError = true;
+      if (eventActivity.inFlight) inFlight = true;
+      if (eventActivity.summary?.current) doing = eventActivity.summary.current;
+    }
+    if (!doing) {
+      doing =
+        parseDoingFromCmd(proc.cmd || "") || shortenCmd(proc.cmd || proc.name || "");
+    }
+    if (doing) summary = { current: doing };
+
+    const id = `${proc.pid}`;
+    const cached = activityCache.get(id);
+    const activity = deriveStateWithHold({
+      cpu,
+      hasError,
+      lastEventAt,
+      inFlight,
+      previousActiveAt: cached?.lastActiveAt,
+      now,
+    });
+    let state = activity.state;
+    if (statusIsError) state = "error";
+    else if (statusIsActive) state = "active";
+    else if (statusIsIdle) state = "idle";
+    const hasSignal =
+      statusIsActive ||
+      statusIsIdle ||
+      statusIsError ||
+      typeof lastEventAt === "number" ||
+      !!inFlight;
+    if (!opencodeApiAvailable && !hasSignal) state = "idle";
+    const cpuThreshold =
+      Number(process.env.CONSENSUS_CPU_ACTIVE || 1);
+    if (!hasSignal && cpu <= cpuThreshold) {
+      state = "idle";
+    }
+    activityCache.set(id, { lastActiveAt: state === "active" ? activity.lastActiveAt : undefined, lastSeenAt: now });
+    seenIds.add(id);
+
+    const cmd = redactText(cmdRaw) || cmdRaw;
+    const cmdShort = shortenCmd(cmd);
+    const kind = inferKind(cmd);
+    const startedAt = startMs ? Math.floor(startMs / 1000) : undefined;
+    const computedTitle = sessionTitle || deriveTitle(doing, repoName, proc.pid, kind);
+    const safeSummary = sanitizeSummary(summary);
+
+    agents.push({
+      id,
+      pid: proc.pid,
+      startedAt,
+      lastEventAt,
+      title: redactText(computedTitle) || computedTitle,
+      cmd,
+      cmdShort,
+      kind,
+      cpu,
+      mem,
+      state,
+      doing: redactText(doing) || doing,
       repo: repoName,
       cwd,
       model,

@@ -1,5 +1,5 @@
 export type AgentState = "active" | "idle" | "error";
-export type AgentKind = "tui" | "exec" | "app-server" | "unknown";
+export type AgentKind = "tui" | "exec" | "app-server" | "opencode-tui" | "opencode-cli" | "opencode-server" | "unknown";
 
 export interface EventSummary {
   ts: number;
