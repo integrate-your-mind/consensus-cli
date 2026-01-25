@@ -5,6 +5,12 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.5 - 2026-01-25
+- Add Claude Code process detection with prompt/resume parsing.
+- Apply CLI-specific palettes (Codex/OpenCode/Claude Code) across tiles and lane items.
+- Add Claude CLI parsing unit tests.
+- Update README with Claude Code support.
+
 ## 0.1.4 - 2026-01-24
 - Fix OpenCode event tracking build error (pid activity typing).
 
