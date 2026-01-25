@@ -18,6 +18,8 @@ export interface ClaudeActivityInput {
   previousActiveAt?: number;
   now?: number;
   cpuThreshold?: number;
+  cpuActiveMs?: number;
+  cpuSustainMs?: number;
 }
 
 const CLAUDE_BINARIES = new Set(["claude", "claude.exe"]);
@@ -131,8 +133,14 @@ export function deriveClaudeState(input: ClaudeActivityInput): ActivityHoldResul
   const hasWork = !!info?.prompt || !!info?.resume || !!info?.continued;
   const isTui = info?.kind === "claude-tui";
   const effectiveThreshold = isTui && !hasWork ? baseThreshold * 3 : baseThreshold;
+  const sustainMs =
+    input.cpuSustainMs ??
+    Number(process.env.CONSENSUS_CLAUDE_CPU_SUSTAIN_MS || 2000);
+  const sustained =
+    typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs;
+  const cpuValue = isTui && !hasWork && !sustained ? 0 : input.cpu;
   const result = deriveStateWithHold({
-    cpu: input.cpu,
+    cpu: cpuValue,
     hasError: false,
     lastEventAt: undefined,
     inFlight: hasWork,
@@ -140,8 +148,17 @@ export function deriveClaudeState(input: ClaudeActivityInput): ActivityHoldResul
     now: input.now,
     cpuThreshold: effectiveThreshold,
   });
-  if (!hasWork && input.cpu <= effectiveThreshold) {
+  if (!hasWork && cpuValue <= effectiveThreshold) {
     return { state: "idle", lastActiveAt: undefined };
   }
   return result;
+}
+
+export function getClaudeCpuThreshold(
+  info: ClaudeCommandInfo | null | undefined,
+  baseThreshold: number
+): number {
+  const hasWork = !!info?.prompt || !!info?.resume || !!info?.continued;
+  const isTui = info?.kind === "claude-tui";
+  return isTui && !hasWork ? baseThreshold * 3 : baseThreshold;
 }

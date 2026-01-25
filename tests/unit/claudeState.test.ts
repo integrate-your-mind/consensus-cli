@@ -14,3 +14,23 @@ test("claude print with prompt marks active", () => {
   });
   assert.equal(result.state, "active");
 });
+
+test("claude tui ignores short cpu spikes without work", () => {
+  const result = deriveClaudeState({
+    cpu: 6,
+    info: { kind: "claude-tui" },
+    cpuActiveMs: 500,
+    cpuThreshold: 1,
+  });
+  assert.equal(result.state, "idle");
+});
+
+test("claude tui activates after sustained cpu", () => {
+  const result = deriveClaudeState({
+    cpu: 6,
+    info: { kind: "claude-tui" },
+    cpuActiveMs: 2500,
+    cpuThreshold: 1,
+  });
+  assert.equal(result.state, "active");
+});

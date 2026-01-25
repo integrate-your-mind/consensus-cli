@@ -23,12 +23,15 @@ import {
 } from "./opencodeEvents.js";
 import { getOpenCodeSessionForDirectory } from "./opencodeStorage.js";
 import { deriveOpenCodeState } from "./opencodeState.js";
-import { deriveClaudeState, summarizeClaudeCommand } from "./claudeCli.js";
+import { deriveClaudeState, getClaudeCpuThreshold, summarizeClaudeCommand } from "./claudeCli.js";
 import { redactText } from "./redact.js";
 
 const execFileAsync = promisify(execFile);
 const repoCache = new Map<string, string | null>();
-const activityCache = new Map<string, { lastActiveAt?: number; lastSeenAt: number }>();
+const activityCache = new Map<
+  string,
+  { lastActiveAt?: number; lastSeenAt: number; lastCpuAboveAt?: number }
+>();
 
 function isCodexProcess(cmd: string | undefined, name: string | undefined, matchRe?: RegExp): boolean {
   if (!cmd && !name) return false;
@@ -438,7 +441,11 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       now,
     });
     const state = activity.state;
-    activityCache.set(id, { lastActiveAt: activity.lastActiveAt, lastSeenAt: now });
+    activityCache.set(id, {
+      lastActiveAt: activity.lastActiveAt,
+      lastSeenAt: now,
+      lastCpuAboveAt: cached?.lastCpuAboveAt,
+    });
     seenIds.add(id);
     const cmd = redactText(cmdRaw) || cmdRaw;
     const cmdShort = shortenCmd(cmd);
@@ -577,7 +584,11 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     if (!hasSignal && cpu <= cpuThreshold) {
       state = "idle";
     }
-    activityCache.set(id, { lastActiveAt: activity.lastActiveAt, lastSeenAt: now });
+    activityCache.set(id, {
+      lastActiveAt: activity.lastActiveAt,
+      lastSeenAt: now,
+      lastCpuAboveAt: cached?.lastCpuAboveAt,
+    });
     seenIds.add(id);
 
     const cmd = redactText(cmdRaw) || cmdRaw;
@@ -634,14 +645,27 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
 
     const id = `${proc.pid}`;
     const cached = activityCache.get(id);
+    const claudeBaseThreshold = Number(
+      process.env.CONSENSUS_CLAUDE_CPU_ACTIVE || process.env.CONSENSUS_CPU_ACTIVE || 1
+    );
+    const claudeThreshold = getClaudeCpuThreshold(claudeInfo, claudeBaseThreshold);
+    const cpuAbove = cpu > claudeThreshold;
+    const cpuActiveMs = cpuAbove && cached?.lastCpuAboveAt ? now - cached.lastCpuAboveAt : 0;
+    const lastCpuAboveAt = cpuAbove ? cached?.lastCpuAboveAt ?? now : undefined;
     const activity = deriveClaudeState({
       cpu,
       info: claudeInfo,
       previousActiveAt: cached?.lastActiveAt,
       now,
+      cpuThreshold: claudeBaseThreshold,
+      cpuActiveMs,
     });
     const state = activity.state;
-    activityCache.set(id, { lastActiveAt: state === "active" ? activity.lastActiveAt : undefined, lastSeenAt: now });
+    activityCache.set(id, {
+      lastActiveAt: state === "active" ? activity.lastActiveAt : undefined,
+      lastSeenAt: now,
+      lastCpuAboveAt,
+    });
     seenIds.add(id);
 
     const cmd = redactText(cmdRaw) || cmdRaw;
