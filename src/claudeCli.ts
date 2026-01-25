@@ -20,6 +20,7 @@ export interface ClaudeActivityInput {
   cpuThreshold?: number;
   cpuActiveMs?: number;
   cpuSustainMs?: number;
+  cpuSpikeThreshold?: number;
 }
 
 const CLAUDE_BINARIES = new Set(["claude", "claude.exe"]);
@@ -135,9 +136,16 @@ export function deriveClaudeState(input: ClaudeActivityInput): ActivityHoldResul
   const effectiveThreshold = isTui && !hasWork ? baseThreshold * 3 : baseThreshold;
   const sustainMs =
     input.cpuSustainMs ??
-    Number(process.env.CONSENSUS_CLAUDE_CPU_SUSTAIN_MS || 2000);
+    Number(process.env.CONSENSUS_CLAUDE_CPU_SUSTAIN_MS || 1000);
+  const spikeEnv = Number(process.env.CONSENSUS_CLAUDE_CPU_SPIKE || "");
+  const spikeThreshold =
+    input.cpuSpikeThreshold ??
+    (Number.isFinite(spikeEnv) && spikeEnv > 0
+      ? spikeEnv
+      : Math.max(effectiveThreshold * 2, 5));
   const sustained =
-    typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs;
+    input.cpu >= spikeThreshold ||
+    (typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs);
   const cpuValue = isTui && !hasWork && !sustained ? 0 : input.cpu;
   const result = deriveStateWithHold({
     cpu: cpuValue,
