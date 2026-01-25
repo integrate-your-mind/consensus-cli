@@ -5,7 +5,7 @@ import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import type { AgentKind, AgentSnapshot, SnapshotPayload, WorkSummary } from "./types.js";
-import { deriveStateWithHold } from "./activity.js";
+import { deriveCodexState } from "./codexState.js";
 import {
   listRecentSessions,
   findSessionById,
@@ -440,10 +440,10 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
 
     const id = `${proc.pid}`;
     const cached = activityCache.get(id);
-    const activity = deriveStateWithHold({
+    const activity = deriveCodexState({
       cpu,
       hasError,
-      lastEventAt: lastActivityAt,
+      lastActivityAt,
       inFlight,
       previousActiveAt: cached?.lastActiveAt,
       now,
