@@ -76,6 +76,9 @@ consensus dev server running on http://127.0.0.1:8787
 - `CONSENSUS_OPENCODE_EVENTS`: set to `0` to disable OpenCode event stream.
 - `CONSENSUS_PROCESS_MATCH`: regex to match codex processes.
 - `CONSENSUS_REDACT_PII`: set to `0` to disable redaction (default enabled).
+- `CONSENSUS_CODEX_EVENT_ACTIVE_MS`: Codex active window after last event in ms (default `60000`).
+- `CONSENSUS_CODEX_ACTIVE_HOLD_MS`: Codex hold window in ms (default `90000`).
+- `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`: Codex in-flight timeout in ms (default `120000`).
 - `CONSENSUS_EVENT_ACTIVE_MS`: active window after last event in ms (default `300000`).
 - `CONSENSUS_CPU_ACTIVE`: CPU threshold for active state (default `1`).
 - `CONSENSUS_ACTIVE_HOLD_MS`: keep active state this long after activity (default `600000`).

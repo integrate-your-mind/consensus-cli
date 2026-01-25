@@ -313,6 +313,10 @@ function summarizeEvent(ev: any): {
 }
 
 export async function updateTail(sessionPath: string): Promise<TailState | null> {
+  const nowMs = Date.now();
+  const inflightTimeoutMs = Number(
+    process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS || 120000
+  );
   let stat: fs.Stats;
   try {
     stat = await fsp.stat(sessionPath);
@@ -331,6 +335,16 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     } as TailState);
   const prevMtime = state.lastMtimeMs;
   state.lastMtimeMs = stat.mtimeMs;
+
+  const expireInFlight = () => {
+    if (
+      state.inFlight &&
+      typeof state.lastEventAt === "number" &&
+      nowMs - state.lastEventAt > inflightTimeoutMs
+    ) {
+      state.inFlight = false;
+    }
+  };
 
   if (stat.size < state.offset) {
     state.offset = 0;
@@ -356,6 +370,7 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
   }
 
   if (stat.size <= readStart) {
+    expireInFlight();
     tailStates.set(sessionPath, state);
     return state;
   }
@@ -450,6 +465,7 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
   } else if (stat.size > prevOffset && prevMtime && prevMtime !== stat.mtimeMs) {
     state.lastEventAt = Math.max(state.lastEventAt || 0, stat.mtimeMs);
   }
+  expireInFlight();
   tailStates.set(sessionPath, state);
   return state;
 }

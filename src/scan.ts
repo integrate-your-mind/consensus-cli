@@ -376,6 +376,12 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
 
   const agents: AgentSnapshot[] = [];
   const seenIds = new Set<string>();
+  const codexEventWindowMs = Number(
+    process.env.CONSENSUS_CODEX_EVENT_ACTIVE_MS || 60000
+  );
+  const codexHoldMs = Number(
+    process.env.CONSENSUS_CODEX_ACTIVE_HOLD_MS || 90000
+  );
   for (const proc of codexProcs) {
     const stats = usage[proc.pid] || ({} as pidusage.Status);
     const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
@@ -439,6 +445,8 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       inFlight,
       previousActiveAt: cached?.lastActiveAt,
       now,
+      eventWindowMs: codexEventWindowMs,
+      holdMs: codexHoldMs,
     });
     const state = activity.state;
     activityCache.set(id, {

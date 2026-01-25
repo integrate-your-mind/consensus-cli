@@ -33,6 +33,15 @@ All configuration is via environment variables.
 - `CONSENSUS_REDACT_PII`
   - Default: enabled
   - Set to `0` to disable redaction.
+- `CONSENSUS_CODEX_EVENT_ACTIVE_MS`
+  - Default: `60000`
+  - Codex event window before dropping to idle.
+- `CONSENSUS_CODEX_ACTIVE_HOLD_MS`
+  - Default: `90000`
+  - Codex hold window after activity.
+- `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`
+  - Default: `120000`
+  - Clear stuck Codex in-flight state after this timeout.
 - `CONSENSUS_EVENT_ACTIVE_MS`
   - Default: `300000`
   - Window after the last event to mark an agent active.

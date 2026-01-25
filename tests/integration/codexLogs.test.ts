@@ -88,3 +88,35 @@ test("parses trailing codex event without newline", async () => {
 
   await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("expires in-flight codex state after timeout", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+  const originalNow = Date.now;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "1000";
+
+  const lines = [
+    {
+      type: "item.started",
+      ts: 1,
+      item: { type: "command_execution", command: "npm run build" },
+    },
+  ];
+  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  Date.now = () => 1_500;
+  const stateStart = await updateTail(file);
+  assert.ok(stateStart);
+  const summaryStart = summarizeTail(stateStart);
+  assert.equal(summaryStart.inFlight, true);
+
+  Date.now = () => 12_500;
+  const stateLater = await updateTail(file);
+  assert.ok(stateLater);
+  const summaryLater = summarizeTail(stateLater);
+  assert.equal(summaryLater.inFlight, false);
+
+  Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  await fs.rm(dir, { recursive: true, force: true });
+});
