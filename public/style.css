@@ -295,12 +295,15 @@ body {
 }
 
 .lane-item {
+  --cli-accent: rgba(87, 242, 198, 0.7);
+  --cli-accent-glow: rgba(87, 242, 198, 0.25);
   display: flex;
   align-items: flex-start;
   gap: 10px;
   padding: 10px;
   border-radius: 10px;
   border: 1px solid rgba(62, 78, 89, 0.5);
+  border-left: 3px solid var(--cli-accent);
   background: rgba(13, 17, 22, 0.85);
   cursor: pointer;
   text-align: left;
@@ -312,16 +315,18 @@ body {
 }
 
 .lane-item:hover {
-  border-color: rgba(87, 242, 198, 0.5);
+  border-color: var(--cli-accent);
+  border-left-color: var(--cli-accent);
 }
 
 .lane-item.is-selected {
-  border-color: rgba(87, 242, 198, 0.7);
-  box-shadow: 0 0 12px rgba(87, 242, 198, 0.25);
+  border-color: var(--cli-accent);
+  border-left-color: var(--cli-accent);
+  box-shadow: 0 0 12px var(--cli-accent-glow);
 }
 
 .lane-item:focus-visible {
-  outline: 2px solid rgba(87, 242, 198, 0.6);
+  outline: 2px solid var(--cli-accent);
   outline-offset: 2px;
 }
 
