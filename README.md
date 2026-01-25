@@ -4,13 +4,13 @@
 [![GitHub release](https://img.shields.io/github/v/release/integrate-your-mind/consensus-cli?display_name=tag&color=2563eb)](https://github.com/integrate-your-mind/consensus-cli/releases)
 [![License](https://img.shields.io/npm/l/consensus-cli.svg?color=6b7280)](LICENSE)
 
-Live isometric atlas for Codex and OpenCode sessions, rendered in a local browser.
+Live isometric atlas for Codex, OpenCode, and Claude Code sessions, rendered in a local browser.
 
 ## Status
 Beta. Local-only, no hosted service.
 
 ## Who it's for
-Developers running multiple Codex or OpenCode sessions who want a visual, at-a-glance view of activity.
+Developers running multiple Codex, OpenCode, or Claude Code sessions who want a visual, at-a-glance view of activity.
 
 ## Core use cases
 - Track which agents are active right now.
@@ -19,7 +19,7 @@ Developers running multiple Codex or OpenCode sessions who want a visual, at-a-g
 
 ## Scope (non-goals)
 - Does not start, stop, or manage processes.
-- Does not connect to remote Codex or OpenCode instances.
+- Does not connect to remote Codex, OpenCode, or Claude Code instances.
 - No authentication or multi-user access.
 
 ## Quickstart
@@ -32,6 +32,7 @@ The server prints the local URL (default `http://127.0.0.1:8787`).
 Consensus reads local Codex CLI sessions and does not require API keys.
 You just need Codex CLI installed and signed in (Pro subscription or team plan).
 If OpenCode is installed, Consensus will auto-start its local server.
+If Claude Code is installed, it will appear automatically (run `claude` once to sign in).
 
 ## Run via npx
 ```bash
@@ -44,18 +45,19 @@ consensus dev server running on http://127.0.0.1:8787
 ```
 
 ## What you get
-- One tile per running `codex` or `opencode` process.
+- One tile per running `codex`, `opencode`, or `claude` process.
 - Activity state (active/idle/error) from CPU and recent events.
-- Best-effort "doing" summary from Codex session JSONL or OpenCode events.
+- Best-effort "doing" summary from Codex session JSONL, OpenCode events, or Claude CLI flags.
 - Click a tile for details and recent events.
 - Active lane for agents plus a dedicated lane for servers.
 
 ## How it works
-1) Scan OS process list for Codex + OpenCode.
+1) Scan OS process list for Codex + OpenCode + Claude Code.
 2) Resolve Codex session JSONL under `CODEX_HOME/sessions/`.
 3) Query the OpenCode local server API and event stream (with storage fallback).
-4) Poll and push snapshots over WebSocket.
-5) Render tiles on a canvas with isometric projection.
+4) Read Claude Code CLI flags to infer current work.
+5) Poll and push snapshots over WebSocket.
+6) Render tiles on a canvas with isometric projection.
 
 ## Install options
 - Local dev: `npm install` + `npm run dev`
