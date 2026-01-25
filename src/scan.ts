@@ -22,6 +22,7 @@ import {
   getOpenCodeActivityBySession,
 } from "./opencodeEvents.js";
 import { getOpenCodeSessionForDirectory } from "./opencodeStorage.js";
+import { summarizeClaudeCommand } from "./claudeCli.js";
 import { redactText } from "./redact.js";
 
 const execFileAsync = promisify(execFile);
@@ -51,6 +52,16 @@ function isOpenCodeProcess(cmd: string | undefined, name: string | undefined): b
   return false;
 }
 
+function isClaudeProcess(cmd: string | undefined, name: string | undefined): boolean {
+  if (!cmd && !name) return false;
+  if (name === "claude") return true;
+  if (!cmd) return false;
+  const firstToken = cmd.trim().split(/\s+/)[0];
+  const base = path.basename(firstToken);
+  if (base === "claude" || base === "claude.exe") return true;
+  return false;
+}
+
 function inferKind(cmd: string): AgentKind {
   if (cmd.includes(" app-server")) return "app-server";
   if (cmd.includes(" exec")) return "exec";
@@ -62,6 +73,8 @@ function inferKind(cmd: string): AgentKind {
     if (cmd.includes(" run")) return "opencode-cli";
     return "opencode-tui";
   }
+  const claudeInfo = summarizeClaudeCommand(cmd);
+  if (claudeInfo) return claudeInfo.kind;
   return "unknown";
 }
 
@@ -73,6 +86,8 @@ function shortenCmd(cmd: string, max = 120): string {
 
 function parseDoingFromCmd(cmd: string): string | undefined {
   const parts = cmd.split(/\s+/g);
+  const claudeInfo = summarizeClaudeCommand(cmd);
+  if (claudeInfo?.doing) return claudeInfo.doing;
   const openIndex = parts.findIndex(
     (part) => part === "opencode" || part.endsWith("/opencode")
   );
@@ -184,7 +199,11 @@ function deriveTitle(
     if (trimmed.startsWith("resume:")) return `Resume ${trimmed.slice(7).trim()}`;
   }
   if (repo) return repo;
-  const prefix = kind.startsWith("opencode") ? "opencode" : "codex";
+  const prefix = kind.startsWith("opencode")
+    ? "opencode"
+    : kind.startsWith("claude")
+      ? "claude"
+      : "codex";
   return `${prefix}#${pid}`;
 }
 
@@ -306,8 +325,12 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
   const opencodeProcs = processes
     .filter((proc) => isOpenCodeProcess(proc.cmd, proc.name))
     .filter((proc) => !codexPidSet.has(proc.pid));
+  const opencodePidSet = new Set(opencodeProcs.map((proc) => proc.pid));
+  const claudeProcs = processes
+    .filter((proc) => isClaudeProcess(proc.cmd, proc.name))
+    .filter((proc) => !codexPidSet.has(proc.pid) && !opencodePidSet.has(proc.pid));
   const pids = Array.from(
-    new Set([...codexProcs, ...opencodeProcs].map((proc) => proc.pid))
+    new Set([...codexProcs, ...opencodeProcs, ...claudeProcs].map((proc) => proc.pid))
   );
   let usage: Record<number, pidusage.Status> = {};
   try {
@@ -570,6 +593,70 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       model,
       summary: safeSummary,
       events,
+    });
+  }
+
+  for (const proc of claudeProcs) {
+    const stats = usage[proc.pid] || ({} as pidusage.Status);
+    const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
+    const mem = typeof stats.memory === "number" ? stats.memory : 0;
+
+    const elapsed = (stats as pidusage.Status & { elapsed?: number }).elapsed;
+    const startMs =
+      typeof elapsed === "number"
+        ? Date.now() - elapsed
+        : startTimes.get(proc.pid);
+
+    const cmdRaw = proc.cmd || proc.name || "";
+    const claudeInfo = summarizeClaudeCommand(cmdRaw);
+    const doing =
+      claudeInfo?.doing ||
+      parseDoingFromCmd(cmdRaw) ||
+      shortenCmd(cmdRaw || proc.name || "");
+    const summary = doing ? { current: doing } : undefined;
+    const model = claudeInfo?.model;
+    const cwdRaw = cwds.get(proc.pid);
+    const cwd = redactText(cwdRaw) || cwdRaw;
+    const repoRoot = cwdRaw ? findRepoRoot(cwdRaw) : null;
+    const repoName = repoRoot ? path.basename(repoRoot) : undefined;
+    const kind = claudeInfo?.kind || inferKind(cmdRaw);
+
+    const id = `${proc.pid}`;
+    const cached = activityCache.get(id);
+    const activity = deriveStateWithHold({
+      cpu,
+      hasError: false,
+      lastEventAt: undefined,
+      inFlight: false,
+      previousActiveAt: cached?.lastActiveAt,
+      now,
+    });
+    const state = activity.state;
+    activityCache.set(id, { lastActiveAt: activity.lastActiveAt, lastSeenAt: now });
+    seenIds.add(id);
+
+    const cmd = redactText(cmdRaw) || cmdRaw;
+    const cmdShort = shortenCmd(cmd);
+    const startedAt = startMs ? Math.floor(startMs / 1000) : undefined;
+    const computedTitle = deriveTitle(doing, repoName, proc.pid, kind);
+    const safeSummary = sanitizeSummary(summary);
+
+    agents.push({
+      id,
+      pid: proc.pid,
+      startedAt,
+      title: redactText(computedTitle) || computedTitle,
+      cmd,
+      cmdShort,
+      kind,
+      cpu,
+      mem,
+      state,
+      doing: redactText(doing) || doing,
+      repo: repoName,
+      cwd,
+      model,
+      summary: safeSummary,
     });
   }
 
