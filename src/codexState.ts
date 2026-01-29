@@ -3,6 +3,7 @@ import { deriveStateWithHold } from "./activity.js";
 
 const DEFAULT_CODEX_CPU_SUSTAIN_MS = 500;
 const DEFAULT_CODEX_INFLIGHT_IDLE_MS = 30_000;
+const DEFAULT_CODEX_HOLD_MS = 2000;
 
 export interface CodexStateInput {
   cpu: number;
@@ -86,7 +87,11 @@ export function deriveCodexState(input: CodexStateInput): ActivityHoldResult {
     input.cpu >= spikeThreshold ||
     (typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs);
 
-  const cpu = hasSignal || sustained ? input.cpu : 0;
+  const cpu = input.cpu;
+
+  const holdMs =
+    input.holdMs ??
+    Number(process.env.CONSENSUS_CODEX_ACTIVE_HOLD_MS || DEFAULT_CODEX_HOLD_MS);
 
   return deriveStateWithHold({
     cpu,
@@ -97,6 +102,6 @@ export function deriveCodexState(input: CodexStateInput): ActivityHoldResult {
     now,
     cpuThreshold,
     eventWindowMs,
-    holdMs: input.holdMs,
+    holdMs,
   });
 }

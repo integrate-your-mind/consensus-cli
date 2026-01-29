@@ -1,7 +1,6 @@
 Goal (incl. success criteria):
-- Fix Codex sustained CPU activation bug (sustained should not require activity signal).
-- Remove unused Kimi modules/tests (activity/config/scanner/core dirs + related tests).
-- All unit/integration tests and build pass after cleanup.
+- Maintain Codex session detection and reduced flicker with current changes.
+- Tests/build pass after changes.
 
 Constraints/Assumptions:
 - Keep dependencies minimal; no heavy frameworks.
@@ -9,7 +8,7 @@ Constraints/Assumptions:
 - Must maintain CONTINUITY.md each turn; responses begin with Ledger Snapshot.
 
 Key decisions:
-- Follow user plan: fix Codex sustained CPU gating, then remove unused modules, then verify.
+- None yet; need repro + diagnosis.
 
 State:
   - Done:
@@ -20,10 +19,13 @@ State:
     - Ran `npm test` (pass).
     - Ran `npm run build` (pass).
     - Committed changes: `6f8d645`.
+    - Recorded UI during work: `/Users/romanmondello/consensus/tmp/codex-flicker-before.webm`.
+    - Codex flicker fix applied (cpu passthrough) and tests updated; tests/build passed.
+    - User reports Codex sessions are working now.
   - Now:
-    - Ready for push or additional changes.
+    - Await user direction on whether to keep changes and commit/push.
   - Next:
-    - None.
+    - None unless user requests.
 
 Open questions (UNCONFIRMED if needed):
 - None.
@@ -32,9 +34,4 @@ Working set (files/ids/commands):
 - `CONTINUITY.md`
 - `src/codexState.ts`
 - `tests/unit/codexState.test.ts`
-- `src/activity/` (directory removal)
-- `src/config/` (directory removal)
-- `src/scanner/` (directory removal)
-- `src/core/` (directory removal)
-- `tests/unit/activityMachine.test.ts`
-- `tests/integration/codexActivityLatency.test.ts`
+- `/Users/romanmondello/consensus/tmp/codex-flicker-before.webm`
