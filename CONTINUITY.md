@@ -67,9 +67,13 @@ State:
     - Repointed `backup/local-changes-20260128-223008` to commit `6979001` (true pre-merge backup).
     - Verified `markSessionDirty` export exists on backup branch; server error resolved.
     - User confirmed status is good after revert.
+    - Created local `main` branch at backup commit and pushed to `origin/main`.
+    - Archived `init-oss` by tagging `archive/init-oss-20260128` and pushing the tag.
+    - Switched local working branch to `main` and set upstream to `origin/main`.
+    - Set GitHub default branch to `main`.
+    - Deleted remote `init-oss` branch.
   - Now:
-    - Prepare a commit that includes the updated Continuity Ledger.
-    - Push the backup branch state to `main`.
+    - Ready to continue work on `main`.
   - Next:
     - Re-validate UI behavior post-push (no flicker; accurate active counts, no ghost sessions).
     - Move to other providers (OpenCode/Claude) once OpenCode is stable.
