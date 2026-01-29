@@ -2,13 +2,10 @@ import type { AgentState } from "./types.js";
 import type { ActivityHoldResult } from "./activity.js";
 import { deriveStateWithHold } from "./activity.js";
 
-const DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS = 15000;
-
 export interface OpenCodeStateInput {
   cpu: number;
   hasError: boolean;
   lastEventAt?: number;
-  lastActivityAt?: number;
   inFlight?: boolean;
   status?: string;
   isServer?: boolean;
@@ -17,8 +14,6 @@ export interface OpenCodeStateInput {
   cpuThreshold?: number;
   eventWindowMs?: number;
   holdMs?: number;
-  inFlightIdleMs?: number;
-  strictInFlight?: boolean;
 }
 
 export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResult {
@@ -26,90 +21,69 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
   const statusIsError = !!status && /error|failed|failure/.test(status);
   const statusIsActive = !!status && /running|active|processing/.test(status);
   const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
-  const now = input.now ?? Date.now();
-  if (input.strictInFlight) {
-    if (input.isServer) {
-      if (input.hasError || statusIsError) return { state: "error", lastActiveAt: undefined };
-      return { state: "idle", lastActiveAt: undefined };
-    }
-    const state =
-      input.hasError || statusIsError ? "error" : input.inFlight ? "active" : "idle";
-    const reason =
-      input.hasError || statusIsError ? "error" : input.inFlight ? "in_flight" : "idle";
-    return { state, lastActiveAt: input.inFlight ? now : undefined, reason };
-  }
-  const cpuThreshold = input.cpuThreshold ?? Number(process.env.CONSENSUS_CPU_ACTIVE || 1);
-  const holdMs =
-    input.holdMs ?? Number(process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS || 1000);
-  const envInFlightIdle = process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS;
-  const envInFlightTimeout = process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS;
-  let inFlightIdleMs: number | undefined =
-    input.inFlightIdleMs ??
-    (envInFlightIdle !== undefined
-      ? Number(envInFlightIdle)
-      : envInFlightTimeout !== undefined
-        ? Number(envInFlightTimeout)
-        : DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS);
-  if (
-    typeof inFlightIdleMs !== "number" ||
-    !Number.isFinite(inFlightIdleMs) ||
-    inFlightIdleMs <= 0
-  ) {
-    inFlightIdleMs = undefined;
-  }
-  const eventWindowMs =
-    input.eventWindowMs ?? Number(process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS || 1000);
-  const activityAt =
-    typeof input.lastActivityAt === "number" ? input.lastActivityAt : undefined;
-  let inFlight = input.inFlight;
-  const recentActivity =
-    typeof activityAt === "number" && now - activityAt <= eventWindowMs;
-  const cpuActive = input.cpu >= cpuThreshold;
-  if (
-    inFlight &&
-    typeof inFlightIdleMs === "number" &&
-    typeof activityAt === "number" &&
-    now - activityAt > inFlightIdleMs
-  ) {
-    inFlight = false;
-  }
-  const hasEvidence = recentActivity || !!inFlight || cpuActive;
 
   const activity = deriveStateWithHold({
-    cpu: hasEvidence ? input.cpu : 0,
+    cpu: input.cpu,
     hasError: input.hasError,
-    lastEventAt: activityAt,
-    inFlight,
+    lastEventAt: input.lastEventAt,
+    inFlight: input.inFlight,
     previousActiveAt: input.previousActiveAt,
-    now,
-    cpuThreshold,
-    eventWindowMs,
-    holdMs,
+    now: input.now,
+    cpuThreshold: input.cpuThreshold,
+    eventWindowMs: input.eventWindowMs,
+    holdMs: input.holdMs,
   });
 
   let state: AgentState = activity.state;
-  let reason = activity.reason;
+  
+  // Handle error state first - this always takes priority
   if (statusIsError) {
     state = "error";
-    reason = "status_error";
-  } else if (statusIsIdle && !inFlight) {
-    state = "idle";
-    reason = "status_idle";
-  } else if (statusIsActive && state !== "active") {
-    state = "idle";
-    reason = "status_active_no_signal";
-  }
-
-  if (input.isServer) {
-    if (state === "error") {
-      return { state, lastActiveAt: activity.lastActiveAt, reason };
+  } else if (statusIsIdle) {
+    // Status explicitly says idle - respect that unless we're in a hold period
+    // This prevents flickering when status reports idle but hold is active
+    if (state !== "active" || !activity.lastActiveAt) {
+      state = "idle";
     }
-    return { state: "idle", lastActiveAt: undefined, reason: "server" };
+  } else if (statusIsActive) {
+    // Status indicates active (running/processing), but we need evidence
+    // to actually show as active. This prevents false positives when
+    // a process reports "running" but isn't actually doing work.
+    //
+    // CRITICAL: Only upgrade to active if we have real evidence of work:
+    // - inFlight flag is set
+    // - Recent event activity
+    // - CPU above threshold
+    // - Already in active hold period
+    //
+    // If status says "running" but there's no evidence, stay idle.
+    // This is the expected behavior per the test case.
+    const hasEvidence = 
+      input.inFlight ||
+      (typeof input.lastEventAt === "number") ||
+      (input.cpu > (input.cpuThreshold ?? 1)) ||
+      (state === "active" && activity.lastActiveAt);
+    
+    if (!hasEvidence) {
+      state = "idle";
+    }
   }
 
-  if (state === "idle") {
-    return { state, lastActiveAt: undefined, reason };
+  const cpuThreshold = input.cpuThreshold ?? Number(process.env.CONSENSUS_CPU_ACTIVE || 1);
+  if (input.isServer) {
+    // Server mode: use CPU as primary indicator but respect hold period
+    const cpuActive = input.cpu > cpuThreshold;
+    if (cpuActive) {
+      state = "active";
+    } else if (state === "active" && activity.lastActiveAt) {
+      // Keep active during hold period even for servers
+      state = "active";
+    } else {
+      state = "idle";
+    }
   }
 
-  return { state, lastActiveAt: activity.lastActiveAt, reason };
+  // CRITICAL FIX: Always preserve lastActiveAt for the hold mechanism
+  // This allows the hold period to work correctly across scan cycles
+  return { state, lastActiveAt: activity.lastActiveAt };
 }

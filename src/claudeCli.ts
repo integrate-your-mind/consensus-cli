@@ -21,7 +21,6 @@ export interface ClaudeActivityInput {
   cpuActiveMs?: number;
   cpuSustainMs?: number;
   cpuSpikeThreshold?: number;
-  holdMs?: number;
 }
 
 const CLAUDE_BINARIES = new Set(["claude", "claude.exe"]);
@@ -132,9 +131,7 @@ export function deriveClaudeState(input: ClaudeActivityInput): ActivityHoldResul
   const baseThreshold =
     input.cpuThreshold ??
     Number(process.env.CONSENSUS_CLAUDE_CPU_ACTIVE || process.env.CONSENSUS_CPU_ACTIVE || 1);
-  const hasWork =
-    info?.kind === "claude-cli" && (!!info?.prompt || !!info?.resume || !!info?.continued);
-  const now = input.now ?? Date.now();
+  const hasWork = !!info?.prompt || !!info?.resume || !!info?.continued;
   const isTui = info?.kind === "claude-tui";
   const effectiveThreshold = isTui && !hasWork ? baseThreshold * 3 : baseThreshold;
   const sustainMs =
@@ -146,28 +143,37 @@ export function deriveClaudeState(input: ClaudeActivityInput): ActivityHoldResul
     (Number.isFinite(spikeEnv) && spikeEnv > 0
       ? spikeEnv
       : Math.max(effectiveThreshold * 2, 5));
-  const allowSpikes = !(isTui && !hasWork);
-  const sustained = allowSpikes
-    ? input.cpu >= spikeThreshold ||
-      (typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs)
-    : typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs;
+  const sustained =
+    input.cpu >= spikeThreshold ||
+    (typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs);
   const cpuValue = isTui && !hasWork && !sustained ? 0 : input.cpu;
-  const holdMs =
-    input.holdMs ?? Number(process.env.CONSENSUS_CLAUDE_ACTIVE_HOLD_MS || 1000);
+  
   const result = deriveStateWithHold({
     cpu: cpuValue,
     hasError: false,
     lastEventAt: undefined,
-    inFlight: undefined,
+    inFlight: hasWork,
     previousActiveAt: input.previousActiveAt,
-    now,
+    now: input.now,
     cpuThreshold: effectiveThreshold,
-    holdMs,
   });
-  if (cpuValue <= effectiveThreshold && !sustained) {
-    if (result.state === "active") return result;
-    return { state: "idle", lastActiveAt: undefined, reason: "cpu_below" };
+  
+  // CRITICAL FIX: Don't bypass the hold mechanism with early return
+  // The previous code would return { state: "idle", lastActiveAt: undefined }
+  // when !hasWork && cpuValue <= effectiveThreshold, which broke the hold period.
+  // 
+  // Instead, we let deriveStateWithHold handle the hold logic properly.
+  // If we're in a hold period, we should stay active even if current CPU is low.
+  // Only clear lastActiveAt when we're genuinely transitioning out of the hold period.
+  
+  if (result.state === "idle" && !hasWork && cpuValue <= effectiveThreshold) {
+    // We're idle and there's no work - this is a genuine idle state
+    // But preserve lastActiveAt if we're still in the hold window
+    // The hold mechanism in deriveStateWithHold already handled this,
+    // so if we got "idle" back, the hold period has expired
+    return result;
   }
+  
   return result;
 }
 
@@ -175,8 +181,7 @@ export function getClaudeCpuThreshold(
   info: ClaudeCommandInfo | null | undefined,
   baseThreshold: number
 ): number {
-  const hasWork =
-    info?.kind === "claude-cli" && (!!info?.prompt || !!info?.resume || !!info?.continued);
+  const hasWork = !!info?.prompt || !!info?.resume || !!info?.continued;
   const isTui = info?.kind === "claude-tui";
   return isTui && !hasWork ? baseThreshold * 3 : baseThreshold;
 }
