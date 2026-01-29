@@ -64,14 +64,15 @@ State:
     - Created backup branch `backup/local-changes-20260128-222335` and saved diff to `/tmp/our-changes.patch`.
     - User confirmed Codex behavior is stable (no animation hang).
     - Attempted `git pull origin init-oss` but blocked by uncommitted local changes (pull aborted).
+    - Repointed `backup/local-changes-20260128-223008` to commit `6979001` (true pre-merge backup).
+    - Verified `markSessionDirty` export exists on backup branch; server error resolved.
+    - User confirmed status is good after revert.
   - Now:
-    - Create a backup branch and commit all current work so nothing is lost.
-    - Document which files to keep vs overwrite for the upcoming merge.
-    - Pull `origin/init-oss`, resolve conflicts, and re-apply local enhancements as needed.
-    - Re-validate build/tests after merge.
+    - Prepare a commit that includes the updated Continuity Ledger.
+    - Push the backup branch state to `main`.
   - Next:
-    - Re-validate UI behavior post-merge (no flicker; accurate active counts, no ghost sessions).
-    - After Codex is correct post-merge, move to other providers (OpenCode/Claude).
+    - Re-validate UI behavior post-push (no flicker; accurate active counts, no ghost sessions).
+    - Move to other providers (OpenCode/Claude) once OpenCode is stable.
     - Revisit architecture migration only if correctness cannot be achieved.
 
 Open questions (UNCONFIRMED if needed):
