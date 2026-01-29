@@ -216,16 +216,14 @@ function hashString(input) {
 }
 
 function agentIdentity(agent) {
-  // Prioritize explicit identity, then id (for server delta sync consistency)
-  // sessionPath is used as fallback only when needed for display/grouping
-  const identity = agent.identity || agent.id;
+  const identity = agent.identity || agent.sessionPath;
   if (identity) return identity;
   const kind = typeof agent.kind === "string" ? agent.kind : "";
   const isServer = kind === "app-server" || kind === "opencode-server";
   if (!isServer) {
-    return agent.sessionPath || `${agent.pid}`;
+    return agent.id || `${agent.pid}`;
   }
-  return agent.sessionPath || `${agent.pid}`;
+  return agent.id || `${agent.pid}`;
 }
 
 function groupKeyForAgent(agent) {
