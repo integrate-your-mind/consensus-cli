@@ -5,7 +5,8 @@ declare module "pidusage" {
     elapsed?: number;
   }
 
-  function pidusage(pids: number | number[]): Promise<Record<number, Status>>;
+  function pidusage(pid: number): Promise<Status>;
+  function pidusage(pids: number[]): Promise<Record<number, Status>>;
 
   namespace pidusage {
     export interface Status {

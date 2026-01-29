@@ -27,10 +27,13 @@ export interface WorkSummary {
 }
 
 export interface AgentSnapshot {
+  identity?: string;
   id: string;
   pid: number;
   startedAt?: number;
   lastEventAt?: number;
+  lastActivityAt?: number;
+  activityReason?: string;
   title?: string;
   cmd: string;
   cmdShort: string;
@@ -47,7 +50,29 @@ export interface AgentSnapshot {
   events?: EventSummary[];
 }
 
+export interface SnapshotMeta {
+  pollMs?: number;
+  opencode?: {
+    ok: boolean;
+    reachable?: boolean;
+    status?: number;
+    error?: string;
+  };
+  activity?: {
+    counts?: Record<string, Record<AgentState, number>>;
+    transitions?: Record<
+      string,
+      {
+        total: number;
+        byReason: Record<string, number>;
+        byState: Record<string, number>;
+      }
+    >;
+  };
+}
+
 export interface SnapshotPayload {
   ts: number;
   agents: AgentSnapshot[];
+  meta?: SnapshotMeta;
 }

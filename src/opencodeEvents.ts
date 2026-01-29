@@ -1,14 +1,30 @@
 import type { EventSummary, WorkSummary } from "./types.js";
+import { createParser } from "eventsource-parser";
 import { redactText } from "./redact.js";
 
 const MAX_EVENTS = 50;
 const STALE_TTL_MS = 30 * 60 * 1000;
 const RECONNECT_MIN_MS = 10_000;
+const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
+const INFLIGHT_TIMEOUT_MS = Number(
+  process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS || 15000
+);
+const ACTIVITY_KINDS = new Set<string>();
+const META_EVENT_RE =
+  /^(session|snapshot|history|heartbeat|connected|ready|ping|pong)(\.|$)/i;
+const START_EVENT_RE =
+  /(tool\.execute\.before|response\.(started|in_progress|running)|run\.(started|in_progress|running))/i;
+const END_EVENT_RE =
+  /((response|run)\.(completed|failed|errored|canceled|cancelled|aborted|interrupted|stopped)|session\.idle)/i;
+const DELTA_EVENT_RE =
+  /(response\.((output_text|function_call_arguments|content_part|text)\.delta)|message\.part\.updated)/i;
 
 interface ActivityState {
   events: EventSummary[];
   summary: WorkSummary;
   lastEventAt?: number;
+  lastActivityAt?: number;
+  lastInFlightSignalAt?: number;
   lastCommand?: EventSummary;
   lastEdit?: EventSummary;
   lastMessage?: EventSummary;
@@ -22,16 +38,68 @@ interface ActivityState {
 const sessionActivity = new Map<string, ActivityState>();
 const pidActivity = new Map<number, ActivityState>();
 
+type OpenCodeEventListener = () => void;
+const listeners = new Set<OpenCodeEventListener>();
+
+export function onOpenCodeEvent(listener: OpenCodeEventListener): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+type OpenCodeRawListener = (raw: any) => void;
+const rawListeners = new Set<OpenCodeRawListener>();
+
+export function onOpenCodeRawEvent(listener: OpenCodeRawListener): () => void {
+  rawListeners.add(listener);
+  return () => rawListeners.delete(listener);
+}
+
+function notifyListeners(): void {
+  for (const listener of listeners) {
+    try {
+      listener();
+    } catch {
+      // Ignore listener errors
+    }
+  }
+}
+
+function notifyRawListeners(raw: any): void {
+  for (const listener of rawListeners) {
+    try {
+      listener(raw);
+    } catch {
+      // Ignore listener errors
+    }
+  }
+}
+
+function logDebug(message: string): void {
+  if (!isDebugActivity()) return;
+  process.stderr.write(`[consensus][opencode] ${message}\n`);
+}
+
+function expireInFlight(state: ActivityState, now: number): void {
+  if (!state.inFlight) return;
+  const lastSignal = state.lastInFlightSignalAt ?? state.lastActivityAt ?? state.lastEventAt;
+  if (typeof lastSignal === "number" && now - lastSignal > INFLIGHT_TIMEOUT_MS) {
+    state.inFlight = false;
+    state.lastInFlightSignalAt = undefined;
+    state.lastActivityAt = undefined;
+  }
+}
+
 let connecting = false;
 let connected = false;
 let lastConnectAt = 0;
 let lastFailureAt = 0;
+let activeAbort: AbortController | null = null;
 
 function nowMs(): number {
   return Date.now();
 }
 
-function parseTimestamp(value: any): number {
+function parseTimestamp(value: any): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value < 100_000_000_000 ? value * 1000 : value;
   }
@@ -39,7 +107,7 @@ function parseTimestamp(value: any): number {
     const parsed = Date.parse(value);
     if (!Number.isNaN(parsed)) return parsed;
   }
-  return nowMs();
+  return undefined;
 }
 
 function extractText(value: any): string | undefined {
@@ -102,28 +170,25 @@ function summarizeEvent(raw: any): {
   const isError =
     !!raw?.error || lowerType.includes("error") || statusStr.includes("error");
   let inFlight: boolean | undefined;
-  if (
-    lowerType.includes("started") ||
-    statusStr.includes("started") ||
-    statusStr.includes("running") ||
-    statusStr.includes("processing") ||
-    statusStr.includes("in_progress")
-  ) {
-    inFlight = true;
-  } else if (
-    lowerType.includes("completed") ||
-    lowerType.includes("finished") ||
-    lowerType.includes("done") ||
-    lowerType.includes("ended") ||
-    statusStr.includes("completed") ||
-    statusStr.includes("finished") ||
-    statusStr.includes("done") ||
-    statusStr.includes("ended") ||
-    statusStr.includes("idle") ||
-    statusStr.includes("stopped") ||
-    statusStr.includes("paused") ||
-    isError
-  ) {
+  const isMessagePartUpdated = /message\.part\.updated/i.test(lowerType);
+  const partRole =
+    raw?.role ||
+    raw?.message?.role ||
+    raw?.part?.role ||
+    raw?.properties?.role;
+  const partType =
+    raw?.part?.type || raw?.part?.content?.type || raw?.properties?.partType;
+  const shouldTreatMessagePartActive =
+    isMessagePartUpdated &&
+    (partRole === "assistant" ||
+      partRole === "assistant_response" ||
+      partType === "output_text" ||
+      partType === "text");
+  if (START_EVENT_RE.test(lowerType) || DELTA_EVENT_RE.test(lowerType)) {
+    if (!isMessagePartUpdated || shouldTreatMessagePartActive) {
+      inFlight = true;
+    }
+  } else if (END_EVENT_RE.test(lowerType) || isError) {
     inFlight = false;
   }
 
@@ -181,6 +246,20 @@ function summarizeEvent(raw: any): {
     return { summary, kind: "prompt", isError, type, inFlight };
   }
 
+  const roleRaw =
+    raw?.role ||
+    raw?.message?.role ||
+    raw?.properties?.role ||
+    raw?.message?.author?.role ||
+    raw?.author?.role;
+  const role = typeof roleRaw === "string" ? roleRaw.toLowerCase() : "";
+  if (isMessagePartUpdated) {
+    if (role === "assistant" || role === "agent") {
+      inFlight = true;
+    } else {
+      inFlight = undefined;
+    }
+  }
   const messageText =
     extractText(raw?.message) ||
     extractText(raw?.content) ||
@@ -189,8 +268,14 @@ function summarizeEvent(raw: any): {
   if (messageText) {
     const trimmed = messageText.replace(/\s+/g, " ").trim();
     const snippet = trimmed.slice(0, 80);
-    const summary = redactText(snippet) || snippet;
-    return { summary, kind: "message", isError, type, inFlight };
+    if (role === "assistant" || role === "agent") {
+      const summary = redactText(snippet) || snippet;
+      return { summary, kind: "message", isError, type, inFlight: isMessagePartUpdated ? true : undefined };
+    }
+    if (role === "user") {
+      const summary = redactText(`prompt: ${snippet}`) || `prompt: ${snippet}`;
+      return { summary, kind: "prompt", isError, type, inFlight };
+    }
   }
 
   if (type && type !== "event") {
@@ -199,6 +284,19 @@ function summarizeEvent(raw: any): {
   }
 
   return { kind: "other", isError, type, inFlight };
+}
+
+function isActivityEvent(input: {
+  kind?: string;
+  type?: string;
+  inFlight?: boolean;
+}): boolean {
+  const type = typeof input.type === "string" ? input.type : "";
+  const lowerType = type.toLowerCase();
+  if (META_EVENT_RE.test(lowerType)) return false;
+  if (input.inFlight) return true;
+  if (START_EVENT_RE.test(lowerType) || DELTA_EVENT_RE.test(lowerType)) return true;
+  return false;
 }
 
 function ensureActivity<T extends string | number>(
@@ -220,7 +318,12 @@ function ensureActivity<T extends string | number>(
   return fresh;
 }
 
-function recordEvent(state: ActivityState, entry: EventSummary, kind?: string): void {
+function recordEvent(
+  state: ActivityState,
+  entry: EventSummary,
+  kind: string | undefined,
+  activityTs?: number
+): void {
   state.events.push(entry);
   if (state.events.length > MAX_EVENTS) {
     state.events = state.events.slice(-MAX_EVENTS);
@@ -232,6 +335,9 @@ function recordEvent(state: ActivityState, entry: EventSummary, kind?: string): 
   if (kind === "tool") state.lastTool = entry;
   if (kind === "prompt") state.lastPrompt = entry;
   if (entry.isError) state.lastError = entry;
+  if (typeof activityTs === "number") {
+    state.lastActivityAt = Math.max(state.lastActivityAt || 0, activityTs);
+  }
   state.summary = {
     current: state.events[state.events.length - 1]?.summary,
     lastCommand: state.lastCommand?.summary,
@@ -243,7 +349,8 @@ function recordEvent(state: ActivityState, entry: EventSummary, kind?: string): 
 }
 
 function handleRawEvent(raw: any): void {
-  const ts = parseTimestamp(
+  const now = nowMs();
+  const parsedTs = parseTimestamp(
     raw?.ts ||
       raw?.timestamp ||
       raw?.time ||
@@ -252,9 +359,16 @@ function handleRawEvent(raw: any): void {
       raw?.properties?.time ||
       raw?.properties?.timestamp
   );
+  const ts = parsedTs ?? now;
   const sessionId = getSessionId(raw);
   const pid = getPid(raw);
   const { summary, kind, isError, type, inFlight } = summarizeEvent(raw);
+  const activity = isActivityEvent({
+    kind,
+    type: typeof type === "string" ? type : undefined,
+    inFlight,
+  });
+  const activityTs = activity ? ts : undefined;
   const entry: EventSummary | null = summary
     ? {
         ts,
@@ -263,13 +377,18 @@ function handleRawEvent(raw: any): void {
         isError,
       }
     : null;
-  const now = nowMs();
+  let touched = false;
   if (sessionId) {
+    touched = true;
     const state = ensureActivity(sessionId, sessionActivity, now);
+    const prevInFlight = state.inFlight;
     if (entry) {
-      recordEvent(state, entry, kind);
+      recordEvent(state, entry, kind, activityTs);
     } else {
       state.lastEventAt = Math.max(state.lastEventAt || 0, ts);
+      if (typeof activityTs === "number") {
+        state.lastActivityAt = Math.max(state.lastActivityAt || 0, activityTs);
+      }
       if (isError) {
         state.lastError = {
           ts,
@@ -279,14 +398,35 @@ function handleRawEvent(raw: any): void {
         };
       }
     }
-    if (typeof inFlight === "boolean") state.inFlight = inFlight;
+    if (typeof inFlight === "boolean") {
+      state.inFlight = inFlight;
+      if (inFlight) {
+        state.lastInFlightSignalAt = now;
+      } else {
+        state.lastInFlightSignalAt = undefined;
+        state.lastActivityAt = undefined;
+      }
+    } else if (activity && state.inFlight) {
+      state.lastInFlightSignalAt = now;
+    }
+    if (prevInFlight !== state.inFlight) {
+      logDebug(
+        `inFlight ${prevInFlight ? "on" : "off"} -> ${state.inFlight ? "on" : "off"} ` +
+          `session=${sessionId} lastEventAt=${state.lastEventAt ?? "?"} ` +
+          `lastActivityAt=${state.lastActivityAt ?? "?"}`
+      );
+    }
   }
   if (typeof pid === "number") {
+    touched = true;
     const state = ensureActivity(pid, pidActivity, now);
     if (entry) {
-      recordEvent(state, entry, kind);
+      recordEvent(state, entry, kind, activityTs);
     } else {
       state.lastEventAt = Math.max(state.lastEventAt || 0, ts);
+      if (typeof activityTs === "number") {
+        state.lastActivityAt = Math.max(state.lastActivityAt || 0, activityTs);
+      }
       if (isError) {
         state.lastError = {
           ts,
@@ -296,8 +436,20 @@ function handleRawEvent(raw: any): void {
         };
       }
     }
-    if (typeof inFlight === "boolean") state.inFlight = inFlight;
+    if (typeof inFlight === "boolean") {
+      state.inFlight = inFlight;
+      if (inFlight) {
+        state.lastInFlightSignalAt = now;
+      } else {
+        state.lastInFlightSignalAt = undefined;
+        state.lastActivityAt = undefined;
+      }
+    } else if (activity && state.inFlight) {
+      state.lastInFlightSignalAt = now;
+    }
   }
+  if (touched) notifyListeners();
+  if (rawListeners.size) notifyRawListeners(raw);
 }
 
 export function ingestOpenCodeEvent(raw: unknown): void {
@@ -318,78 +470,86 @@ async function connectStream(host: string, port: number): Promise<void> {
   connecting = true;
   lastConnectAt = nowMs();
   try {
-    const response = await fetch(`http://${host}:${port}/global/event`, {
-      headers: {
-        Accept: "text/event-stream",
-      },
-    });
-    if (!response.ok || !response.body) {
-      connected = false;
+    const controller = new AbortController();
+    activeAbort = controller;
+    const endpoints = ["/global/event", "/event"];
+    for (const endpoint of endpoints) {
+      const response = await fetch(`http://${host}:${port}${endpoint}`, {
+        headers: {
+          Accept: "text/event-stream",
+        },
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body) continue;
+      connected = true;
       connecting = false;
-      lastFailureAt = nowMs();
+      const reader = response.body.getReader();
+      const parser = createParser({
+        onEvent: (event) => {
+          const payload = event.data;
+          if (!payload) return;
+          try {
+            const parsed = JSON.parse(payload);
+            let raw: any = parsed;
+            if (parsed && typeof parsed === "object" && parsed.payload && typeof parsed.payload === "object") {
+              raw = { ...parsed, ...parsed.payload };
+            }
+            if (event.event && typeof raw === "object" && raw && !raw.type) {
+              raw.type = event.event;
+            }
+            if (parsed?.type && typeof raw === "object" && raw && !raw.type) {
+              raw.type = parsed.type;
+            }
+            handleRawEvent(raw);
+          } catch {
+            // ignore malformed payloads
+          }
+        },
+      });
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        parser.feed(Buffer.from(value).toString("utf8"));
+      }
       return;
     }
-    connected = true;
-    connecting = false;
-    const reader = response.body.getReader();
-    let buffer = "";
-    let currentEvent: string | undefined;
-    let dataLines: string[] = [];
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += Buffer.from(value).toString("utf8");
-      let idx: number;
-      while ((idx = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, idx).trimEnd();
-        buffer = buffer.slice(idx + 1);
-        if (!line) {
-          if (dataLines.length) {
-            const payload = dataLines.join("\n");
-            try {
-              const parsed = JSON.parse(payload);
-              const raw = parsed?.payload ?? parsed;
-              if (currentEvent && typeof raw === "object" && !raw.type) {
-                raw.type = currentEvent;
-              }
-              if (parsed?.type && typeof raw === "object" && !raw.type) {
-                raw.type = parsed.type;
-              }
-              handleRawEvent(raw);
-            } catch {
-              // ignore malformed payloads
-            }
-          }
-          currentEvent = undefined;
-          dataLines = [];
-          continue;
-        }
-        if (line.startsWith("event:")) {
-          currentEvent = line.slice(6).trim();
-          continue;
-        }
-        if (line.startsWith("data:")) {
-          dataLines.push(line.slice(5).trim());
-        }
-      }
+    if (process.env.CONSENSUS_DEBUG_OPENCODE === "1") {
+      process.stderr.write(
+        `[consensus] opencode SSE connect failed at ${host}:${port}\n`
+      );
     }
+    lastFailureAt = nowMs();
   } catch {
     lastFailureAt = nowMs();
   } finally {
     connected = false;
     connecting = false;
+    if (activeAbort?.signal.aborted) {
+      // reset after explicit stop
+      activeAbort = null;
+    } else if (activeAbort) {
+      activeAbort = null;
+    }
   }
 }
 
 export function ensureOpenCodeEventStream(host: string, port: number): void {
   if (process.env.CONSENSUS_OPENCODE_EVENTS === "0") return;
   const now = nowMs();
+  if (activeAbort) return;
   if (connecting || connected) return;
   if (now - lastConnectAt < RECONNECT_MIN_MS) return;
   if (now - lastFailureAt < RECONNECT_MIN_MS) return;
   pruneStale();
   void connectStream(host, port);
+}
+
+export function stopOpenCodeEventStream(): void {
+  if (!activeAbort) return;
+  activeAbort.abort();
+  activeAbort = null;
+  connected = false;
+  connecting = false;
 }
 
 export function getOpenCodeActivityBySession(
@@ -398,18 +558,21 @@ export function getOpenCodeActivityBySession(
   events?: EventSummary[];
   summary?: WorkSummary;
   lastEventAt?: number;
+  lastActivityAt?: number;
   hasError?: boolean;
   inFlight?: boolean;
 } | null {
   if (!sessionId) return null;
   const state = sessionActivity.get(sessionId);
   if (!state) return null;
+  expireInFlight(state, nowMs());
   const events = state.events.slice(-20);
   const hasError = !!state.lastError || events.some((ev) => ev.isError);
   return {
     events,
     summary: state.summary,
     lastEventAt: state.lastEventAt,
+    lastActivityAt: state.lastActivityAt,
     hasError,
     inFlight: state.inFlight,
   };
@@ -421,18 +584,21 @@ export function getOpenCodeActivityByPid(
   events?: EventSummary[];
   summary?: WorkSummary;
   lastEventAt?: number;
+  lastActivityAt?: number;
   hasError?: boolean;
   inFlight?: boolean;
 } | null {
   if (typeof pid !== "number") return null;
   const state = pidActivity.get(pid);
   if (!state) return null;
+  expireInFlight(state, nowMs());
   const events = state.events.slice(-20);
   const hasError = !!state.lastError || events.some((ev) => ev.isError);
   return {
     events,
     summary: state.summary,
     lastEventAt: state.lastEventAt,
+    lastActivityAt: state.lastActivityAt,
     hasError,
     inFlight: state.inFlight,
   };

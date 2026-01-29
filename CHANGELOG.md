@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 This project follows Semantic Versioning.
 
 ## Unreleased
+- Fix: normalize OpenCode detection for mixed-case binary paths to keep servers in the correct lane.
+- Fix: OpenCode activity now uses work-only timestamps (not heartbeat events) and decays in-flight after idle.
+- Fix: Claude CLI prompts use a short pulse instead of sticking active indefinitely.
+- Fix: prevent OpenCode “server” misclassification when prompts include “server” text (tokenized subcommand parsing).
+- Fix: reduce OpenCode server idle flicker with a higher CPU threshold for servers.
+- Fix: avoid Codex in-flight flicker by clearing on explicit assistant completion (tool call tracking + assistant message end).
+- Fix: remove short in-flight idle clearing by default (configurable via `CONSENSUS_CODEX_INFLIGHT_IDLE_MS`).
+- Fix: stabilize Codex activation with prompt pulse + file-growth activity and longer event/hold defaults.
+- Fix: Codex prompt pulse for instant activation without waiting on streaming events.
+- Fix: ignore OpenCode helper processes without sessions to avoid false active tiles.
+- Fix: reduce OpenCode active/hold defaults for faster idle transitions.
+- Fix Codex session matching by using `session_meta` cwd when session IDs are missing.
+- Add sustained CPU fallback for Codex active detection when log signals lag.
+- Use OpenCode API/storage activity timestamps to reduce activation lag.
+- Harden WebSocket override handling for UI tests.
+- Switch to event-driven updates (Codex log watch + OpenCode SSE) with slow PID polling.
+- Surface OpenCode API failures in the UI status line.
+- Do not treat Codex prompts as activity (avoid false active state).
+- Deduplicate by PID to avoid hiding live agents when session association drifts.
+- Cache process/session scans for fast event-driven refreshes.
+- Expand Codex in-flight detection for response created/delta events.
+- Reduce Codex idle lag by shortening default active + hold windows.
+- Clear Codex in-flight state when activity is stale.
+- Fix: keep Codex in-flight active until timeout to prevent active/idle flicker mid-run.
+- Parallelize Codex tail reads to reduce pickup lag.
+- Lower Codex active windows for sub-second idle transitions.
 
 ## 0.1.6 - 2026-01-25
 - Treat Codex response items as activity only for assistant output/tool work (not user prompts).

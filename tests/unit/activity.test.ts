@@ -26,6 +26,30 @@ test("marks idle when no recent activity", () => {
   assert.equal(state, "idle");
 });
 
+test("keeps active at the event window boundary", () => {
+  const now = Date.now();
+  const state = deriveState({
+    cpu: 0,
+    hasError: false,
+    lastEventAt: now - 5000,
+    now,
+    eventWindowMs: 5000,
+  });
+  assert.equal(state, "active");
+});
+
+test("drops to idle just past the event window", () => {
+  const now = Date.now();
+  const state = deriveState({
+    cpu: 0,
+    hasError: false,
+    lastEventAt: now - 5001,
+    now,
+    eventWindowMs: 5000,
+  });
+  assert.equal(state, "idle");
+});
+
 test("marks error when hasError true", () => {
   const state = deriveState({ cpu: 20, hasError: true, lastEventAt: Date.now() });
   assert.equal(state, "error");

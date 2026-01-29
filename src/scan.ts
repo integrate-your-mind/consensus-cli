@@ -4,17 +4,28 @@ import fs from "fs";
 import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import type { AgentKind, AgentSnapshot, SnapshotPayload, WorkSummary } from "./types.js";
+import { performance } from "perf_hooks";
+import { Effect } from "effect";
+import type {
+  AgentKind,
+  AgentSnapshot,
+  AgentState,
+  SnapshotPayload,
+  WorkSummary,
+} from "./types.js";
 import { deriveCodexState } from "./codexState.js";
 import {
   listRecentSessions,
   findSessionById,
+  findSessionByCwd,
   pickSessionForProcess,
   resolveCodexHome,
   summarizeTail,
   updateTail,
+  getTailState,
 } from "./codexLogs.js";
-import { getOpenCodeSessions } from "./opencodeApi.js";
+import type { SessionFile } from "./codexLogs.js";
+import { getOpenCodeSessions, type OpenCodeSessionResult } from "./opencodeApi.js";
 import { ensureOpenCodeServer } from "./opencodeServer.js";
 import {
   ensureOpenCodeEventStream,
@@ -23,36 +34,186 @@ import {
 } from "./opencodeEvents.js";
 import { getOpenCodeSessionForDirectory } from "./opencodeStorage.js";
 import { deriveOpenCodeState } from "./opencodeState.js";
+import { shouldIncludeOpenCodeProcess } from "./opencodeFilter.js";
 import { deriveClaudeState, getClaudeCpuThreshold, summarizeClaudeCommand } from "./claudeCli.js";
+import { parseOpenCodeCommand, summarizeOpenCodeCommand } from "./opencodeCmd.js";
 import { redactText } from "./redact.js";
+import { dedupeAgents } from "./dedupe.js";
+import {
+  recordActivityCount,
+  recordActivityTransition,
+  runPromise,
+} from "./observability/index.js";
 
 const execFileAsync = promisify(execFile);
+const fsp = fs.promises;
 const repoCache = new Map<string, string | null>();
 const activityCache = new Map<
   string,
-  { lastActiveAt?: number; lastSeenAt: number; lastCpuAboveAt?: number }
+  {
+    lastActiveAt?: number;
+    lastSeenAt: number;
+    lastCpuAboveAt?: number;
+    lastState?: AgentState;
+    lastReason?: string;
+    startMs?: number;
+  }
 >();
+const dirtySessionPaths = new Set<string>();
+let opencodeSessionCache: OpenCodeSessionResult | null = null;
+let opencodeSessionCacheAt = 0;
+const pidSessionCache = new Map<
+  number,
+  { path: string; lastSeenAt: number; startMs?: number }
+>();
+const opencodeServerLogged = new Set<number>();
+const START_MS_EPSILON_MS = 1000;
+
+const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
+
+function logActivityDecision(message: string): void {
+  if (!isDebugActivity()) return;
+  process.stderr.write(`[consensus][activity] ${message}\n`);
+}
+
+function isStartMsMismatch(cached?: number, current?: number): boolean {
+  if (typeof cached !== "number" || typeof current !== "number") return false;
+  return Math.abs(cached - current) > START_MS_EPSILON_MS;
+}
+
+function providerForKind(kind: AgentKind): string {
+  if (kind.startsWith("opencode")) return "opencode";
+  if (kind.startsWith("claude")) return "claude";
+  if (kind === "app-server") return "server";
+  if (kind === "unknown") return "other";
+  return "codex";
+}
+
+const profileEnabled =
+  process.env.CONSENSUS_PROFILE === "1" || process.env.CONSENSUS_PROFILE === "true";
+const profileThresholdMs = Math.max(0, Number(process.env.CONSENSUS_PROFILE_MS || 25));
+
+type ProfileHandle = { label: string; start: number; extra?: string };
+
+function startProfile(label: string, extra?: string): ProfileHandle | null {
+  if (!profileEnabled) return null;
+  return { label, start: performance.now(), extra };
+}
+
+function endProfile(
+  handle: ProfileHandle | null,
+  data?: Record<string, number | string | undefined>
+): void {
+  if (!handle) return;
+  const duration = performance.now() - handle.start;
+  if (duration < profileThresholdMs) return;
+  const parts = data
+    ? Object.entries(data)
+        .filter(([, value]) => value !== undefined)
+        .map(([key, value]) => `${key}=${value}`)
+    : [];
+  const suffix = parts.length ? ` ${parts.join(" ")}` : "";
+  const label = handle.extra ? `${handle.label} ${handle.extra}` : handle.label;
+  process.stdout.write(`[consensus] scan:${label} ${duration.toFixed(1)}ms${suffix}\n`);
+}
+
+export function markSessionDirty(sessionPath: string): void {
+  if (!sessionPath) return;
+  dirtySessionPaths.add(sessionPath);
+}
+
+function consumeDirtySessions(): Set<string> {
+  const dirty = new Set(dirtySessionPaths);
+  dirtySessionPaths.clear();
+  return dirty;
+}
+
+type ScanMode = "fast" | "full";
+export interface ScanOptions {
+  mode?: ScanMode;
+  includeActivity?: boolean;
+}
+
+type PsProcess = Awaited<ReturnType<typeof psList>>[number];
+const processCache: {
+  at: number;
+  processes: PsProcess[];
+  usage: Record<number, pidusage.Status>;
+  cwds: Map<number, string>;
+  startTimes: Map<number, number>;
+  jsonlByPid: Map<number, string[]>;
+} = {
+  at: 0,
+  processes: [],
+  usage: {},
+  cwds: new Map(),
+  startTimes: new Map(),
+  jsonlByPid: new Map(),
+};
+
+const sessionCache: {
+  at: number;
+  home: string;
+  sessions: Awaited<ReturnType<typeof listRecentSessions>>;
+} = {
+  at: 0,
+  home: "",
+  sessions: [],
+};
+
+function stripQuotes(value: string): string {
+  return value.replace(/^["']|["']$/g, "");
+}
+
+function isCodexBinary(value: string | undefined): boolean {
+  if (!value) return false;
+  const cleaned = stripQuotes(value);
+  const base = path.basename(cleaned).toLowerCase();
+  return base === "codex" || base === "codex.exe";
+}
+
+function hasCodexVendorPath(cmdLine: string): boolean {
+  return /[\\/]+codex[\\/]+vendor[\\/]+/i.test(cmdLine);
+}
+
+function hasCodexToken(cmdLine: string): boolean {
+  return (
+    /(?:^|\s|[\\/])codex(\.exe)?(?:\s|$)/i.test(cmdLine) ||
+    /[\\/]+codex(\.exe)?/i.test(cmdLine)
+  );
+}
 
 function isCodexProcess(cmd: string | undefined, name: string | undefined, matchRe?: RegExp): boolean {
   if (!cmd && !name) return false;
-  if (matchRe) {
-    return matchRe.test(cmd || "") || matchRe.test(name || "");
-  }
+  if (isOpenCodeProcess(cmd, name)) return false;
+  if (isClaudeProcess(cmd, name)) return false;
   const cmdLine = cmd || "";
-  if (cmdLine.includes("/codex/vendor/")) return false;
-  if (name === "codex") return true;
-  if (cmdLine === "codex" || cmdLine.startsWith("codex ")) return true;
-  if (cmdLine.includes("/codex") || cmdLine.includes(" codex ")) return true;
+  if (hasCodexVendorPath(cmdLine)) return false;
+  if (matchRe) {
+    return matchRe.test(cmdLine) || matchRe.test(name || "");
+  }
+  if (isCodexBinary(name)) return true;
+  if (cmdLine && isCodexBinary(cmdLine.split(/\s+/g)[0])) return true;
+  if (hasCodexToken(cmdLine)) return true;
+  return false;
+}
+
+function isCodexVendorProcess(cmd: string | undefined, name: string | undefined): boolean {
+  if (!cmd && !name) return false;
+  const cmdLine = cmd || "";
+  if (!hasCodexVendorPath(cmdLine)) return false;
+  if (isCodexBinary(name)) return true;
+  if (hasCodexToken(cmdLine)) return true;
   return false;
 }
 
 function isOpenCodeProcess(cmd: string | undefined, name: string | undefined): boolean {
   if (!cmd && !name) return false;
-  if (name === "opencode") return true;
+  if (name && name.toLowerCase() === "opencode") return true;
   if (!cmd) return false;
   const firstToken = cmd.trim().split(/\s+/)[0];
-  const base = path.basename(firstToken);
-  if (base === "opencode") return true;
+  const base = path.basename(firstToken).toLowerCase();
+  if (base === "opencode" || base === "opencode.exe") return true;
   return false;
 }
 
@@ -68,17 +229,19 @@ function isClaudeProcess(cmd: string | undefined, name: string | undefined): boo
 
 function inferKind(cmd: string): AgentKind {
   if (cmd.includes(" app-server")) return "app-server";
-  if (cmd.includes(" exec")) return "exec";
-  if (cmd.includes(" codex") || cmd.startsWith("codex") || cmd.includes("/codex")) return "tui";
-  if (cmd.includes(" opencode") || cmd.startsWith("opencode") || cmd.includes("/opencode")) {
-    if (cmd.includes(" serve") || cmd.includes("--serve") || cmd.includes(" web")) {
-      return "opencode-server";
-    }
-    if (cmd.includes(" run")) return "opencode-cli";
-    return "opencode-tui";
-  }
+  const openInfo = parseOpenCodeCommand(cmd);
+  if (openInfo) return openInfo.kind;
   const claudeInfo = summarizeClaudeCommand(cmd);
   if (claudeInfo) return claudeInfo.kind;
+  if (cmd.includes(" exec")) return "exec";
+  if (
+    cmd.includes(" codex") ||
+    cmd.startsWith("codex") ||
+    cmd.startsWith("codex.exe") ||
+    /[\\/]+codex(\.exe)?/i.test(cmd)
+  ) {
+    return "tui";
+  }
   return "unknown";
 }
 
@@ -92,6 +255,8 @@ function parseDoingFromCmd(cmd: string): string | undefined {
   const parts = cmd.split(/\s+/g);
   const claudeInfo = summarizeClaudeCommand(cmd);
   if (claudeInfo?.doing) return claudeInfo.doing;
+  const openInfo = summarizeOpenCodeCommand(cmd);
+  if (openInfo?.doing) return openInfo.doing;
   const openIndex = parts.findIndex(
     (part) => part === "opencode" || part.endsWith("/opencode")
   );
@@ -132,7 +297,7 @@ function parseDoingFromCmd(cmd: string): string | undefined {
     return "monitor";
   }
   if (cmd.includes("app-server")) return "app-server";
-  if (cmd.startsWith("codex")) return "codex";
+  if (cmd.startsWith("codex") || cmd.startsWith("codex.exe")) return "codex";
   return undefined;
 }
 
@@ -141,12 +306,55 @@ function extractSessionId(cmd: string): string | undefined {
   const resumeIndex = parts.indexOf("resume");
   if (resumeIndex !== -1) {
     const token = parts[resumeIndex + 1];
-    if (token && /^[0-9a-fA-F-]{16,}$/.test(token)) return token;
+    if (token) {
+      const cleaned = stripQuotes(token);
+      if (/^[0-9a-fA-F-]{16,}$/.test(cleaned)) return cleaned;
+    }
   }
   const sessionFlag = parts.findIndex((part) => part === "--session" || part === "--session-id");
   if (sessionFlag !== -1) {
     const token = parts[sessionFlag + 1];
-    if (token && /^[0-9a-fA-F-]{16,}$/.test(token)) return token;
+    if (token) {
+      const cleaned = stripQuotes(token);
+      if (/^[0-9a-fA-F-]{16,}$/.test(cleaned)) return cleaned;
+    }
+  }
+  for (const part of parts) {
+    if (part.startsWith("--session-id=") || part.startsWith("--session=")) {
+      const token = part.split("=", 2)[1];
+      if (token) {
+        const cleaned = stripQuotes(token);
+        if (/^[0-9a-fA-F-]{16,}$/.test(cleaned)) return cleaned;
+      }
+    }
+  }
+  return undefined;
+}
+
+function splitCmdArgs(command: string): string[] {
+  if (!command) return [];
+  const matches = command.match(/(?:[^\s"]+|"[^"]*")+/g);
+  if (!matches) return [];
+  return matches.map((part) => part.replace(/^"(.*)"$/, "$1"));
+}
+
+function extractCwdFromCmd(cmd: string): string | undefined {
+  const parts = splitCmdArgs(cmd);
+  if (parts.length === 0) return undefined;
+  const flags = new Set(["--cwd", "--working-dir", "--workdir", "--dir"]);
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    if (!part) continue;
+    if (flags.has(part)) {
+      const next = parts[i + 1];
+      if (next && !next.startsWith("-")) return next;
+    }
+    for (const flag of flags) {
+      if (part.startsWith(`${flag}=`)) {
+        const value = part.slice(flag.length + 1);
+        if (value) return value;
+      }
+    }
   }
   return undefined;
 }
@@ -158,7 +366,13 @@ function extractOpenCodeSessionId(cmd: string): string | undefined {
   );
   if (sessionFlag !== -1) {
     const token = parts[sessionFlag + 1];
-    if (token) return token;
+    if (token) return stripQuotes(token);
+  }
+  for (const part of parts) {
+    if (part.startsWith("--session-id=") || part.startsWith("--session=")) {
+      const token = part.split("=", 2)[1];
+      if (token) return stripQuotes(token);
+    }
   }
   return undefined;
 }
@@ -225,6 +439,9 @@ async function getCwdsForPids(pids: number[]): Promise<Map<number, string>> {
   const result = new Map<number, string>();
   if (pids.length === 0) return result;
   if (process.platform === "win32") return result;
+  if (process.platform === "darwin") {
+    return await getCwdsForPidsWithLsof(pids);
+  }
   try {
     const { stdout } = await execFileAsync("ps", [
       "-o",
@@ -246,6 +463,11 @@ async function getCwdsForPids(pids: number[]): Promise<Map<number, string>> {
   } catch {
     // fall through to lsof
   }
+  return await getCwdsForPidsWithLsof(pids);
+}
+
+async function getCwdsForPidsWithLsof(pids: number[]): Promise<Map<number, string>> {
+  const result = new Map<number, string>();
   try {
     const { stdout } = await execFileAsync("lsof", [
       "-a",
@@ -272,10 +494,120 @@ async function getCwdsForPids(pids: number[]): Promise<Map<number, string>> {
   return result;
 }
 
+async function getJsonlForPids(pids: number[]): Promise<Map<number, string[]>> {
+  const result = new Map<number, string[]>();
+  if (pids.length === 0) return result;
+  if (process.platform === "win32") return result;
+  try {
+    const { stdout } = await execFileAsync("lsof", [
+      "-a",
+      "-p",
+      pids.join(","),
+      "-Fn",
+    ]);
+    let currentPid: number | null = null;
+    const lines = stdout.split(/\r?\n/).filter(Boolean);
+    for (const line of lines) {
+      if (line.startsWith("p")) {
+        const pid = Number(line.slice(1));
+        currentPid = Number.isNaN(pid) ? null : pid;
+        continue;
+      }
+      if (!currentPid) continue;
+      if (!line.startsWith("n")) continue;
+      const filePath = line.slice(1).trim();
+      if (!filePath.endsWith(".jsonl")) continue;
+      const list = result.get(currentPid) || [];
+      list.push(filePath);
+      result.set(currentPid, list);
+    }
+  } catch {
+    return result;
+  }
+  return result;
+}
+
+async function buildJsonlMtimeIndex(paths: string[]): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  for (const filePath of paths) {
+    if (result.has(filePath)) continue;
+    try {
+      const stat = await fsp.stat(filePath);
+      result.set(filePath, stat.mtimeMs);
+    } catch {
+      // ignore missing paths
+    }
+  }
+  return result;
+}
+
+function pickNewestJsonl(
+  paths: string[],
+  mtimes: Map<string, number>
+): string | undefined {
+  let best: string | undefined;
+  let bestMtime = -1;
+  for (const filePath of paths) {
+    const mtime = mtimes.get(filePath);
+    if (mtime === undefined) continue;
+    if (!best || mtime > bestMtime) {
+      best = filePath;
+      bestMtime = mtime;
+    }
+  }
+  return best;
+}
+
+async function getStartTimesForPidsWindows(pids: number[]): Promise<Map<number, number>> {
+  const result = new Map<number, number>();
+  if (pids.length === 0) return result;
+  const filter = pids.map((pid) => `ProcessId=${pid}`).join(" OR ");
+  if (!filter) return result;
+  const command = [
+    "Get-CimInstance Win32_Process -Filter",
+    `'${filter}'`,
+    "| Select-Object ProcessId,",
+    "@{Name='StartMs';Expression={[int64](([System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate).ToUniversalTime() - [DateTime]::Parse('1970-01-01T00:00:00Z')).TotalMilliseconds)}}",
+    "| ConvertTo-Json -Compress",
+  ].join(" ");
+  const run = async (shell: string): Promise<string> => {
+    const { stdout } = await execFileAsync(shell, ["-NoProfile", "-Command", command]);
+    return stdout;
+  };
+  let stdout = "";
+  try {
+    stdout = await run("powershell");
+  } catch {
+    try {
+      stdout = await run("pwsh");
+    } catch {
+      return result;
+    }
+  }
+  const trimmed = stdout.trim();
+  if (!trimmed) return result;
+  try {
+    const parsed = JSON.parse(trimmed) as
+      | { ProcessId?: number | string; StartMs?: number | string }
+      | Array<{ ProcessId?: number | string; StartMs?: number | string }>;
+    const entries = Array.isArray(parsed) ? parsed : [parsed];
+    for (const entry of entries) {
+      const pid = Number(entry.ProcessId);
+      const startMs = Number(entry.StartMs);
+      if (Number.isFinite(pid) && Number.isFinite(startMs)) {
+        result.set(pid, startMs);
+      }
+    }
+  } catch {
+    return result;
+  }
+  return result;
+}
+
 async function getStartTimesForPids(pids: number[]): Promise<Map<number, number>> {
   const result = new Map<number, number>();
   if (pids.length === 0) return result;
-  if (process.platform === "win32") return result;
+  if (process.platform === "win32") return await getStartTimesForPidsWindows(pids);
   try {
     const { stdout } = await execFileAsync("ps", ["-o", "pid=,lstart=", "-p", pids.join(",")]);
     const lines = stdout.split(/\r?\n/).filter(Boolean);
@@ -287,6 +619,55 @@ async function getStartTimesForPids(pids: number[]): Promise<Map<number, number>
       const parsed = Date.parse(dateStr);
       if (!Number.isNaN(parsed)) {
         result.set(pid, parsed);
+      }
+    }
+  } catch {
+    return result;
+  }
+  return result;
+}
+
+async function getPidUsageForPids(
+  pids: number[]
+): Promise<Record<number, pidusage.Status>> {
+  if (pids.length === 0) return {};
+  const fallback = async (): Promise<Record<number, pidusage.Status>> => {
+    const result: Record<number, pidusage.Status> = {};
+    for (const pid of pids) {
+      try {
+        const stat = await pidusage(pid);
+        if (stat && typeof stat.cpu === "number") {
+          result[pid] = stat;
+        }
+      } catch {
+        // ignore missing pids
+      }
+    }
+    return result;
+  };
+  try {
+    const bulk = await pidusage(pids);
+    if (bulk && Object.keys(bulk).length > 0) return bulk;
+  } catch {
+    // fall back to per-pid sampling
+  }
+  return await fallback();
+}
+
+async function getCpuFromPs(pids: number[]): Promise<Map<number, number>> {
+  const result = new Map<number, number>();
+  if (pids.length === 0) return result;
+  if (process.platform === "win32") return result;
+  try {
+    const { stdout } = await execFileAsync("ps", ["-o", "pid=,pcpu=", "-p", pids.join(",")]);
+    const lines = stdout.split(/\r?\n/).filter(Boolean);
+    for (const line of lines) {
+      const match = line.trim().match(/^(\d+)\s+([\d.]+)/);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      const cpu = Number(match[2]);
+      if (!Number.isNaN(pid) && Number.isFinite(cpu)) {
+        result.set(pid, cpu);
       }
     }
   } catch {
@@ -312,9 +693,33 @@ function findRepoRoot(cwd: string): string | null {
   return null;
 }
 
-export async function scanCodexProcesses(): Promise<SnapshotPayload> {
+export async function scanCodexProcesses(options: ScanOptions = {}): Promise<SnapshotPayload> {
   const now = Date.now();
+  const mode: ScanMode = options.mode ?? "full";
+  const includeActivity = options.includeActivity !== false;
+  const scanTimer = startProfile("total", mode);
+  const dirtySessions = includeActivity && mode === "fast" ? consumeDirtySessions() : null;
+  const metricEffects: Effect.Effect<void, never, never>[] = [];
+  const activityTransitions = new Map<
+    string,
+    { total: number; byReason: Record<string, number>; byState: Record<string, number> }
+  >();
+  const trackTransition = (
+    provider: string,
+    from: AgentState,
+    to: AgentState,
+    reason: string
+  ): void => {
+    const current =
+      activityTransitions.get(provider) || { total: 0, byReason: {}, byState: {} };
+    current.total += 1;
+    current.byReason[reason] = (current.byReason[reason] ?? 0) + 1;
+    const stateKey = `${from}->${to}`;
+    current.byState[stateKey] = (current.byState[stateKey] ?? 0) + 1;
+    activityTransitions.set(provider, current);
+  };
   const matchEnv = process.env.CONSENSUS_PROCESS_MATCH;
+  const debugOpencode = process.env.CONSENSUS_DEBUG_OPENCODE === "1";
   let matchRe: RegExp | undefined;
   if (matchEnv) {
     try {
@@ -323,8 +728,57 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       matchRe = undefined;
     }
   }
-  const processes = await psList();
-  const codexProcs = processes.filter((proc) => isCodexProcess(proc.cmd, proc.name, matchRe));
+  const pollMs = Math.max(250, Number(process.env.CONSENSUS_POLL_MS || 500));
+  const resolveMs = (value: string | undefined, fallback: number): number => {
+    if (value === undefined) return fallback;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const processCacheMs = Math.max(100, resolveMs(process.env.CONSENSUS_PROCESS_CACHE_MS, 1000));
+  const processCacheFastMs = Math.max(
+    100,
+    resolveMs(process.env.CONSENSUS_PROCESS_CACHE_FAST_MS, 500)
+  );
+  const processCacheTtl = mode === "fast" ? processCacheFastMs : processCacheMs;
+  const sessionCacheMs = Math.max(100, resolveMs(process.env.CONSENSUS_SESSION_CACHE_MS, 1000));
+  const sessionCacheFastMs = Math.max(
+    100,
+    resolveMs(process.env.CONSENSUS_SESSION_CACHE_FAST_MS, 500)
+  );
+  const sessionsCacheTtl = mode === "fast" ? sessionCacheFastMs : sessionCacheMs;
+  const shouldUseProcessCache =
+    mode === "fast" &&
+    now - processCache.at < processCacheTtl &&
+    processCache.processes.length > 0;
+
+  let processes: PsProcess[] = [];
+  let usage: Record<number, pidusage.Status> = {};
+  let cwds = new Map<number, string>();
+  let startTimes = new Map<number, number>();
+  let jsonlByPid = new Map<number, string[]>();
+
+  if (shouldUseProcessCache) {
+    processes = processCache.processes;
+    usage = processCache.usage;
+    cwds = processCache.cwds;
+    startTimes = processCache.startTimes;
+    jsonlByPid = processCache.jsonlByPid || new Map();
+  } else {
+    const psTimer = startProfile("psList");
+    processes = await psList();
+    endProfile(psTimer, { count: processes.length });
+  }
+  const codexWrapperProcs = processes.filter((proc) =>
+    isCodexProcess(proc.cmd, proc.name, matchRe)
+  );
+  const codexWrapperPidSet = new Set(codexWrapperProcs.map((proc) => proc.pid));
+  const codexVendorProcs = processes
+    .filter((proc) => isCodexVendorProcess(proc.cmd, proc.name))
+    .filter((proc) => !codexWrapperPidSet.has(proc.ppid ?? -1));
+  const includeVendor =
+    process.env.CONSENSUS_INCLUDE_CODEX_VENDOR === "1" ||
+    process.env.CONSENSUS_INCLUDE_CODEX_VENDOR === "true";
+  const codexProcs = includeVendor ? [...codexWrapperProcs, ...codexVendorProcs] : codexWrapperProcs;
   const codexPidSet = new Set(codexProcs.map((proc) => proc.pid));
   const opencodeProcs = processes
     .filter((proc) => isOpenCodeProcess(proc.cmd, proc.name))
@@ -336,69 +790,406 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
   const pids = Array.from(
     new Set([...codexProcs, ...opencodeProcs, ...claudeProcs].map((proc) => proc.pid))
   );
-  let usage: Record<number, pidusage.Status> = {};
-  try {
-    usage = (await pidusage(pids)) as Record<number, pidusage.Status>;
-  } catch {
-    usage = {};
+  if (shouldUseProcessCache) {
+    const refreshPids = Array.from(
+      new Set([...opencodeProcs, ...claudeProcs].map((proc) => proc.pid))
+    );
+    if (refreshPids.length > 0) {
+      const refreshTimer = startProfile("pidusage", "fast");
+      try {
+        const refreshed = await getPidUsageForPids(refreshPids);
+        usage = { ...usage, ...refreshed };
+        processCache.usage = usage;
+      } catch {
+        // ignore refresh failures
+      }
+      endProfile(refreshTimer, { count: refreshPids.length });
+    }
+  }
+  if (!shouldUseProcessCache) {
+    const usageTimer = startProfile("pidusage");
+    usage = await getPidUsageForPids(pids);
+    endProfile(usageTimer, { count: pids.length });
+
+    const cwdTimer = startProfile("cwd");
+    cwds = await getCwdsForPids(pids);
+    if (cwds.size < pids.length) {
+      for (const proc of processes) {
+        if (cwds.has(proc.pid)) continue;
+        const inferred = extractCwdFromCmd(proc.cmd || "");
+        if (inferred) cwds.set(proc.pid, inferred);
+      }
+    }
+    endProfile(cwdTimer, { count: cwds.size });
+
+    const codexChildren: number[] = [];
+    const childrenByPpid = new Map<number, number[]>();
+    for (const proc of processes) {
+      if (typeof proc.ppid !== "number") continue;
+      const list = childrenByPpid.get(proc.ppid) || [];
+      list.push(proc.pid);
+      childrenByPpid.set(proc.ppid, list);
+    }
+    for (const proc of codexProcs) {
+      const children = childrenByPpid.get(proc.pid);
+      if (!children) continue;
+      codexChildren.push(...children);
+    }
+    const jsonlCandidates = Array.from(new Set([...codexProcs.map((p) => p.pid), ...codexChildren]));
+    const jsonlTimer = startProfile("jsonl");
+    jsonlByPid = await getJsonlForPids(jsonlCandidates);
+    endProfile(jsonlTimer, { count: jsonlByPid.size });
+
+    const startTimer = startProfile("startTimes");
+    startTimes = await getStartTimesForPids(pids);
+    endProfile(startTimer, { count: startTimes.size });
+
+    processCache.at = now;
+    processCache.processes = processes;
+    processCache.usage = usage;
+    processCache.cwds = cwds;
+    processCache.startTimes = startTimes;
+    processCache.jsonlByPid = jsonlByPid;
   }
 
-  const cwds = await getCwdsForPids(pids);
-  const startTimes = await getStartTimesForPids(pids);
+  const opencodeCpuPids = opencodeProcs.map((proc) => proc.pid);
+  const needsCpuOverride = opencodeCpuPids.some((pid) => (usage[pid]?.cpu ?? 0) <= 0);
+  if (needsCpuOverride) {
+    const psCpu = await getCpuFromPs(opencodeCpuPids);
+    if (psCpu.size > 0) {
+      for (const [pid, cpu] of psCpu.entries()) {
+        const existing = usage[pid];
+        if (!existing || existing.cpu <= 0) {
+          usage[pid] = {
+            cpu,
+            memory: existing?.memory ?? 0,
+            elapsed: existing?.elapsed,
+          };
+        }
+      }
+      processCache.usage = usage;
+    }
+  }
+
   const codexHome = resolveCodexHome();
-  const sessions = await listRecentSessions(codexHome);
   const opencodeHost = process.env.CONSENSUS_OPENCODE_HOST || "127.0.0.1";
   const opencodePort = Number(process.env.CONSENSUS_OPENCODE_PORT || 4096);
-  const opencodeResult = await getOpenCodeSessions(opencodeHost, opencodePort, {
-    silent: true,
-    timeoutMs: Number(process.env.CONSENSUS_OPENCODE_TIMEOUT_MS || 1000),
-  });
-  await ensureOpenCodeServer(opencodeHost, opencodePort, opencodeResult);
-  if (opencodeProcs.length) {
+  const timeoutMs = Number(process.env.CONSENSUS_OPENCODE_TIMEOUT_MS || 1000);
+  const opencodePollMs = Math.max(pollMs * 2, 2000);
+  const shouldFetchOpenCode =
+    !opencodeSessionCache || now - opencodeSessionCacheAt > opencodePollMs;
+  const opencodeTimer = shouldFetchOpenCode ? startProfile("opencode") : null;
+  const opencodeResultPromise =
+    shouldFetchOpenCode
+      ? getOpenCodeSessions(opencodeHost, opencodePort, {
+          silent: true,
+          timeoutMs,
+        }).then((result) => {
+          opencodeSessionCache = result;
+          opencodeSessionCacheAt = now;
+          return result;
+        })
+      : Promise.resolve(opencodeSessionCache);
+
+  const opencodeResultRaw = await opencodeResultPromise;
+  endProfile(opencodeTimer, { ok: opencodeResultRaw?.ok ? 1 : 0 });
+  const opencodeResult = opencodeResultRaw ?? {
+    ok: false,
+    sessions: [],
+    reachable: false,
+  };
+  await ensureOpenCodeServer(opencodeHost, opencodePort, opencodeResult, opencodeProcs.length > 0);
+  if (opencodeProcs.length > 0 || opencodeResult.ok) {
     ensureOpenCodeEventStream(opencodeHost, opencodePort);
   }
   const opencodeSessions = opencodeResult.ok ? opencodeResult.sessions : [];
   const opencodeApiAvailable = opencodeResult.ok;
   const opencodeSessionsByPid = new Map<number, (typeof opencodeSessions)[number]>();
   const opencodeSessionsByDir = new Map<string, (typeof opencodeSessions)[number]>();
+  const opencodeCwdCounts = new Map<string, number>();
+  for (const proc of opencodeProcs) {
+    const cmdRaw = proc.cmd || proc.name || "";
+    const kind = inferKind(cmdRaw);
+    if (kind !== "opencode-tui") continue;
+    const cwdRaw = cwds.get(proc.pid);
+    if (!cwdRaw) continue;
+    opencodeCwdCounts.set(cwdRaw, (opencodeCwdCounts.get(cwdRaw) || 0) + 1);
+  }
+  const opencodeSessionTimestamp = (session: (typeof opencodeSessions)[number]): number => {
+    return (
+      parseTimestamp(
+        session.lastActivity ||
+          session.lastActivityAt ||
+          session.time?.updated ||
+          session.updatedAt ||
+          session.updated ||
+          session.time?.created ||
+          session.createdAt ||
+          session.created
+      ) ?? 0
+    );
+  };
+  const setLatestSessionByDir = (dir: string | undefined, session: (typeof opencodeSessions)[number]) => {
+    if (!dir) return;
+    const existing = opencodeSessionsByDir.get(dir);
+    if (!existing) {
+      opencodeSessionsByDir.set(dir, session);
+      return;
+    }
+    const existingTs = opencodeSessionTimestamp(existing);
+    const nextTs = opencodeSessionTimestamp(session);
+    if (nextTs >= existingTs) {
+      opencodeSessionsByDir.set(dir, session);
+    }
+  };
   for (const session of opencodeSessions) {
     const pid = coerceNumber(session.pid);
     if (typeof pid === "number") {
       opencodeSessionsByPid.set(pid, session);
     }
     if (typeof session.directory === "string") {
-      opencodeSessionsByDir.set(session.directory, session);
+      setLatestSessionByDir(session.directory, session);
     }
     if (typeof session.cwd === "string") {
-      opencodeSessionsByDir.set(session.cwd, session);
+      setLatestSessionByDir(session.cwd, session);
+    }
+  }
+
+  const cacheMatchesHome =
+    sessionCache.home === codexHome && sessionCache.sessions.length > 0;
+  let sessions: SessionFile[] = [];
+  if (mode === "fast") {
+    const shouldRefreshSessions = !!dirtySessions && dirtySessions.size > 0;
+    const shouldUseSessionCache =
+      cacheMatchesHome && now - sessionCache.at < sessionsCacheTtl;
+    if (shouldUseSessionCache && !shouldRefreshSessions) {
+      sessions = sessionCache.sessions;
+    } else {
+      const sessionsTimer = startProfile("sessions", "fast");
+      sessions = await listRecentSessions(codexHome);
+      endProfile(sessionsTimer, { count: sessions.length });
+      sessionCache.at = now;
+      sessionCache.home = codexHome;
+      sessionCache.sessions = sessions;
+    }
+  } else {
+    const shouldUseSessionCache =
+      cacheMatchesHome && now - sessionCache.at < sessionsCacheTtl;
+    if (shouldUseSessionCache) {
+      sessions = sessionCache.sessions;
+    } else {
+      const sessionsTimer = startProfile("sessions", "full");
+      sessions = await listRecentSessions(codexHome);
+      endProfile(sessionsTimer, { count: sessions.length });
+      sessionCache.at = now;
+      sessionCache.home = codexHome;
+      sessionCache.sessions = sessions;
     }
   }
 
   const agents: AgentSnapshot[] = [];
   const seenIds = new Set<string>();
-  const codexEventWindowMs = Number(
-    process.env.CONSENSUS_CODEX_EVENT_ACTIVE_MS || 60000
+  const codexEventWindowMs = resolveMs(
+    process.env.CONSENSUS_CODEX_EVENT_ACTIVE_MS,
+    1000
   );
-  const codexHoldMs = Number(
-    process.env.CONSENSUS_CODEX_ACTIVE_HOLD_MS || 90000
+  const codexStaleActiveMs = resolveMs(
+    process.env.CONSENSUS_CODEX_STALE_ACTIVE_MS,
+    5000
   );
+  const codexMtimeWindowMs = resolveMs(
+    process.env.CONSENSUS_CODEX_MTIME_ACTIVE_MS,
+    0
+  );
+  const codexHoldMs = resolveMs(
+    process.env.CONSENSUS_CODEX_ACTIVE_HOLD_MS,
+    0
+  );
+  const codexInFlightGraceMs = resolveMs(
+    process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS,
+    0
+  );
+  const codexInFlightIdleMs =
+    process.env.CONSENSUS_CODEX_INFLIGHT_IDLE_MS !== undefined
+      ? resolveMs(process.env.CONSENSUS_CODEX_INFLIGHT_IDLE_MS, 0)
+      : undefined;
+  const codexStrictEnv = process.env.CONSENSUS_CODEX_STRICT_INFLIGHT;
+  const codexStrictInFlight =
+    codexStrictEnv === undefined || codexStrictEnv === ""
+      ? true
+      : codexStrictEnv === "1" || codexStrictEnv === "true";
+  const cpuThreshold = Number(process.env.CONSENSUS_CPU_ACTIVE || 1);
+  const claudeStartGraceMs = resolveMs(
+    process.env.CONSENSUS_CLAUDE_START_ACTIVE_MS,
+    1200
+  );
+
+  type CodexContext = {
+    proc: PsProcess;
+    cpu: number;
+    mem: number;
+    startMs?: number;
+    cmdRaw: string;
+    cwdRaw?: string;
+    sessionId?: string;
+    session?: SessionFile;
+    jsonlPaths?: string[];
+  };
+  const codexContexts: CodexContext[] = [];
+  const codexCwdCounts = new Map<string, number>();
+  for (const proc of codexProcs) {
+    const cwdRaw = cwds.get(proc.pid);
+    if (!cwdRaw) continue;
+    codexCwdCounts.set(cwdRaw, (codexCwdCounts.get(cwdRaw) || 0) + 1);
+  }
+  const usedSessionPaths = new Set<string>();
+  const normalizeSessionPath = (value?: string): string | undefined =>
+    value ? path.resolve(value) : undefined;
+  const pickUnusedSession = (startMs?: number): SessionFile | undefined => {
+    let best: SessionFile | undefined;
+    let bestDelta = Number.POSITIVE_INFINITY;
+    for (const session of sessions) {
+      const key = normalizeSessionPath(session.path);
+      if (key && usedSessionPaths.has(key)) continue;
+      if (startMs === undefined) return session;
+      const delta = Math.abs(session.mtimeMs - startMs);
+      if (delta < bestDelta) {
+        best = session;
+        bestDelta = delta;
+      }
+    }
+    return best;
+  };
+
+  const jsonlPaths = Array.from(
+    new Set(
+      Array.from(jsonlByPid.values()).flatMap((paths) => paths)
+    )
+  );
+  const jsonlMtimes = await buildJsonlMtimeIndex(jsonlPaths);
+
+  const childJsonlByPid = new Map<number, string[]>();
+  if (jsonlByPid.size > 0) {
+    const childrenByPpid = new Map<number, number[]>();
+    for (const proc of processes) {
+      if (typeof proc.ppid !== "number") continue;
+      const list = childrenByPpid.get(proc.ppid) || [];
+      list.push(proc.pid);
+      childrenByPpid.set(proc.ppid, list);
+    }
+    for (const proc of codexProcs) {
+      const childPids = childrenByPpid.get(proc.pid) || [];
+      const childPaths = childPids.flatMap((pid) => jsonlByPid.get(pid) || []);
+      if (childPaths.length) childJsonlByPid.set(proc.pid, childPaths);
+    }
+  }
+
   for (const proc of codexProcs) {
     const stats = usage[proc.pid] || ({} as pidusage.Status);
     const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
     const mem = typeof stats.memory === "number" ? stats.memory : 0;
-
     const elapsed = (stats as pidusage.Status & { elapsed?: number }).elapsed;
     const startMs =
       typeof elapsed === "number"
-        ? Date.now() - elapsed
+        ? now - elapsed
         : startTimes.get(proc.pid);
-
     const cmdRaw = proc.cmd || proc.name || "";
+    const cwdRaw = cwds.get(proc.pid);
     const sessionId = extractSessionId(cmdRaw);
-    const session =
+    let cachedSession: SessionFile | undefined;
+    let cachedEntry = pidSessionCache.get(proc.pid);
+    if (cachedEntry && isStartMsMismatch(cachedEntry.startMs, startMs)) {
+      pidSessionCache.delete(proc.pid);
+      cachedEntry = undefined;
+    }
+    if (cachedEntry) {
+      try {
+        const stat = await fsp.stat(cachedEntry.path);
+        cachedSession = { path: cachedEntry.path, mtimeMs: stat.mtimeMs };
+      } catch {
+        pidSessionCache.delete(proc.pid);
+      }
+    }
+    const cwdCount = cwdRaw ? codexCwdCounts.get(cwdRaw) || 0 : 0;
+    const sessionByCwd =
+      !sessionId && cwdRaw && cwdCount === 1
+        ? await findSessionByCwd(sessions, cwdRaw, startMs)
+        : undefined;
+    const directJsonl = jsonlByPid.get(proc.pid) || [];
+    const childJsonl = childJsonlByPid.get(proc.pid) || [];
+    const mappedJsonl = pickNewestJsonl([...directJsonl, ...childJsonl], jsonlMtimes);
+    let session =
+      mappedJsonl
+        ? { path: mappedJsonl, mtimeMs: jsonlMtimes.get(mappedJsonl) ?? now }
+        : undefined;
+    session =
       (sessionId && sessions.find((item) => item.path.includes(sessionId))) ||
       (sessionId ? await findSessionById(codexHome, sessionId) : undefined) ||
-      pickSessionForProcess(sessions, startMs);
+      cachedSession ||
+      session;
+    if (!session) {
+      const byStart = startMs !== undefined ? pickUnusedSession(startMs) : undefined;
+      session = sessionByCwd || byStart || pickUnusedSession();
+    }
+    const allowReuse =
+      !!sessionId ||
+      /\bresume\b/i.test(cmdRaw);
+    const initialSessionPath = normalizeSessionPath(session?.path);
+    const sessionByCwdPath = normalizeSessionPath(sessionByCwd?.path);
+    if (initialSessionPath && usedSessionPaths.has(initialSessionPath) && !allowReuse) {
+      session =
+        sessionByCwd && sessionByCwdPath && !usedSessionPaths.has(sessionByCwdPath)
+          ? sessionByCwd
+          : undefined;
+      if (!session) session = pickUnusedSession(startMs);
+    }
+    const sessionPath = normalizeSessionPath(session?.path);
+    if (sessionPath) {
+      usedSessionPaths.add(sessionPath);
+    }
+    codexContexts.push({
+      proc,
+      cpu,
+      mem,
+      startMs,
+      cmdRaw,
+      cwdRaw,
+      sessionId,
+      session,
+    });
+  }
+
+  const tailTargets = new Set<string>();
+  const cachedTails = new Map<string, Awaited<ReturnType<typeof updateTail>>>();
+  if (includeActivity) {
+    if (dirtySessions) {
+      for (const dirtyPath of dirtySessions) {
+        tailTargets.add(path.resolve(dirtyPath));
+      }
+    }
+    for (const ctx of codexContexts) {
+      const sessionPath = normalizeSessionPath(ctx.session?.path);
+      if (!sessionPath) continue;
+      tailTargets.add(sessionPath);
+    }
+  }
+  const tailsTimer = startProfile("tails");
+  const tailEntries: Array<[string, Awaited<ReturnType<typeof updateTail>>]> =
+    includeActivity
+      ? await Promise.all(
+          Array.from(tailTargets).map(async (sessionPath) => {
+            const tail = await updateTail(sessionPath);
+            return [sessionPath, tail] as const;
+          })
+        )
+      : [];
+  endProfile(tailsTimer, { updated: tailTargets.size, cached: cachedTails.size });
+  const tailsByPath = new Map<string, Awaited<ReturnType<typeof updateTail>>>([
+    ...cachedTails.entries(),
+    ...tailEntries,
+  ]);
+  for (const ctx of codexContexts) {
+    const { proc, cpu, mem, startMs, cmdRaw, cwdRaw, session, sessionId } = ctx;
     let doing: string | undefined;
     let events: AgentSnapshot["events"];
     let model: string | undefined;
@@ -407,10 +1198,14 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     let summary: WorkSummary | undefined;
     let lastEventAt: number | undefined;
     let lastActivityAt: number | undefined;
+    let lastInFlightSignalAt: number | undefined;
+    let lastIngestAt: number | undefined;
     let inFlight = false;
+    let lastMtimeMs: number | undefined;
 
-    if (session) {
-      const tail = await updateTail(session.path);
+    const sessionPath = normalizeSessionPath(session?.path);
+    if (sessionPath) {
+      const tail = includeActivity ? tailsByPath.get(sessionPath) : getTailState(sessionPath);
       if (tail) {
         const tailSummary = summarizeTail(tail);
         doing = tailSummary.doing;
@@ -421,7 +1216,10 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
         summary = tailSummary.summary;
         lastEventAt = tailSummary.lastEventAt;
         lastActivityAt = tailSummary.lastActivityAt;
+        lastInFlightSignalAt = tailSummary.lastInFlightSignalAt;
+        lastIngestAt = tailSummary.lastIngestAt;
         inFlight = !!tailSummary.inFlight;
+        lastMtimeMs = tail.lastMtimeMs;
       }
     }
 
@@ -433,28 +1231,82 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       summary = { current: doing };
     }
 
-    const cwdRaw = cwds.get(proc.pid);
     const cwd = redactText(cwdRaw) || cwdRaw;
     const repoRoot = cwdRaw ? findRepoRoot(cwdRaw) : null;
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
 
+    const sessionIdentity = sessionPath ? `codex:${sessionPath}` : `pid:${proc.pid}`;
+    if (sessionPath) {
+      pidSessionCache.set(proc.pid, { path: sessionPath, lastSeenAt: now, startMs });
+    }
     const id = `${proc.pid}`;
-    const cached = activityCache.get(id);
+    let cached = activityCache.get(id);
+    if (isStartMsMismatch(cached?.startMs, startMs)) {
+      activityCache.delete(id);
+      cached = undefined;
+    }
+    const codexStartedRecently =
+      typeof startMs === "number" && now - startMs <= codexHoldMs;
+    const previousActiveAt = codexStartedRecently ? now : cached?.lastActiveAt;
+    const cpuAbove = cpu > cpuThreshold;
+    const cpuActiveMs =
+      cpuAbove && cached?.lastCpuAboveAt ? now - cached.lastCpuAboveAt : 0;
+    const lastCpuAboveAt = cpuAbove ? cached?.lastCpuAboveAt ?? now : undefined;
+    const mtimeSignalAt =
+      typeof lastMtimeMs === "number" && now - lastMtimeMs <= codexMtimeWindowMs
+        ? lastMtimeMs
+        : undefined;
+    const combinedActivityAt = lastActivityAt;
+    const inFlightGrace =
+      !inFlight &&
+      typeof lastInFlightSignalAt === "number" &&
+      now - lastInFlightSignalAt <= codexInFlightGraceMs;
+    const effectiveInFlight = inFlight || inFlightGrace;
     const activity = deriveCodexState({
       cpu,
       hasError,
-      lastActivityAt,
-      inFlight,
-      previousActiveAt: cached?.lastActiveAt,
+      lastActivityAt: combinedActivityAt,
+      lastInFlightSignalAt,
+      inFlight: effectiveInFlight,
+      cpuActiveMs,
+      inFlightIdleMs: codexInFlightIdleMs,
+      previousActiveAt,
       now,
+      cpuThreshold,
       eventWindowMs: codexEventWindowMs,
       holdMs: codexHoldMs,
+      strictInFlight: codexStrictInFlight,
     });
-    const state = activity.state;
+    let state = activity.state;
+    let reason = activity.reason || "unknown";
+    const activityAt =
+      typeof combinedActivityAt === "number" ? combinedActivityAt : activity.lastActiveAt;
+    if (
+      state === "active" &&
+      !effectiveInFlight &&
+      typeof activityAt === "number" &&
+      now - activityAt > codexStaleActiveMs
+    ) {
+      state = "idle";
+      reason = "stale_ttl";
+    }
+    const prevState = cached?.lastState;
+    if (prevState && prevState !== state) {
+      metricEffects.push(recordActivityTransition("codex", prevState, state, reason));
+      trackTransition("codex", prevState, state, reason);
+      logActivityDecision(
+        `codex state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
+          `cpu=${cpu.toFixed(2)} inFlight=${effectiveInFlight ? 1 : 0} ` +
+          `lastActivity=${combinedActivityAt ?? "?"}`
+      );
+    }
     activityCache.set(id, {
       lastActiveAt: activity.lastActiveAt,
       lastSeenAt: now,
-      lastCpuAboveAt: cached?.lastCpuAboveAt,
+      lastCpuAboveAt,
+      lastState: state,
+      lastReason: reason,
+      startMs,
     });
     seenIds.add(id);
     const cmd = redactText(cmdRaw) || cmdRaw;
@@ -466,10 +1318,13 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const safeSummary = sanitizeSummary(summary);
 
     agents.push({
+      identity: sessionIdentity,
       id,
       pid: proc.pid,
       startedAt,
       lastEventAt,
+      lastActivityAt: activityAt,
+      activityReason: reason,
       title: redactText(computedTitle) || computedTitle,
       cmd,
       cmdShort,
@@ -478,7 +1333,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       mem,
       state,
       doing: redactText(doing) || doing,
-      sessionPath: redactText(session?.path) || session?.path,
+      sessionPath: sessionPath ? redactText(sessionPath) || sessionPath : undefined,
       repo: repoName,
       cwd,
       model,
@@ -487,13 +1342,31 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     });
   }
 
-  const opencodeEventWindowMs = Number(
-    process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS || 90_000
+  const opencodeEventWindowMs = resolveMs(
+    process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS,
+    0
   );
-  const opencodeHoldMs = Number(
-    process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS || 120_000
+  const opencodeStaleActiveMs = resolveMs(
+    process.env.CONSENSUS_OPENCODE_STALE_ACTIVE_MS,
+    0
   );
-  const cpuThreshold = Number(process.env.CONSENSUS_CPU_ACTIVE || 1);
+  const opencodeCpuWindowMs = resolveMs(
+    process.env.CONSENSUS_OPENCODE_CPU_ACTIVE_MS,
+    0
+  );
+  const opencodeHoldMs = resolveMs(
+    process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS,
+    0
+  );
+  const opencodeStrictEnv = process.env.CONSENSUS_OPENCODE_STRICT_INFLIGHT;
+  const opencodeStrictInFlight =
+    opencodeStrictEnv === undefined || opencodeStrictEnv === ""
+      ? true
+      : opencodeStrictEnv === "1" || opencodeStrictEnv === "true";
+  const opencodeInFlightIdleMs =
+    process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS !== undefined
+      ? resolveMs(process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS, 0)
+      : undefined;
   for (const proc of opencodeProcs) {
     const stats = usage[proc.pid] || ({} as pidusage.Status);
     const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
@@ -502,22 +1375,34 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const elapsed = (stats as pidusage.Status & { elapsed?: number }).elapsed;
     const startMs =
       typeof elapsed === "number"
-        ? Date.now() - elapsed
+        ? now - elapsed
         : startTimes.get(proc.pid);
 
     const cmdRaw = proc.cmd || proc.name || "";
-    const sessionByPid = opencodeSessionsByPid.get(proc.pid);
+    const kind = inferKind(cmdRaw);
+    const isLspRun =
+      kind === "opencode-cli" &&
+      /opencode\s+run/i.test(cmdRaw) &&
+      (cmdRaw.includes("language-server") || cmdRaw.includes(".local/share/opencode/bin/node_modules"));
+    if (isLspRun) continue;
+    const isServer = kind === "opencode-server";
+    const sessionByPid = isServer ? undefined : opencodeSessionsByPid.get(proc.pid);
     const cwdMatch = cwds.get(proc.pid);
-    const sessionByDir = sessionByPid
-      ? undefined
-      : opencodeSessionsByDir.get(cwdMatch || "");
+    const cwdCount = cwdMatch ? opencodeCwdCounts.get(cwdMatch) || 0 : 0;
+    const allowDirMatch = cwdCount <= 1;
+    const sessionByDir =
+      sessionByPid || isServer || kind !== "opencode-tui" || !allowDirMatch
+        ? undefined
+        : opencodeSessionsByDir.get(cwdMatch || "");
     const session = sessionByPid || sessionByDir;
     const storageSession =
-      !session && cwdMatch ? await getOpenCodeSessionForDirectory(cwdMatch) : undefined;
+      !isServer && !session && cwdMatch && allowDirMatch
+        ? await getOpenCodeSessionForDirectory(cwdMatch)
+        : undefined;
     const sessionId =
-      session?.id || storageSession?.id || extractOpenCodeSessionId(cmdRaw);
+      !isServer ? session?.id || storageSession?.id || extractOpenCodeSessionId(cmdRaw) : undefined;
     const sessionTitle = normalizeTitle(
-      session?.title || session?.name || storageSession?.title
+      !isServer ? session?.title || session?.name || storageSession?.title : undefined
     );
     const sessionCwd = session?.cwd || session?.directory || storageSession?.directory;
     const cwdRaw = sessionCwd || cwds.get(proc.pid);
@@ -525,15 +1410,17 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const repoRoot = cwdRaw ? findRepoRoot(cwdRaw) : null;
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
 
-    const lastActivityAt = parseTimestamp(
+    const apiUpdatedAt = parseTimestamp(
       session?.lastActivity ||
         session?.lastActivityAt ||
         storageSession?.time?.updated ||
-        storageSession?.time?.created ||
         session?.time?.updated ||
-        session?.time?.created ||
         session?.updatedAt ||
-        session?.updated ||
+        session?.updated
+    );
+    const apiCreatedAt = parseTimestamp(
+      storageSession?.time?.created ||
+        session?.time?.created ||
         session?.createdAt ||
         session?.created
     );
@@ -541,23 +1428,69 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const status = statusRaw?.toLowerCase();
     const statusIsError = !!status && /error|failed|failure/.test(status);
     const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
+    const statusIsActive = !!status && /running|active|processing/.test(status);
     let hasError = statusIsError;
     const model = typeof session?.model === "string" ? session.model : undefined;
 
-    let doing: string | undefined = sessionTitle;
+    let doing: string | undefined = isServer ? "opencode server" : sessionTitle;
     let summary: WorkSummary | undefined;
     let events: AgentSnapshot["events"];
     const eventActivity =
-      getOpenCodeActivityBySession(sessionId) || getOpenCodeActivityByPid(proc.pid);
-    let lastEventAt: number | undefined = eventActivity?.lastEventAt;
+      !isServer
+        ? getOpenCodeActivityBySession(sessionId) || getOpenCodeActivityByPid(proc.pid)
+        : null;
+    const includeOpenCode = shouldIncludeOpenCodeProcess({
+      kind,
+      opencodeApiAvailable,
+      hasSession: !!session || !!storageSession,
+      hasEventActivity: !!eventActivity,
+      cpu,
+      cpuThreshold,
+    });
+    if (!includeOpenCode) continue;
+    if (debugOpencode && isServer && !opencodeServerLogged.has(proc.pid)) {
+      opencodeServerLogged.add(proc.pid);
+      process.stdout.write(
+        `[consensus] opencode server detected pid=${proc.pid} cmd=${cmdRaw}\n`
+      );
+    }
+    let lastEventAt: number | undefined;
+    let lastActivityAt: number | undefined;
     let inFlight = eventActivity?.inFlight;
     if (eventActivity) {
       events = eventActivity.events;
       summary = eventActivity.summary || summary;
-      lastEventAt = eventActivity.lastEventAt || lastEventAt;
+      if (typeof eventActivity.lastEventAt === "number") {
+        if (typeof lastEventAt !== "number" || eventActivity.lastEventAt > lastEventAt) {
+          lastEventAt = eventActivity.lastEventAt;
+        }
+      }
+      if (typeof eventActivity.lastActivityAt === "number") {
+        if (
+          typeof lastActivityAt !== "number" ||
+          eventActivity.lastActivityAt > lastActivityAt
+        ) {
+          lastActivityAt = eventActivity.lastActivityAt;
+        }
+      }
       if (eventActivity.hasError) hasError = true;
       if (eventActivity.inFlight) inFlight = true;
       if (eventActivity.summary?.current) doing = eventActivity.summary.current;
+    }
+    const allowApiActivityAt = !statusIsIdle && (!!eventActivity || !!inFlight);
+    const apiActivityAt = allowApiActivityAt ? apiUpdatedAt ?? apiCreatedAt : undefined;
+    if (typeof apiActivityAt === "number") {
+      lastEventAt =
+        typeof lastEventAt === "number"
+          ? Math.max(lastEventAt, apiActivityAt)
+          : apiActivityAt;
+      lastActivityAt =
+        typeof lastActivityAt === "number"
+          ? Math.max(lastActivityAt, apiActivityAt)
+          : apiActivityAt;
+    }
+    if (statusIsIdle && !eventActivity?.inFlight) {
+      inFlight = false;
     }
     if (!lastEventAt && statusIsIdle) {
       lastEventAt = undefined;
@@ -568,36 +1501,89 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     }
     if (doing) summary = { current: doing };
 
+    const sessionIdentity = sessionId ? `opencode:${sessionId}` : `pid:${proc.pid}`;
     const id = `${proc.pid}`;
-    const cached = activityCache.get(id);
-    const kind = inferKind(cmdRaw);
+    let cached = activityCache.get(id);
+    if (isStartMsMismatch(cached?.startMs, startMs)) {
+      activityCache.delete(id);
+      cached = undefined;
+    }
+    const cpuAbove = cpu > cpuThreshold;
+    const lastCpuAboveAt = cpuAbove ? now : cached?.lastCpuAboveAt;
+    const cpuSignal =
+      typeof lastActivityAt === "number" || inFlight ? cpu : 0;
+    if (
+      typeof lastCpuAboveAt === "number" &&
+      now - lastCpuAboveAt <= opencodeCpuWindowMs &&
+      typeof lastActivityAt === "number"
+    ) {
+      lastActivityAt = Math.max(lastActivityAt, lastCpuAboveAt);
+    }
+    const opencodeStartedRecently =
+      typeof startMs === "number" && now - startMs <= opencodeHoldMs;
+    const previousActiveAt = opencodeStartedRecently ? now : cached?.lastActiveAt;
     const activity = deriveOpenCodeState({
-      cpu,
+      cpu: cpuSignal,
       hasError,
-      lastEventAt: lastEventAt,
+      lastEventAt,
+      lastActivityAt,
       inFlight,
       status,
       isServer: kind === "opencode-server",
-      previousActiveAt: cached?.lastActiveAt,
+      previousActiveAt,
       now,
       cpuThreshold,
-      eventWindowMs: opencodeEventWindowMs,
+      eventWindowMs: Math.max(opencodeEventWindowMs, opencodeCpuWindowMs),
       holdMs: opencodeHoldMs,
+      inFlightIdleMs: opencodeInFlightIdleMs,
+      strictInFlight: opencodeStrictInFlight,
     });
     let state = activity.state;
+    let reason = activity.reason || "unknown";
     const hasSignal =
       statusIsIdle ||
       statusIsError ||
-      typeof lastEventAt === "number" ||
+      typeof lastActivityAt === "number" ||
       typeof inFlight === "boolean";
-    if (!opencodeApiAvailable && !hasSignal) state = "idle";
+    const activityAt = typeof lastActivityAt === "number" ? lastActivityAt : undefined;
+    if (!opencodeApiAvailable && !hasSignal) {
+      state = "idle";
+      reason = "api_unavailable";
+    }
     if (!hasSignal && cpu <= cpuThreshold) {
       state = "idle";
+      reason = "no_signal";
+    }
+    if (
+      state === "active" &&
+      !inFlight &&
+      typeof activityAt === "number" &&
+      now - activityAt > opencodeStaleActiveMs
+    ) {
+      state = "idle";
+      reason = "stale_ttl";
+    }
+    if (isServer && state !== "error") {
+      state = "idle";
+      reason = "server_idle";
+    }
+    const prevState = cached?.lastState;
+    if (prevState && prevState !== state) {
+      metricEffects.push(recordActivityTransition("opencode", prevState, state, reason));
+      trackTransition("opencode", prevState, state, reason);
+      logActivityDecision(
+        `opencode state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
+          `cpu=${cpu.toFixed(2)} inFlight=${inFlight ? 1 : 0} ` +
+          `lastActivity=${lastActivityAt ?? "?"} status=${status ?? "?"}`
+      );
     }
     activityCache.set(id, {
       lastActiveAt: activity.lastActiveAt,
       lastSeenAt: now,
-      lastCpuAboveAt: cached?.lastCpuAboveAt,
+      lastCpuAboveAt,
+      lastState: state,
+      lastReason: reason,
+      startMs,
     });
     seenIds.add(id);
 
@@ -608,10 +1594,13 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const safeSummary = sanitizeSummary(summary);
 
     agents.push({
+      identity: sessionIdentity,
       id,
       pid: proc.pid,
       startedAt,
       lastEventAt,
+      lastActivityAt,
+      activityReason: reason,
       title: redactText(computedTitle) || computedTitle,
       cmd,
       cmdShort,
@@ -620,6 +1609,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       mem,
       state,
       doing: redactText(doing) || doing,
+      sessionPath: sessionId ? `opencode:${sessionId}` : undefined,
       repo: repoName,
       cwd,
       model,
@@ -636,7 +1626,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const elapsed = (stats as pidusage.Status & { elapsed?: number }).elapsed;
     const startMs =
       typeof elapsed === "number"
-        ? Date.now() - elapsed
+        ? now - elapsed
         : startTimes.get(proc.pid);
 
     const cmdRaw = proc.cmd || proc.name || "";
@@ -653,8 +1643,13 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
     const kind = claudeInfo?.kind || inferKind(cmdRaw);
 
+    const sessionIdentity = `pid:${proc.pid}`;
     const id = `${proc.pid}`;
-    const cached = activityCache.get(id);
+    let cached = activityCache.get(id);
+    if (isStartMsMismatch(cached?.startMs, startMs)) {
+      activityCache.delete(id);
+      cached = undefined;
+    }
     const claudeBaseThreshold = Number(
       process.env.CONSENSUS_CLAUDE_CPU_ACTIVE || process.env.CONSENSUS_CPU_ACTIVE || 1
     );
@@ -662,19 +1657,36 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const cpuAbove = cpu > claudeThreshold;
     const cpuActiveMs = cpuAbove && cached?.lastCpuAboveAt ? now - cached.lastCpuAboveAt : 0;
     const lastCpuAboveAt = cpuAbove ? cached?.lastCpuAboveAt ?? now : undefined;
+    const startedRecently =
+      typeof startMs === "number" && now - startMs <= claudeStartGraceMs;
+    const previousActiveAt = startedRecently ? now : cached?.lastActiveAt;
     const activity = deriveClaudeState({
       cpu,
       info: claudeInfo,
-      previousActiveAt: cached?.lastActiveAt,
+      previousActiveAt,
       now,
       cpuThreshold: claudeBaseThreshold,
       cpuActiveMs,
     });
     const state = activity.state;
+    const reason = activity.reason || "unknown";
+    const activityAt = activity.lastActiveAt ?? cached?.lastActiveAt;
+    const prevState = cached?.lastState;
+    if (prevState && prevState !== state) {
+      metricEffects.push(recordActivityTransition("claude", prevState, state, reason));
+      trackTransition("claude", prevState, state, reason);
+      logActivityDecision(
+        `claude state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
+          `cpu=${cpu.toFixed(2)} threshold=${claudeThreshold}`
+      );
+    }
     activityCache.set(id, {
-      lastActiveAt: state === "active" ? activity.lastActiveAt : undefined,
+      lastActiveAt: activity.lastActiveAt,
       lastSeenAt: now,
       lastCpuAboveAt,
+      lastState: state,
+      lastReason: reason,
+      startMs,
     });
     seenIds.add(id);
 
@@ -685,6 +1697,7 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     const safeSummary = sanitizeSummary(summary);
 
     agents.push({
+      identity: sessionIdentity,
       id,
       pid: proc.pid,
       startedAt,
@@ -695,6 +1708,8 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       cpu,
       mem,
       state,
+      lastActivityAt: activityAt,
+      activityReason: reason,
       doing: redactText(doing) || doing,
       repo: repoName,
       cwd,
@@ -703,13 +1718,72 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
     });
   }
 
-  for (const id of activityCache.keys()) {
-    if (!seenIds.has(id)) {
-      activityCache.delete(id);
+  const dedupedAgents = dedupeAgents(agents);
+  const activityCounts = new Map<string, Record<AgentState, number>>();
+  for (const agent of dedupedAgents) {
+    const provider = providerForKind(agent.kind);
+    const current = activityCounts.get(provider) || { active: 0, idle: 0, error: 0 };
+    current[agent.state] += 1;
+    activityCounts.set(provider, current);
+  }
+  const activityCountMeta: Record<string, Record<AgentState, number>> = {};
+  for (const [provider, counts] of activityCounts.entries()) {
+    activityCountMeta[provider] = counts;
+    metricEffects.push(recordActivityCount(provider, "active", counts.active));
+    metricEffects.push(recordActivityCount(provider, "idle", counts.idle));
+    metricEffects.push(recordActivityCount(provider, "error", counts.error));
+  }
+  const activityTransitionMeta: Record<
+    string,
+    { total: number; byReason: Record<string, number>; byState: Record<string, number> }
+  > = {};
+  for (const [provider, summary] of activityTransitions.entries()) {
+    activityTransitionMeta[provider] = summary;
+  }
+  if (metricEffects.length > 0) {
+    void runPromise(Effect.all(metricEffects).pipe(Effect.asVoid)).catch((err) => {
+      logActivityDecision(`metrics error: ${String(err)}`);
+    });
+  }
+
+  if (includeActivity) {
+    for (const id of activityCache.keys()) {
+      if (!seenIds.has(id)) {
+        activityCache.delete(id);
+      }
+    }
+  }
+  for (const pid of pidSessionCache.keys()) {
+    if (!codexPidSet.has(pid)) {
+      pidSessionCache.delete(pid);
+    }
+  }
+  for (const pid of opencodeServerLogged.keys()) {
+    if (!opencodePidSet.has(pid)) {
+      opencodeServerLogged.delete(pid);
     }
   }
 
-  return { ts: now, agents };
+  const activityMeta =
+    Object.keys(activityCountMeta).length > 0 ||
+    Object.keys(activityTransitionMeta).length > 0
+      ? {
+          counts: activityCountMeta,
+          transitions: activityTransitionMeta,
+        }
+      : undefined;
+  const meta = {
+    opencode: {
+      ok: opencodeResult.ok,
+      reachable: opencodeResult.reachable,
+      status: opencodeResult.status,
+      error: opencodeResult.error,
+    },
+    activity: activityMeta,
+  };
+
+  endProfile(scanTimer, { agents: dedupedAgents.length });
+  return { ts: now, agents: dedupedAgents, meta };
 }
 
 const isDirectRun = process.argv[1] && process.argv[1].endsWith("scan.js");

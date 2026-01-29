@@ -23,3 +23,85 @@ test("opencode active when inFlight true", () => {
   });
   assert.equal(result.state, "active");
 });
+
+test("opencode ignores lastEventAt without activity", () => {
+  const now = 1_000_000;
+  const result = deriveOpenCodeState({
+    cpu: 0,
+    hasError: false,
+    status: "running",
+    lastEventAt: now - 200,
+    eventWindowMs: 1000,
+    now,
+  });
+  assert.equal(result.state, "idle");
+});
+
+test("opencode inFlight decays after idle window", () => {
+  const now = 1_000_000;
+  const result = deriveOpenCodeState({
+    cpu: 0,
+    hasError: false,
+    status: "running",
+    inFlight: true,
+    lastActivityAt: now - 2_000,
+    inFlightIdleMs: 1_000,
+    now,
+  });
+  assert.equal(result.state, "idle");
+});
+
+test("opencode holds active during brief idle gap while running", () => {
+  const now = 1_000_000;
+  const result = deriveOpenCodeState({
+    cpu: 0,
+    hasError: false,
+    status: "running",
+    previousActiveAt: now - 500,
+    holdMs: 1000,
+    now,
+  });
+  assert.equal(result.state, "active");
+});
+
+test("opencode drops to idle after hold window while running", () => {
+  const now = 1_000_000;
+  const result = deriveOpenCodeState({
+    cpu: 0,
+    hasError: false,
+    status: "running",
+    previousActiveAt: now - 2000,
+    holdMs: 1000,
+    now,
+  });
+  assert.equal(result.state, "idle");
+});
+
+test("opencode server is always idle unless error", () => {
+  const now = 1_000_000;
+  const result = deriveOpenCodeState({
+    cpu: 10,
+    hasError: false,
+    status: "running",
+    isServer: true,
+    previousActiveAt: now - 5_000,
+    holdMs: 10_000,
+    now,
+  });
+  assert.equal(result.state, "idle");
+  assert.equal(result.lastActiveAt, undefined);
+});
+
+test("opencode idle status clears hold for non-server agents", () => {
+  const now = 1_000_000;
+  const result = deriveOpenCodeState({
+    cpu: 0,
+    hasError: false,
+    status: "idle",
+    previousActiveAt: now - 2_000,
+    holdMs: 10_000,
+    now,
+  });
+  assert.equal(result.state, "idle");
+  assert.equal(result.lastActiveAt, undefined);
+});

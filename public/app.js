@@ -17,14 +17,44 @@ const serverTitle = document.querySelector(".server-title");
 const tileW = 96;
 const tileH = 48;
 const gridScale = 2;
+const roofScale = 0.28;
+const roofHitScale = 0.44;
+const roofW = tileW * roofScale;
+const roofH = roofW * 0.5;
+const roofHitW = tileW * roofHitScale;
+const roofHitH = roofHitW * 0.5;
+const markerScale = 0.36;
+const markerW = tileW * markerScale;
+const markerH = markerW * 0.5;
+const markerOffset = tileH * 0.6;
 
 const query = new URLSearchParams(window.location.search);
 const mockMode = query.get("mock") === "1";
-const wsOverrideRaw = query.get("ws");
-const wsOverride =
-  wsOverrideRaw && (wsOverrideRaw.startsWith("ws://") || wsOverrideRaw.startsWith("wss://"))
-    ? wsOverrideRaw
-    : null;
+const wsOverrideRaw =
+  query.get("ws") ||
+  (() => {
+    const match = window.location.href.match(/[?&]ws=([^&]+)/);
+    return match ? match[1] : null;
+  })();
+const wsOverrideDecoded = wsOverrideRaw ? decodeURIComponent(wsOverrideRaw) : null;
+let wsOverride = null;
+if (wsOverrideDecoded) {
+  if (wsOverrideDecoded.startsWith("ws://") || wsOverrideDecoded.startsWith("wss://")) {
+    wsOverride = wsOverrideDecoded;
+  } else if (
+    wsOverrideDecoded.startsWith("http://") ||
+    wsOverrideDecoded.startsWith("https://")
+  ) {
+    wsOverride = wsOverrideDecoded.replace(/^http/, "ws");
+  }
+}
+if (wsOverrideRaw || mockMode) {
+  window.__consensusDebug = {
+    wsOverride,
+    wsOverrideRaw,
+    search: window.location.search,
+  };
+}
 
 const cliPalette = {
   codex: {
@@ -97,9 +127,23 @@ let hovered = null;
 let selected = null;
 let searchQuery = "";
 let searchMatches = new Set();
+let wsLastMessageAt = Date.now();
+let wsHealthTimer = null;
+let wsSeq = 0;
+let pendingSnapshot = null;
+let pendingSnapshotSeq = 0;
+let lastAppliedSeq = 0;
+const WS_STALE_MS = 5000;
+let wsStatus = "connecting…";
+let latestMeta = {};
+let ledgerSeq = 0;
+let ledgerTs = 0;
+let ledgerMeta = {};
+const ledgerAgents = new Map();
 
 const layout = new Map();
 const occupied = new Map();
+let layoutLocked = false;
 
 function ensureSelectedVisible(agent) {
   if (!agent || !panel.classList.contains("open")) return;
@@ -171,12 +215,23 @@ function hashString(input) {
   return Math.abs(hash);
 }
 
+function agentIdentity(agent) {
+  const identity = agent.identity || agent.sessionPath;
+  if (identity) return identity;
+  const kind = typeof agent.kind === "string" ? agent.kind : "";
+  const isServer = kind === "app-server" || kind === "opencode-server";
+  if (!isServer) {
+    return agent.id || `${agent.pid}`;
+  }
+  return agent.id || `${agent.pid}`;
+}
+
 function groupKeyForAgent(agent) {
-  return agent.repo || agent.cwd || agent.cmd || agent.id;
+  return agent.repo || agent.cwd || agent.cmd || agentIdentity(agent);
 }
 
 function keyForAgent(agent) {
-  return `${groupKeyForAgent(agent)}::${agent.id}`;
+  return `${groupKeyForAgent(agent)}::${agentIdentity(agent)}`;
 }
 
 function assignCoordinate(key, baseKey) {
@@ -205,6 +260,7 @@ function assignCoordinate(key, baseKey) {
 }
 
 function updateLayout(newAgents) {
+  if (layoutLocked) return;
   const activeKeys = new Set();
   for (const agent of newAgents) {
     const key = keyForAgent(agent);
@@ -218,13 +274,38 @@ function updateLayout(newAgents) {
   for (const [key, coord] of layout.entries()) {
     if (!activeKeys.has(key)) {
       layout.delete(key);
-      occupied.delete(`${coord.x},${coord.y}`);
+      occupied.delete(`${coord.x / gridScale},${coord.y / gridScale}`);
     }
   }
 }
 
+function renderStatus() {
+  const suffixes = [];
+  const opencode = latestMeta && latestMeta.opencode ? latestMeta.opencode : null;
+  if (opencode && opencode.ok === false) {
+    if (opencode.reachable === false) {
+      suffixes.push("OpenCode API unreachable");
+    } else if (opencode.error === "non_json") {
+      suffixes.push("OpenCode API bad response");
+    } else if (typeof opencode.status === "number") {
+      suffixes.push(`OpenCode API ${opencode.status}`);
+    } else if (opencode.error) {
+      suffixes.push(`OpenCode API ${opencode.error}`);
+    } else {
+      suffixes.push("OpenCode API error");
+    }
+  }
+
+  if ((wsStatus === "live" || wsStatus === "stale") && suffixes.length) {
+    statusEl.textContent = `${wsStatus} • ${suffixes.join(" • ")}`;
+    return;
+  }
+  statusEl.textContent = wsStatus;
+}
+
 function setStatus(text) {
-  statusEl.textContent = text;
+  wsStatus = text;
+  renderStatus();
 }
 
 function setCount(agentCount, serverCount) {
@@ -265,6 +346,50 @@ function escapeHtml(value) {
 
 function isServerKind(kind) {
   return kind === "app-server" || kind === "opencode-server";
+}
+
+const STATE_RANK = { error: 3, active: 2, idle: 1 };
+
+function pickBetterAgent(a, b) {
+  const rankA = STATE_RANK[a.state] ?? 0;
+  const rankB = STATE_RANK[b.state] ?? 0;
+  if (rankA !== rankB) return rankA > rankB ? a : b;
+
+  const eventA = a.lastEventAt ?? 0;
+  const eventB = b.lastEventAt ?? 0;
+  if (eventA !== eventB) return eventA > eventB ? a : b;
+
+  if (a.cpu !== b.cpu) return a.cpu > b.cpu ? a : b;
+  if (a.mem !== b.mem) return a.mem > b.mem ? a : b;
+
+  const startA = a.startedAt ?? 0;
+  const startB = b.startedAt ?? 0;
+  if (startA !== startB) return startA > startB ? a : b;
+
+  return a;
+}
+
+function dedupeAgentsByIdentity(list) {
+  const byKey = new Map();
+  for (const agent of list) {
+    const identity = agentIdentity(agent) || `${agent.pid}`;
+    const scope = isServerKind(agent.kind) ? "server" : "agent";
+    const key = `${scope}:${identity}`;
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, agent);
+      continue;
+    }
+    byKey.set(key, pickBetterAgent(existing, agent));
+  }
+  return [...byKey.values()];
+}
+
+function normalizeState(value) {
+  if (typeof value !== "string") return "idle";
+  const state = value.trim().toLowerCase();
+  if (state === "active" || state === "idle" || state === "error") return state;
+  return "idle";
 }
 
 function cliForAgent(agent) {
@@ -347,6 +472,21 @@ function roundRect(ctx, x, y, width, height, radius) {
   ctx.closePath();
 }
 
+function pointInQuad(pt, a, b, c, d) {
+  const sign = (p1, p2, p3) => (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+  let hasPos = false;
+  let hasNeg = false;
+  const points = [a, b, c, d];
+  for (let i = 0; i < points.length; i += 1) {
+    const next = (i + 1) % points.length;
+    const s = sign(pt, points[i], points[next]);
+    if (s > 0) hasPos = true;
+    if (s < 0) hasNeg = true;
+    if (hasPos && hasNeg) return false;
+  }
+  return true;
+}
+
 function drawTag(ctx, x, y, text, accent) {
   if (!text) return;
   ctx.save();
@@ -387,13 +527,18 @@ function renderLaneList(items, container, emptyLabel) {
     .map((agent) => {
       const doingRaw = agent.summary?.current || agent.doing || agent.cmdShort || "";
       const doing = escapeHtml(truncate(doingRaw, 80));
-      const selectedClass = selected && selected.id === agent.id ? "is-selected" : "";
+      const selectedClass =
+        selected && agentIdentity(selected) === agentIdentity(agent) ? "is-selected" : "";
       const accent = accentFor(agent);
       const accentGlow = accentSoftFor(agent);
       const cli = cliForAgent(agent);
       const label = escapeHtml(labelFor(agent));
+      const isActive = agent.state === "active";
+      const laneId = agentIdentity(agent);
+      const laneTestId = escapeHtml(`lane-${laneId}`);
+      const laneState = escapeHtml(agent.state || "idle");
       return `
-        <button class="lane-item ${selectedClass} cli-${cli}" type="button" data-id="${agent.id}" style="--cli-accent: ${accent}; --cli-accent-glow: ${accentGlow};">
+        <button class="lane-item ${selectedClass} cli-${cli}" type="button" data-id="${laneId}" data-testid="${laneTestId}" data-state="${laneState}" data-active="${isActive}" aria-busy="${isActive}" style="--cli-accent: ${accent}; --cli-accent-glow: ${accentGlow};">
           <div class="lane-pill ${agent.state}"></div>
           <div class="lane-copy">
             <div class="lane-label">${label}</div>
@@ -407,7 +552,7 @@ function renderLaneList(items, container, emptyLabel) {
   Array.from(container.querySelectorAll(".lane-item")).forEach((item) => {
     item.addEventListener("click", () => {
       const id = item.getAttribute("data-id");
-      selected = sorted.find((agent) => agent.id === id) || null;
+      selected = sorted.find((agent) => agentIdentity(agent) === id) || null;
       renderPanel(selected);
     });
   });
@@ -434,6 +579,10 @@ function renderPanel(agent) {
   const lastEventAt = agent.lastEventAt
     ? new Date(agent.lastEventAt).toLocaleTimeString()
     : null;
+  const lastActivityAt = agent.lastActivityAt
+    ? new Date(agent.lastActivityAt).toLocaleTimeString()
+    : null;
+  const activityReason = agent.activityReason;
   const showMetadata = searchQuery.trim().length > 0;
   panelContent.innerHTML = `
     <div class="panel-section">
@@ -459,6 +608,8 @@ function renderPanel(agent) {
                 .join("")
             : "<div>-</div>"
         }
+        ${activityReason ? `<div><span class="panel-key">activity reason</span>${escapeHtml(activityReason)}</div>` : ""}
+        ${lastActivityAt ? `<div><span class="panel-key">last activity</span>${escapeHtml(lastActivityAt)}</div>` : ""}
         ${lastEventAt ? `<div><span class="panel-key">last event</span>${escapeHtml(lastEventAt)}</div>` : ""}
         <div><span class="panel-key">cpu</span>${escapeHtml(formatPercent(agent.cpu))}</div>
         <div><span class="panel-key">mem</span>${escapeHtml(formatBytes(agent.mem))}</div>
@@ -511,6 +662,7 @@ panelClose.addEventListener("click", () => {
 });
 
 function draw() {
+  flushPendingSnapshot();
   ctx.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
   ctx.clearRect(0, 0, canvas.width / deviceScale, canvas.height / deviceScale);
   ctx.save();
@@ -544,10 +696,14 @@ function draw() {
   const activeAgents = drawList
     .filter((item) => item.agent.state !== "idle")
     .sort((a, b) => b.agent.cpu - a.agent.cpu);
-  const topActiveIds = new Set(activeAgents.slice(0, 4).map((item) => item.agent.id));
+  const topActiveIds = new Set(
+    activeAgents.slice(0, 4).map((item) => agentIdentity(item.agent))
+  );
 
   const time = Date.now();
   const hitList = [];
+  const roofList = [];
+  const obstructedIds = new Set();
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   for (const item of drawList) {
@@ -578,20 +734,10 @@ function draw() {
     drawDiamond(ctx, x, y, tileW, tileH, "rgba(16, 22, 28, 0.8)", "#3e4e59");
     ctx.globalAlpha = 1;
 
-    const roofSize = tileW * 0.28;
-    drawDiamond(
-      ctx,
-      x,
-      y - height - tileH * 0.15,
-      roofSize,
-      roofSize * 0.5,
-      palette.stroke,
-      null
-    );
+    const roofY = y - height - tileH * 0.15;
 
     if (isActive) {
       const glowAlpha = 0.12 + pulsePhase * 0.22;
-      const capAlpha = 0.16 + pulsePhase * 0.28;
       ctx.save();
       drawDiamond(
         ctx,
@@ -602,19 +748,10 @@ function draw() {
         accentGlow(item.agent, glowAlpha),
         null
       );
-      drawDiamond(
-        ctx,
-        x,
-        y - height - tileH * 0.18,
-        roofSize * 0.82,
-        roofSize * 0.42,
-        accentGlow(item.agent, capAlpha),
-        null
-      );
       ctx.restore();
     }
 
-    if (selected && selected.id === item.agent.id) {
+    if (selected && agentIdentity(selected) === agentIdentity(item.agent)) {
       drawDiamond(ctx, x, y, tileW + 10, tileH + 6, "rgba(0,0,0,0)", accent);
     }
 
@@ -623,9 +760,9 @@ function draw() {
     ctx.ellipse(x, y + tileH * 0.7, tileW * 0.4, tileH * 0.2, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    const isHovered = hovered && hovered.id === item.agent.id;
-    const isSelected = selected && selected.id === item.agent.id;
-    const showActiveTag = topActiveIds.has(item.agent.id);
+    const isHovered = hovered && agentIdentity(hovered) === agentIdentity(item.agent);
+    const isSelected = selected && agentIdentity(selected) === agentIdentity(item.agent);
+    const showActiveTag = topActiveIds.has(agentIdentity(item.agent));
     if (isHovered || isSelected) {
       const label = truncate(labelFor(item.agent), 20);
       drawTag(ctx, x, y - height - tileH * 0.6, label, accentStrong);
@@ -648,9 +785,105 @@ function draw() {
     hitList.push({
       x,
       y,
+      roofY,
+      roofW,
+      roofH,
+      roofHitW,
+      roofHitH,
+      height,
       agent: item.agent,
       key: item.key,
     });
+
+    roofList.push({
+      x,
+      y: roofY,
+      agent: item.agent,
+      paletteStroke: palette.stroke,
+      accent,
+      accentStrong,
+      identity: agentIdentity(item.agent),
+      pulsePhase,
+      isActive,
+      isSelected,
+    });
+  }
+
+  for (const a of hitList) {
+    const roofPoint = { x: a.x, y: a.roofY };
+    for (const b of hitList) {
+      if (a === b) continue;
+      const topY = b.y - b.height;
+      const halfW = tileW / 2;
+      const halfH = tileH / 2;
+      const leftA = { x: b.x - halfW, y: topY };
+      const leftB = { x: b.x, y: topY + halfH };
+      const leftC = { x: b.x, y: b.y + halfH };
+      const leftD = { x: b.x - halfW, y: b.y };
+      const rightA = { x: b.x + halfW, y: topY };
+      const rightB = { x: b.x, y: topY + halfH };
+      const rightC = { x: b.x, y: b.y + halfH };
+      const rightD = { x: b.x + halfW, y: b.y };
+      if (
+        pointInQuad(roofPoint, leftA, leftB, leftC, leftD) ||
+        pointInQuad(roofPoint, rightA, rightB, rightC, rightD)
+      ) {
+        obstructedIds.add(agentIdentity(a.agent));
+        break;
+      }
+    }
+  }
+
+  for (const item of hitList) {
+    if (obstructedIds.has(agentIdentity(item.agent))) {
+      item.markerY = item.roofY - markerOffset;
+    }
+  }
+
+  for (const item of roofList) {
+    const roofAlpha = 1;
+    ctx.save();
+    ctx.globalAlpha = roofAlpha;
+    drawDiamond(ctx, item.x, item.y, roofW, roofH, item.paletteStroke, null);
+    if (item.isActive) {
+      const capAlpha = 0.16 + item.pulsePhase * 0.28;
+      drawDiamond(
+        ctx,
+        item.x,
+        item.y,
+        roofW * 0.82,
+        roofH * 0.82,
+        accentGlow(item.agent, capAlpha),
+        null
+      );
+    }
+    ctx.restore();
+
+    if (item.isSelected) {
+      const selectedRoofW = roofW + 8;
+      const selectedRoofH = selectedRoofW * 0.5;
+      drawDiamond(
+        ctx,
+        item.x,
+        item.y,
+        selectedRoofW,
+        selectedRoofH,
+        "rgba(0,0,0,0)",
+        item.accent
+      );
+    }
+
+    if (obstructedIds.has(item.identity)) {
+      drawDiamond(
+        ctx,
+        item.x,
+        item.y - markerOffset,
+        markerW,
+        markerH,
+        "rgba(0,0,0,0)",
+        item.accentStrong
+      );
+    }
   }
 
   ctx.restore();
@@ -673,9 +906,37 @@ canvas.addEventListener("mousemove", (event) => {
   let found = null;
   for (let i = hitList.length - 1; i >= 0; i -= 1) {
     const item = hitList[i];
-    if (pointInDiamond(pos.x, pos.y, item.x, item.y, tileW, tileH)) {
+    if (!item.markerY) continue;
+    if (pointInDiamond(pos.x, pos.y, item.x, item.markerY, markerW, markerH)) {
       found = item.agent;
       break;
+    }
+  }
+  if (!found) {
+    for (let i = hitList.length - 1; i >= 0; i -= 1) {
+      const item = hitList[i];
+      if (
+        pointInDiamond(
+          pos.x,
+          pos.y,
+          item.x,
+          item.roofY,
+          item.roofHitW || roofHitW,
+          item.roofHitH || roofHitH
+        )
+      ) {
+        found = item.agent;
+        break;
+      }
+    }
+  }
+  if (!found) {
+    for (let i = hitList.length - 1; i >= 0; i -= 1) {
+      const item = hitList[i];
+      if (pointInDiamond(pos.x, pos.y, item.x, item.y, tileW, tileH)) {
+        found = item.agent;
+        break;
+      }
     }
   }
   hovered = found;
@@ -727,7 +988,7 @@ if (searchInput) {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) return;
     searchQuery = target.value || "";
-    applySnapshot({ agents, ts: Date.now() });
+    scheduleSnapshot({ agents, ts: Date.now(), meta: latestMeta });
   });
 }
 
@@ -781,58 +1042,239 @@ function connect() {
 
   ws.addEventListener("open", () => {
     setStatus("live");
+    wsLastMessageAt = Date.now();
+    if (wsHealthTimer) clearInterval(wsHealthTimer);
+    wsHealthTimer = setInterval(() => {
+      if (Date.now() - wsLastMessageAt > WS_STALE_MS) {
+        setStatus("stale");
+      }
+    }, 1000);
+    const hello = {
+      v: 1,
+      t: "hello",
+      role: "viewer",
+      enc: "json",
+      lastSeq: ledgerSeq || undefined,
+    };
+    try {
+      ws.send(JSON.stringify(hello));
+    } catch {
+      // ignore send errors
+    }
   });
 
   ws.addEventListener("message", (event) => {
-    const payload = JSON.parse(event.data);
-    applySnapshot(payload);
+    wsLastMessageAt = Date.now();
+    const handlePayload = (text) => {
+      try {
+        const payload = JSON.parse(text);
+        if (payload && payload.v === 1 && typeof payload.t === "string") {
+          if (payload.t === "welcome") return;
+          if (payload.t === "snapshot") {
+            ingestSnapshot(payload.data || {}, payload.seq || 0);
+            if (wsStatus !== "live") {
+              setStatus("live");
+            }
+            return;
+          }
+          if (payload.t === "delta") {
+            applyDeltaOps(payload.ops || [], payload.seq || 0);
+            if (wsStatus !== "live") {
+              setStatus("live");
+            }
+            return;
+          }
+          if (payload.t === "ping") {
+            ws.send(JSON.stringify({ v: 1, t: "pong", ts: Date.now() }));
+            return;
+          }
+        }
+        const seq = ++wsSeq;
+        ingestSnapshot(payload, 0, seq);
+        if (wsStatus !== "live") {
+          setStatus("live");
+        }
+      } catch {
+        setStatus("error");
+      }
+    };
+    if (typeof event.data === "string") {
+      handlePayload(event.data);
+      return;
+    }
+    if (event.data instanceof Blob) {
+      event.data.text().then(handlePayload).catch(() => setStatus("error"));
+      return;
+    }
+    if (event.data instanceof ArrayBuffer) {
+      const text = new TextDecoder().decode(new Uint8Array(event.data));
+      handlePayload(text);
+      return;
+    }
+    setStatus("error");
   });
 
   ws.addEventListener("close", () => {
     setStatus("disconnected");
+    if (wsHealthTimer) {
+      clearInterval(wsHealthTimer);
+      wsHealthTimer = null;
+    }
     setTimeout(connect, 1000);
+  });
+
+  ws.addEventListener("error", () => {
+    setStatus("error");
   });
 }
 
+function ingestSnapshot(payload, seq = 0, renderSeq = seq) {
+  if (seq && seq <= ledgerSeq) return;
+  if (seq) ledgerSeq = seq;
+  ledgerTs = typeof payload.ts === "number" ? payload.ts : Date.now();
+  ledgerMeta = payload.meta || {};
+  ledgerAgents.clear();
+  const incomingAgents = Array.isArray(payload.agents) ? payload.agents : [];
+  for (const agent of incomingAgents) {
+    if (!agent) continue;
+    ledgerAgents.set(String(agentIdentity(agent)), agent);
+  }
+  scheduleSnapshot(
+    { ts: ledgerTs, agents: Array.from(ledgerAgents.values()), meta: ledgerMeta },
+    renderSeq
+  );
+}
+
+function applyDeltaOps(ops, seq = 0) {
+  if (seq && seq <= ledgerSeq) return;
+  if (seq) ledgerSeq = seq;
+  if (Array.isArray(ops)) {
+    for (const entry of ops) {
+      const op = entry && entry.op;
+      if (op === "upsert" && entry.value) {
+        const id = entry.id ?? agentIdentity(entry.value);
+        ledgerAgents.set(String(id), entry.value);
+        continue;
+      }
+      if (op === "remove") {
+        ledgerAgents.delete(String(entry.id));
+        continue;
+      }
+      if (op === "meta") {
+        ledgerMeta = entry.value || {};
+        continue;
+      }
+      if (op === "ts") {
+        const ts = Number(entry.value);
+        if (Number.isFinite(ts)) {
+          ledgerTs = ts;
+        }
+      }
+    }
+  }
+  const ts = ledgerTs || Date.now();
+  scheduleSnapshot(
+    { ts, agents: Array.from(ledgerAgents.values()), meta: ledgerMeta },
+    seq
+  );
+}
+
 function applySnapshot(payload) {
-  agents = payload.agents || [];
+  const incomingAgents = Array.isArray(payload.agents) ? payload.agents : [];
+  agents = dedupeAgentsByIdentity(incomingAgents).map((agent) => ({
+    ...agent,
+    state: normalizeState(agent.state),
+  }));
+  latestMeta = payload.meta || {};
+  renderStatus();
   const serverAgents = agents.filter((agent) => isServerKind(agent.kind));
   const agentNodes = agents.filter((agent) => !isServerKind(agent.kind));
   setCount(agentNodes.length, serverAgents.length);
   const query = searchQuery.trim().toLowerCase();
   searchMatches = new Set(
-    query ? agents.filter((agent) => matchesQuery(agent, query)).map((agent) => agent.id) : []
+    query
+      ? agents
+          .filter((agent) => matchesQuery(agent, query))
+          .map((agent) => agentIdentity(agent))
+      : []
   );
   const visibleAgents = query
-    ? agents.filter((agent) => searchMatches.has(agent.id))
+    ? agents.filter((agent) => searchMatches.has(agentIdentity(agent)))
     : agents;
-  const listAgents = query
-    ? visibleAgents.filter((agent) => !isServerKind(agent.kind))
-    : visibleAgents.filter((agent) => agent.state !== "idle" && !isServerKind(agent.kind));
+  const listAgents = visibleAgents.filter((agent) => !isServerKind(agent.kind));
   const listServers = query
     ? visibleAgents.filter((agent) => isServerKind(agent.kind))
     : visibleAgents.filter((agent) => isServerKind(agent.kind));
   if (laneTitle) {
-    laneTitle.textContent = query ? "search results" : "active agents";
+    laneTitle.textContent = query ? "search results" : "agents";
   }
   if (serverTitle) {
     serverTitle.textContent = query ? "server results" : "servers";
   }
-  renderLaneList(listAgents, activeList, "No active agents.");
+  renderLaneList(listAgents, activeList, "No agents detected.");
   renderLaneList(listServers, serverList, "No servers detected.");
   if (selected) {
-    selected = agents.find((agent) => agent.id === selected.id) || selected;
+    const selectedKey = agentIdentity(selected);
+    selected = agents.find((agent) => agentIdentity(agent) === selectedKey) || selected;
     renderPanel(selected);
   }
+}
+
+function flushPendingSnapshot() {
+  if (!pendingSnapshot) return;
+  const next = pendingSnapshot;
+  const nextSeq = pendingSnapshotSeq;
+  pendingSnapshot = null;
+  pendingSnapshotSeq = 0;
+  if (nextSeq && nextSeq < lastAppliedSeq) return;
+  if (nextSeq) lastAppliedSeq = nextSeq;
+  applySnapshot(next);
+}
+
+function scheduleSnapshot(payload, seq = 0) {
+  if (seq && seq < lastAppliedSeq) return;
+  if (seq && pendingSnapshotSeq && seq < pendingSnapshotSeq) return;
+  pendingSnapshot = payload;
+  pendingSnapshotSeq = seq;
 }
 
 if (mockMode) {
   setStatus("mock");
   window.__consensusMock = {
-    setSnapshot: (snapshot) => applySnapshot(snapshot || {}),
+    setSnapshot: (snapshot) => scheduleSnapshot(snapshot || {}),
     setAgents: (nextAgents) =>
-      applySnapshot({ agents: nextAgents || [], ts: Date.now() }),
+      scheduleSnapshot({ agents: nextAgents || [], ts: Date.now() }),
     getAgents: () => agents,
+    setLayout: (positions) => {
+      if (!Array.isArray(positions)) return;
+      layout.clear();
+      occupied.clear();
+      layoutLocked = true;
+      const byIdentity = new Map(
+        agents.map((agent) => [String(agentIdentity(agent)), agent])
+      );
+      const byPid = new Map(
+        agents
+          .filter((agent) => typeof agent.pid === "number")
+          .map((agent) => [String(agent.pid), agent])
+      );
+      for (const entry of positions) {
+        const keyId = entry?.id ?? entry?.pid;
+        if (keyId === undefined || keyId === null) continue;
+        const agent =
+          byIdentity.get(String(keyId)) || byPid.get(String(keyId)) || null;
+        if (!agent) continue;
+        const key = keyForAgent(agent);
+        const coord = { x: Number(entry.x) || 0, y: Number(entry.y) || 0 };
+        layout.set(key, coord);
+        occupied.set(`${coord.x / gridScale},${coord.y / gridScale}`, key);
+      }
+    },
+    unlockLayout: () => {
+      layoutLocked = false;
+    },
+    getHitList: () => canvas._hitList || [],
+    getView: () => ({ x: view.x, y: view.y, scale: view.scale }),
   };
 } else {
   connect();

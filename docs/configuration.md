@@ -10,49 +10,178 @@ All configuration is via environment variables.
   - Default: `8787`
   - Port for the HTTP server.
 - `CONSENSUS_POLL_MS`
-  - Default: `1000`
-  - Poll interval for scans.
+  - Default: `250`
+  - Poll interval for process presence scans.
+- `CONSENSUS_SCAN_TIMEOUT_MS`
+  - Default: `5000`
+  - Max time (ms) for a scan tick before timing out (guardrail for stuck scans).
+- `CONSENSUS_SCAN_STALL_MS`
+  - Default: `60%` of `CONSENSUS_SCAN_TIMEOUT_MS` (min `250`)
+  - Emit a stall warning/metric when a scan exceeds this duration.
+- `CONSENSUS_SCAN_STALL_CHECK_MS`
+  - Default: `min(1000, CONSENSUS_SCAN_STALL_MS)` (min `250`)
+  - Interval for checking whether a scan is stalling.
+- `CONSENSUS_OTEL_ENABLED`
+  - Default: disabled
+  - Set to `1` to enable Effect OpenTelemetry tracing/metrics (dev-only rollout).
+- `CONSENSUS_OTEL_ENDPOINT`
+  - Default: unset
+  - OTLP/HTTP base endpoint (e.g., `http://localhost:4318`). When unset, exporters fall back to console.
+- `CONSENSUS_OTEL_SERVICE_NAME`
+  - Default: `consensus-cli`
+  - Service name for telemetry resource.
+- `CONSENSUS_OTEL_ENV`
+  - Default: `development`
+  - Deployment environment.
+- `CONSENSUS_OTEL_VERSION`
+  - Default: package version (or `unknown`).
+  - Service version for telemetry resource.
+- `CONSENSUS_OTEL_SAMPLE_RATIO`
+  - Default: `1`
+  - Trace sampling ratio (0–1). Prod can lower to `0.1` later.
+- `CONSENSUS_OTEL_METRIC_INTERVAL_MS`
+  - Default: `10000`
+  - Metric export interval in milliseconds.
+- `CONSENSUS_OTEL_CONSOLE_FALLBACK`
+  - Default: enabled
+  - Set to `0` to disable console exporters when OTLP endpoint is unset.
 - `CONSENSUS_CODEX_HOME`
   - Default: `~/.codex`
   - Override Codex home directory.
+- `CONSENSUS_CODEX_WATCH_POLL`
+  - Default: enabled
+  - Set to `0` to disable polling for Codex JSONL watch events. Polling is the default because native FS events are unreliable for these files.
+- `CONSENSUS_CODEX_WATCH_INTERVAL_MS`
+  - Default: `1000`
+  - Polling interval (ms) for Codex JSONL watcher when polling is enabled.
+- `CONSENSUS_CODEX_WATCH_BINARY_INTERVAL_MS`
+  - Default: `CONSENSUS_CODEX_WATCH_INTERVAL_MS`
+  - Polling interval (ms) for binary file changes when polling is enabled.
 - `CONSENSUS_OPENCODE_HOST`
   - Default: `127.0.0.1`
   - OpenCode server host.
 - `CONSENSUS_OPENCODE_PORT`
   - Default: `4096`
   - OpenCode server port.
+- `CONSENSUS_OPENCODE_TIMEOUT_MS`
+  - Default: `5000`
+  - Timeout for OpenCode HTTP requests.
 - `CONSENSUS_OPENCODE_AUTOSTART`
   - Default: enabled
   - Set to `0` to disable OpenCode server autostart.
 - `CONSENSUS_OPENCODE_EVENTS`
   - Default: enabled
   - Set to `0` to disable OpenCode event stream.
+- `CONSENSUS_OPENCODE_HOME`
+  - Default: `~/.local/share/opencode`
+  - Override OpenCode storage directory.
+- `CONSENSUS_OPENCODE_EVENT_ACTIVE_MS`
+  - Default: `0`
+  - OpenCode event window before dropping to idle.
+- `CONSENSUS_OPENCODE_CPU_ACTIVE_MS`
+  - Default: `1500`
+  - OpenCode CPU window to treat recent CPU spikes as activity.
+- `CONSENSUS_OPENCODE_ACTIVE_HOLD_MS`
+  - Default: `0`
+  - OpenCode hold window after activity.
+- `CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS`
+  - Default: `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`
+  - OpenCode in-flight idle timeout in ms before dropping to idle if no activity is observed.
+- `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`
+  - Default: `15000`
+  - Hard timeout (ms) used to clear OpenCode in-flight when no fresh events are observed.
 - `CONSENSUS_PROCESS_MATCH`
   - Default: unset
   - Regex to match process name or command line.
+- `CONSENSUS_DEBUG_OPENCODE`
+  - Default: unset
+  - Set to `1` to log OpenCode server discovery (debug only).
 - `CONSENSUS_REDACT_PII`
   - Default: enabled
   - Set to `0` to disable redaction.
+- `ACTIVITY_TEST_MODE`
+  - Default: disabled
+  - Set to `1` to enable test-only activity injection endpoints under `/__test`.
 - `CONSENSUS_CODEX_EVENT_ACTIVE_MS`
-  - Default: `60000`
+  - Default: `30000`
   - Codex event window before dropping to idle.
+- `CONSENSUS_CODEX_MTIME_ACTIVE_MS`
+  - Default: `750`
+  - Treat recent Codex JSONL file mtime as activity within this window (bridges log write lag).
 - `CONSENSUS_CODEX_ACTIVE_HOLD_MS`
-  - Default: `90000`
+  - Default: `500`
   - Codex hold window after activity.
+- `CONSENSUS_CODEX_INFLIGHT_GRACE_MS`
+  - Default: `750`
+  - Codex in-flight grace window after the last in-flight signal (prevents brief idle flicker).
+- `CONSENSUS_CODEX_STRICT_INFLIGHT`
+  - Default: disabled
+  - Set to `1` to require explicit in-flight signals from logs (disables CPU/mtime bridging).
+- `CONSENSUS_CODEX_INFLIGHT_IDLE_MS`
+  - Default: `30000`
+  - Idle timeout to clear Codex in-flight when activity is stale. Set to `0` to disable.
 - `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`
+  - Default: `3000`
+  - Hard timeout to clear Codex in-flight if no recent signals and file is not fresh.
+- `CONSENSUS_CODEX_FILE_FRESH_MS`
+  - Default: `10000`
+  - Treat recent Codex JSONL file mtime within this window as fresh and keep in-flight on.
+- `CONSENSUS_CODEX_CPU_SUSTAIN_MS`
+  - Default: `500`
+  - Require sustained Codex CPU activity (ms) before marking active when logs are missing.
+- `CONSENSUS_CODEX_CPU_SPIKE`
+  - Default: derived (`max(cpuThreshold * 10, 25)`)
+  - Codex CPU spike threshold for immediate active state when logs are missing.
+- `CONSENSUS_CODEX_STALE_FILE_MS`
   - Default: `120000`
-  - Clear stuck Codex in-flight state after this timeout.
+  - Treat Codex JSONL files older than this as stale to prevent stale sessions from staying active.
+- `CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS`
+  - Default: `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`
+  - Ignore Codex events older than this when setting in-flight signals (prevents stale sessions after restart).
+- `CONSENSUS_PROCESS_CACHE_MS`
+  - Default: `1000`
+  - Process cache TTL (ms) for full scans.
+- `CONSENSUS_PROCESS_CACHE_FAST_MS`
+  - Default: `500`
+  - Process cache TTL (ms) for fast scans.
+- `CONSENSUS_SESSION_CACHE_MS`
+  - Default: `1000`
+  - Codex session list cache TTL (ms) for full scans.
+- `CONSENSUS_SESSION_CACHE_FAST_MS`
+  - Default: `500`
+  - Codex session list cache TTL (ms) for fast scans.
 - `CONSENSUS_EVENT_ACTIVE_MS`
   - Default: `300000`
   - Window after the last event to mark an agent active.
 - `CONSENSUS_CPU_ACTIVE`
   - Default: `1`
   - CPU threshold for marking an agent active.
+- `CONSENSUS_CLAUDE_CPU_ACTIVE`
+  - Default: `1`
+  - Claude CPU threshold override.
+- `CONSENSUS_CLAUDE_CPU_SUSTAIN_MS`
+  - Default: `1000`
+  - Claude sustained CPU window in ms.
+- `CONSENSUS_CLAUDE_CPU_SPIKE`
+  - Default: derived
+  - Claude spike threshold override.
+- `CONSENSUS_CLAUDE_ACTIVE_HOLD_MS`
+  - Default: `1000`
+  - Claude-specific active hold window to smooth brief CPU spikes (reduce flicker).
+- `CONSENSUS_CLAUDE_START_ACTIVE_MS`
+  - Default: `1200`
+  - Grace window to show Claude sessions as active immediately after process start.
 - `CONSENSUS_ACTIVE_HOLD_MS`
   - Default: `600000`
   - Keep agents active for this long after activity.
+- `CONSENSUS_IDLE_HOLD_MS`
+  - Default: `200`
+  - Hold an agent in idle briefly after spans end (prevents idle flicker).
+- `CONSENSUS_SPAN_STALE_MS`
+  - Default: `15000`
+  - Consider agent spans stale after this duration with no progress updates.
 
 ## Example
 ```bash
-CONSENSUS_PORT=8790 CONSENSUS_POLL_MS=750 npm run dev
+CONSENSUS_PORT=8790 CONSENSUS_POLL_MS=250 npm run dev
 ```

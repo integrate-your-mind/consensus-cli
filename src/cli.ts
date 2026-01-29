@@ -3,6 +3,13 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import path from "path";
 import process from "process";
+import { Effect } from "effect";
+import {
+  annotateSpan,
+  disposeObservability,
+  runPromise,
+  withSpan,
+} from "./observability/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -67,7 +74,34 @@ if (match) env.CONSENSUS_PROCESS_MATCH = match;
 if (noRedact) env.CONSENSUS_REDACT_PII = "0";
 
 const serverPath = path.join(__dirname, "server.js");
-const child = spawn(process.execPath, [serverPath], { stdio: "inherit", env });
-child.on("exit", (code) => {
-  process.exit(code ?? 0);
+const spanAttributes: Record<string, string | number | boolean> = {
+  "cli.args_count": args.length,
+};
+if (host) spanAttributes["consensus.host"] = host;
+if (port) spanAttributes["consensus.port"] = Number(port);
+if (poll) spanAttributes["consensus.poll_ms"] = Number(poll);
+if (opencodeHost) spanAttributes["consensus.opencode_host"] = opencodeHost;
+if (opencodePort) spanAttributes["consensus.opencode_port"] = Number(opencodePort);
+
+const program = Effect.async<number, never>((resume) => {
+  const child = spawn(process.execPath, [serverPath], { stdio: "inherit", env });
+  child.on("exit", (code) => {
+    resume(Effect.succeed(code ?? 0));
+  });
 });
+
+const instrumented = program.pipe(
+  withSpan("cli.run", { attributes: spanAttributes }),
+  Effect.tap((code) => annotateSpan("process.exit_code", code))
+);
+
+runPromise(instrumented)
+  .then(async (code) => {
+    await disposeObservability().catch(() => undefined);
+    process.exit(code);
+  })
+  .catch(async (err) => {
+    process.stderr.write(`[consensus] cli error: ${String(err)}\n`);
+    await disposeObservability().catch(() => undefined);
+    process.exit(1);
+  });

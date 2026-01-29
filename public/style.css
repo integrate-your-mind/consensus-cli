@@ -366,6 +366,12 @@ body {
   }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .lane-pill.active {
+    animation: none;
+  }
+}
+
 .lane-copy {
   display: flex;
   flex-direction: column;

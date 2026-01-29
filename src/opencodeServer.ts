@@ -6,9 +6,9 @@ import { getOpenCodeSessions } from "./opencodeApi.js";
 const execFileAsync = promisify(execFile);
 
 const AUTOSTART_ENABLED = process.env.CONSENSUS_OPENCODE_AUTOSTART !== "0";
-const CHECK_INTERVAL_MS = 30_000;
+const CHECK_INTERVAL_MS = 1_000;
 const INSTALL_CHECK_INTERVAL_MS = 5 * 60_000;
-const START_BACKOFF_MS = 60_000;
+const START_BACKOFF_MS = 5_000;
 
 let lastAttemptAt = 0;
 let lastInstallCheck = 0;
@@ -60,9 +60,10 @@ function spawnOpenCodeServer(host: string, port: number): void {
 export async function ensureOpenCodeServer(
   host: string,
   port: number,
-  existingResult?: OpenCodeSessionResult
+  existingResult?: OpenCodeSessionResult,
+  shouldStart: boolean = true
 ): Promise<void> {
-  if (!AUTOSTART_ENABLED) return;
+  if (!AUTOSTART_ENABLED || !shouldStart) return;
   const now = Date.now();
   if (now - lastAttemptAt < CHECK_INTERVAL_MS) return;
   lastAttemptAt = now;
