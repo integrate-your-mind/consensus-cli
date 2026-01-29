@@ -9,7 +9,7 @@ const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
 const INFLIGHT_TIMEOUT_MS = Number(
   process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS || 15000
 );
-const ACTIVITY_KINDS = new Set<string>();
+const ACTIVITY_KINDS = new Set<string>(["command", "edit", "message", "tool"]);
 const META_EVENT_RE =
   /^(session|snapshot|history|heartbeat|connected|ready|ping|pong)(\.|$)/i;
 const START_EVENT_RE =
@@ -295,6 +295,7 @@ function isActivityEvent(input: {
   const lowerType = type.toLowerCase();
   if (META_EVENT_RE.test(lowerType)) return false;
   if (input.inFlight) return true;
+  if (input.kind && ACTIVITY_KINDS.has(input.kind)) return true;
   if (START_EVENT_RE.test(lowerType) || DELTA_EVENT_RE.test(lowerType)) return true;
   return false;
 }

@@ -61,5 +61,44 @@ test("claude prompt transitions back to idle without work", () => {
     now: now + 1500,
   });
   assert.equal(second.state, "idle");
-  assert.equal(second.lastActiveAt, undefined);
+  assert.equal(second.lastActiveAt, first.lastActiveAt);
+});
+
+test("claude preserves lastActiveAt when idle to enable hold mechanism", () => {
+  const now = 1_000;
+  const holdMs = 1_000;
+
+  const active = deriveClaudeState({
+    cpu: 5,
+    info: { kind: "claude-tui" },
+    cpuActiveMs: 1500,
+    now,
+    holdMs,
+  });
+
+  assert.equal(active.state, "active");
+  assert.ok(active.lastActiveAt);
+
+  const holding = deriveClaudeState({
+    cpu: 0.1,
+    info: { kind: "claude-tui" },
+    now: now + 200,
+    previousActiveAt: active.lastActiveAt,
+    holdMs,
+  });
+
+  assert.equal(holding.state, "active");
+  assert.equal(holding.reason, "hold");
+  assert.equal(holding.lastActiveAt, active.lastActiveAt);
+
+  const idle = deriveClaudeState({
+    cpu: 0.1,
+    info: { kind: "claude-tui" },
+    now: now + 1500,
+    previousActiveAt: active.lastActiveAt,
+    holdMs,
+  });
+
+  assert.equal(idle.state, "idle");
+  assert.equal(idle.lastActiveAt, active.lastActiveAt);
 });

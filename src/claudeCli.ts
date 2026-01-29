@@ -166,7 +166,7 @@ export function deriveClaudeState(input: ClaudeActivityInput): ActivityHoldResul
   });
   if (cpuValue <= effectiveThreshold && !sustained) {
     if (result.state === "active") return result;
-    return { state: "idle", lastActiveAt: undefined, reason: "cpu_below" };
+    return { state: "idle", lastActiveAt: input.previousActiveAt, reason: "cpu_below" };
   }
   return result;
 }

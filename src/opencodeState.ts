@@ -61,9 +61,13 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
     input.eventWindowMs ?? Number(process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS || 1000);
   const activityAt =
     typeof input.lastActivityAt === "number" ? input.lastActivityAt : undefined;
+  const previousActiveAt = input.previousActiveAt;
   let inFlight = input.inFlight;
   const recentActivity =
     typeof activityAt === "number" && now - activityAt <= eventWindowMs;
+  const hasNewActivity =
+    recentActivity &&
+    (typeof previousActiveAt !== "number" || activityAt > previousActiveAt);
   const cpuActive = input.cpu >= cpuThreshold;
   if (
     inFlight &&
@@ -73,14 +77,14 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
   ) {
     inFlight = false;
   }
-  const hasEvidence = recentActivity || !!inFlight || cpuActive;
+  const hasEvidence = hasNewActivity || !!inFlight || cpuActive;
 
   const activity = deriveStateWithHold({
     cpu: hasEvidence ? input.cpu : 0,
     hasError: input.hasError,
-    lastEventAt: activityAt,
+    lastEventAt: hasNewActivity ? activityAt : undefined,
     inFlight,
-    previousActiveAt: input.previousActiveAt,
+    previousActiveAt,
     now,
     cpuThreshold,
     eventWindowMs,
@@ -96,19 +100,25 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
     state = "idle";
     reason = "status_idle";
   } else if (statusIsActive && state !== "active") {
-    state = "idle";
-    reason = "status_active_no_signal";
+    if (!activity.lastActiveAt) {
+      state = "idle";
+      reason = "status_active_no_signal";
+    }
   }
 
   if (input.isServer) {
     if (state === "error") {
       return { state, lastActiveAt: activity.lastActiveAt, reason };
     }
-    return { state: "idle", lastActiveAt: undefined, reason: "server" };
+    return {
+      state: "idle",
+      lastActiveAt: previousActiveAt ?? activity.lastActiveAt,
+      reason: "server",
+    };
   }
 
   if (state === "idle") {
-    return { state, lastActiveAt: undefined, reason };
+    return { state, lastActiveAt: activity.lastActiveAt, reason };
   }
 
   return { state, lastActiveAt: activity.lastActiveAt, reason };

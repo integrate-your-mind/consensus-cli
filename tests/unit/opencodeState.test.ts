@@ -77,7 +77,54 @@ test("opencode drops to idle after hold window while running", () => {
   assert.equal(result.state, "idle");
 });
 
-test("opencode server is always idle unless error", () => {
+test("opencode preserves lastActiveAt when idle to enable hold mechanism", () => {
+  const now = 1_000;
+  const holdMs = 500;
+
+  const active = deriveOpenCodeState({
+    cpu: 0,
+    hasError: false,
+    status: "running",
+    lastActivityAt: now,
+    inFlight: true,
+    now,
+    holdMs,
+  });
+
+  assert.equal(active.state, "active");
+  assert.equal(active.lastActiveAt, now);
+
+  const holding = deriveOpenCodeState({
+    cpu: 0,
+    hasError: false,
+    status: "running",
+    lastActivityAt: now,
+    inFlight: false,
+    now: now + 200,
+    previousActiveAt: active.lastActiveAt,
+    holdMs,
+  });
+
+  assert.equal(holding.state, "active");
+  assert.equal(holding.reason, "hold");
+  assert.equal(holding.lastActiveAt, now);
+
+  const idle = deriveOpenCodeState({
+    cpu: 0,
+    hasError: false,
+    status: "running",
+    lastActivityAt: now,
+    inFlight: false,
+    now: now + 600,
+    previousActiveAt: active.lastActiveAt,
+    holdMs,
+  });
+
+  assert.equal(idle.state, "idle");
+  assert.equal(idle.lastActiveAt, now);
+});
+
+test("opencode server mode preserves lastActiveAt", () => {
   const now = 1_000_000;
   const result = deriveOpenCodeState({
     cpu: 10,
@@ -89,10 +136,10 @@ test("opencode server is always idle unless error", () => {
     now,
   });
   assert.equal(result.state, "idle");
-  assert.equal(result.lastActiveAt, undefined);
+  assert.equal(result.lastActiveAt, now - 5_000);
 });
 
-test("opencode idle status clears hold for non-server agents", () => {
+test("opencode idle status preserves lastActiveAt for non-server agents", () => {
   const now = 1_000_000;
   const result = deriveOpenCodeState({
     cpu: 0,
@@ -103,5 +150,5 @@ test("opencode idle status clears hold for non-server agents", () => {
     now,
   });
   assert.equal(result.state, "idle");
-  assert.equal(result.lastActiveAt, undefined);
+  assert.equal(result.lastActiveAt, now - 2_000);
 });

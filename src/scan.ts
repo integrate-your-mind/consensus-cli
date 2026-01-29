@@ -1344,11 +1344,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
 
   const opencodeEventWindowMs = resolveMs(
     process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS,
-    0
+    1000
   );
   const opencodeStaleActiveMs = resolveMs(
     process.env.CONSENSUS_OPENCODE_STALE_ACTIVE_MS,
-    0
+    5000
   );
   const opencodeCpuWindowMs = resolveMs(
     process.env.CONSENSUS_OPENCODE_CPU_ACTIVE_MS,
@@ -1361,7 +1361,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const opencodeStrictEnv = process.env.CONSENSUS_OPENCODE_STRICT_INFLIGHT;
   const opencodeStrictInFlight =
     opencodeStrictEnv === undefined || opencodeStrictEnv === ""
-      ? true
+      ? false
       : opencodeStrictEnv === "1" || opencodeStrictEnv === "true";
   const opencodeInFlightIdleMs =
     process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS !== undefined
@@ -1546,11 +1546,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       typeof lastActivityAt === "number" ||
       typeof inFlight === "boolean";
     const activityAt = typeof lastActivityAt === "number" ? lastActivityAt : undefined;
-    if (!opencodeApiAvailable && !hasSignal) {
+    if (!opencodeApiAvailable && !hasSignal && !activity.lastActiveAt) {
       state = "idle";
       reason = "api_unavailable";
     }
-    if (!hasSignal && cpu <= cpuThreshold) {
+    if (!hasSignal && cpu <= cpuThreshold && !activity.lastActiveAt) {
       state = "idle";
       reason = "no_signal";
     }
@@ -1558,7 +1558,8 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       state === "active" &&
       !inFlight &&
       typeof activityAt === "number" &&
-      now - activityAt > opencodeStaleActiveMs
+      now - activityAt > opencodeStaleActiveMs &&
+      !activity.lastActiveAt
     ) {
       state = "idle";
       reason = "stale_ttl";

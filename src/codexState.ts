@@ -83,9 +83,8 @@ export function deriveCodexState(input: CodexStateInput): ActivityHoldResult {
 
   const hasSignal = recentWork || !!inFlight;
   const sustained =
-    hasSignal &&
-    (input.cpu >= spikeThreshold ||
-      (typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs));
+    input.cpu >= spikeThreshold ||
+    (typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs);
 
   const cpu = hasSignal || sustained ? input.cpu : 0;
 
