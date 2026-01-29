@@ -259,7 +259,7 @@ const testActivity = new Map<
 >();
 
 function identityForAgent(agent: AgentSnapshot): string {
-  return agent.identity || agent.id;
+  return agent.identity || agent.sessionPath || agent.id;
 }
 
 function logDebug(message: string): void {
