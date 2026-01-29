@@ -22,8 +22,10 @@ State:
     - Recorded UI during work: `/Users/romanmondello/consensus/tmp/codex-flicker-before.webm`.
     - Codex flicker fix applied (cpu passthrough) and tests updated; tests/build passed.
     - User reports Codex sessions are working now.
+    - Committed Codex flicker changes: `88bdb74`.
+    - Pushed to `origin/main`.
   - Now:
-    - Await user direction on whether to keep changes and commit/push.
+    - Await further requests.
   - Next:
     - None unless user requests.
 
