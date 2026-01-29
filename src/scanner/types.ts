@@ -2,7 +2,8 @@
  * Scanner service types
  */
 
-import type { AgentSnapshot, SnapshotPayload } from "../types.js"
+import type { Effect, Option } from "effect"
+import type { SnapshotPayload } from "../types.js"
 
 /** Process information from ps-list */
 export interface PsProcess {
@@ -52,5 +53,3 @@ export interface Scanner {
   readonly getUsage: (pids: readonly number[]) => Effect.Effect<Readonly<Record<number, ProcessUsage>>>
   readonly getCwd: (pid: number) => Effect.Effect<Option.Option<string>>
 }
-
-import type { Effect, Option } from "effect"

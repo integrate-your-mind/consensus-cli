@@ -71,7 +71,7 @@ const buildCodexConfig = () => ({
   holdMs: Option.getOrUndefined(parseNumber(process.env.CONSENSUS_CODEX_ACTIVE_HOLD_MS)),
   inFlightIdleMs: Option.getOrUndefined(parseNumber(process.env.CONSENSUS_CODEX_INFLIGHT_IDLE_MS)),
   inFlightTimeoutMs: Option.getOrUndefined(parseNumber(process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS)),
-  spikeMultiplier: undefined, // Derived from cpuThreshold * 10
+  spikeMultiplier: undefined, // Default (10) applied by schema
   spikeMinimum: Option.getOrUndefined(parseNumber(process.env.CONSENSUS_CODEX_CPU_SPIKE)),
   inFlightGraceMs: Option.getOrUndefined(parseNumber(process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS)),
   strictInFlight: Option.getOrUndefined(parseBoolean(process.env.CONSENSUS_CODEX_STRICT_INFLIGHT)),

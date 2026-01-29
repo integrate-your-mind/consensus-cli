@@ -3,7 +3,7 @@
  * Provides declarative, priority-ordered state transitions
  */
 
-import { Effect, Match, Option } from "effect"
+import { Effect, Option } from "effect"
 import type { ActivityContext, State, StateResult } from "./types.js"
 
 // ============================================================================
