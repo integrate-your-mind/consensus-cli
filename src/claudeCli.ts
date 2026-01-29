@@ -147,6 +147,7 @@ export function deriveClaudeState(input: ClaudeActivityInput): ActivityHoldResul
     input.cpu >= spikeThreshold ||
     (typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs);
   const cpuValue = isTui && !hasWork && !sustained ? 0 : input.cpu;
+  
   const result = deriveStateWithHold({
     cpu: cpuValue,
     hasError: false,
@@ -156,9 +157,23 @@ export function deriveClaudeState(input: ClaudeActivityInput): ActivityHoldResul
     now: input.now,
     cpuThreshold: effectiveThreshold,
   });
-  if (!hasWork && cpuValue <= effectiveThreshold) {
-    return { state: "idle", lastActiveAt: undefined };
+  
+  // CRITICAL FIX: Don't bypass the hold mechanism with early return
+  // The previous code would return { state: "idle", lastActiveAt: undefined }
+  // when !hasWork && cpuValue <= effectiveThreshold, which broke the hold period.
+  // 
+  // Instead, we let deriveStateWithHold handle the hold logic properly.
+  // If we're in a hold period, we should stay active even if current CPU is low.
+  // Only clear lastActiveAt when we're genuinely transitioning out of the hold period.
+  
+  if (result.state === "idle" && !hasWork && cpuValue <= effectiveThreshold) {
+    // We're idle and there's no work - this is a genuine idle state
+    // But preserve lastActiveAt if we're still in the hold window
+    // The hold mechanism in deriveStateWithHold already handled this,
+    // so if we got "idle" back, the hold period has expired
+    return result;
   }
+  
   return result;
 }
 

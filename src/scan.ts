@@ -590,8 +590,14 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       statusIsError ||
       typeof lastEventAt === "number" ||
       typeof inFlight === "boolean";
-    if (!opencodeApiAvailable && !hasSignal) state = "idle";
-    if (!hasSignal && cpu <= cpuThreshold) {
+    
+    // CRITICAL FIX: Don't override state after deriveOpenCodeState has applied hold logic
+    // The previous code would flip state back to idle, negating the hold mechanism.
+    // Only force idle when we have NO signal AND NO hold period active.
+    if (!opencodeApiAvailable && !hasSignal && !activity.lastActiveAt) {
+      state = "idle";
+    }
+    if (!hasSignal && cpu <= cpuThreshold && !activity.lastActiveAt) {
       state = "idle";
     }
     activityCache.set(id, {
@@ -671,8 +677,12 @@ export async function scanCodexProcesses(): Promise<SnapshotPayload> {
       cpuActiveMs,
     });
     const state = activity.state;
+    // CRITICAL FIX: Always preserve lastActiveAt from the activity result
+    // The previous code only kept lastActiveAt when state was "active",
+    // which broke the hold mechanism on subsequent scans.
+    // The hold mechanism needs the timestamp to know when to expire.
     activityCache.set(id, {
-      lastActiveAt: state === "active" ? activity.lastActiveAt : undefined,
+      lastActiveAt: activity.lastActiveAt,
       lastSeenAt: now,
       lastCpuAboveAt,
     });
