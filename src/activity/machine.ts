@@ -16,7 +16,10 @@ const isWithinWindow = (
   now: number,
   windowMs: number
 ): boolean => {
-  if (timestamp === undefined || windowMs <= 0) return false
+  if (timestamp === undefined) return false
+  if (!Number.isFinite(windowMs)) return false
+  if (windowMs < 0) return true
+  if (windowMs === 0) return false
   return now - timestamp <= windowMs
 }
 

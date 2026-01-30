@@ -1,8 +1,7 @@
 import type { AgentState } from "./types.js";
 import type { ActivityHoldResult } from "./activity.js";
 import { deriveStateWithHold } from "./activity.js";
-
-const DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS = 15000;
+import { DISABLE_INFLIGHT_DECAY, INFLIGHT_CONFIG } from "./config/inflight.js";
 
 export interface OpenCodeStateInput {
   hasError: boolean;
@@ -25,35 +24,34 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
   const statusIsActive = !!status && /running|active|processing/.test(status);
   const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
   const now = input.now ?? Date.now();
+  const activityAt =
+    typeof input.lastActivityAt === "number" ? input.lastActivityAt : undefined;
+  const eventAt = typeof input.lastEventAt === "number" ? input.lastEventAt : undefined;
   if (input.strictInFlight) {
     const state =
       input.hasError || statusIsError ? "error" : input.inFlight ? "active" : "idle";
     const reason =
       input.hasError || statusIsError ? "error" : input.inFlight ? "in_flight" : "idle";
-    return { state, lastActiveAt: input.inFlight ? now : undefined, reason };
+    const lastActiveAt = input.inFlight ? activityAt ?? eventAt ?? now : undefined;
+    return { state, lastActiveAt, reason };
   }
   const holdMs =
     input.holdMs ?? Number(process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS || 3000);
-  const envInFlightIdle = process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS;
-  const envInFlightTimeout = process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS;
+  const envInFlightIdle = INFLIGHT_CONFIG.opencode.idleMs;
+  const envInFlightTimeout = INFLIGHT_CONFIG.opencode.timeoutMs;
   let inFlightIdleMs: number | undefined =
-    input.inFlightIdleMs ??
-    (envInFlightIdle !== undefined
-      ? Number(envInFlightIdle)
-      : envInFlightTimeout !== undefined
-        ? Number(envInFlightTimeout)
-        : DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS);
-  if (
-    typeof inFlightIdleMs !== "number" ||
-    !Number.isFinite(inFlightIdleMs) ||
-    inFlightIdleMs <= 0
-  ) {
-    inFlightIdleMs = undefined;
+    input.inFlightIdleMs ?? envInFlightIdle ?? envInFlightTimeout;
+  if (inFlightIdleMs !== DISABLE_INFLIGHT_DECAY) {
+    if (
+      typeof inFlightIdleMs !== "number" ||
+      !Number.isFinite(inFlightIdleMs) ||
+      inFlightIdleMs <= 0
+    ) {
+      inFlightIdleMs = undefined;
+    }
   }
   const eventWindowMs =
     input.eventWindowMs ?? Number(process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS || 1000);
-  const activityAt =
-    typeof input.lastActivityAt === "number" ? input.lastActivityAt : undefined;
   const previousActiveAt = input.previousActiveAt;
   let inFlight = input.inFlight;
   const recentActivity =
@@ -61,11 +59,16 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
   const hasNewActivity =
     recentActivity &&
     (typeof previousActiveAt !== "number" || activityAt > previousActiveAt);
+  const decayAt =
+    typeof activityAt === "number" && typeof eventAt === "number"
+      ? Math.max(activityAt, eventAt)
+      : activityAt ?? eventAt;
   if (
     inFlight &&
+    inFlightIdleMs !== DISABLE_INFLIGHT_DECAY &&
     typeof inFlightIdleMs === "number" &&
-    typeof activityAt === "number" &&
-    now - activityAt > inFlightIdleMs
+    typeof decayAt === "number" &&
+    now - decayAt > inFlightIdleMs
   ) {
     inFlight = false;
   }

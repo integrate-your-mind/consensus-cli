@@ -15,6 +15,7 @@ export interface ClaudeSessionState {
   sessionId: string;
   inFlight: boolean;
   lastActivityAt?: number;
+  lastInFlightSignalAt?: number;
   lastSeenAt: number;
   cwd?: string;
   transcriptPath?: string;

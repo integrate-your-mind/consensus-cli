@@ -1,14 +1,14 @@
 import type { EventSummary, WorkSummary } from "./types.js";
 import { createParser } from "eventsource-parser";
 import { redactText } from "./redact.js";
+import { getLastSignalAt } from "./activity/signal.js";
+import { INFLIGHT_CONFIG } from "./config/inflight.js";
 
 const MAX_EVENTS = 50;
 const STALE_TTL_MS = 30 * 60 * 1000;
 const RECONNECT_MIN_MS = 10_000;
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
-const INFLIGHT_TIMEOUT_MS = Number(
-  process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS || 15000
-);
+const INFLIGHT_TIMEOUT_MS = INFLIGHT_CONFIG.opencode.timeoutMs;
 const ACTIVITY_KINDS = new Set<string>(["command", "edit", "message", "prompt", "tool"]);
 // Meta events that don't indicate real activity
 const META_EVENT_RE =
@@ -87,7 +87,7 @@ function logDebug(message: string): void {
 
 function expireInFlight(state: ActivityState, now: number): void {
   if (!state.inFlight) return;
-  const lastSignal = state.lastInFlightSignalAt ?? state.lastActivityAt ?? state.lastEventAt;
+  const lastSignal = getLastSignalAt(state);
   if (typeof lastSignal === "number" && now - lastSignal > INFLIGHT_TIMEOUT_MS) {
     state.inFlight = false;
     state.lastInFlightSignalAt = undefined;

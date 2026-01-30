@@ -60,6 +60,35 @@ test("opencode inFlight decays after idle window", () => {
   assert.equal(result.state, "idle");
 });
 
+test("opencode inFlight does not decay when idle decay is disabled", () => {
+  const now = 1_000_000;
+  const result = deriveOpenCodeState({
+    hasError: false,
+    status: "running",
+    inFlight: true,
+    lastActivityAt: now - 10_000,
+    inFlightIdleMs: -1,
+    now,
+  });
+  assert.equal(result.state, "active");
+  assert.equal(result.reason, "in_flight");
+});
+
+test("opencode inFlight decay uses most recent event timestamp", () => {
+  const now = 1_000_000;
+  const result = deriveOpenCodeState({
+    hasError: false,
+    status: "running",
+    inFlight: true,
+    lastActivityAt: now - 10_000,
+    lastEventAt: now - 500,
+    inFlightIdleMs: 1_000,
+    now,
+  });
+  assert.equal(result.state, "active");
+  assert.equal(result.reason, "in_flight");
+});
+
 test("opencode holds active during brief idle gap while running", () => {
   const now = 1_000_000;
   const result = deriveOpenCodeState({
@@ -273,6 +302,19 @@ test("opencode strict inFlight mode shows active when inFlight=true", () => {
   });
   assert.equal(result.state, "active");
   assert.equal(result.reason, "in_flight");
+});
+
+test("opencode strict inFlight uses lastActivityAt for lastActiveAt", () => {
+  const now = 1_000_000;
+  const result = deriveOpenCodeState({
+    hasError: false,
+    inFlight: true,
+    lastActivityAt: now - 2_000,
+    now,
+    strictInFlight: true,
+  });
+  assert.equal(result.state, "active");
+  assert.equal(result.lastActiveAt, now - 2_000);
 });
 
 test("opencode error state takes precedence over inFlight", () => {

@@ -81,8 +81,8 @@ test("event store tracks item-level activity", () => {
 
 test("event store updates lastActivityAt on every event", () => {
   const threadId = "thread-ghi-789";
-  const ts1 = 1000000;
-  const ts2 = 2000000;
+  const ts1 = Date.now();
+  const ts2 = ts1 + 1000;
   
   codexEventStore.handleEvent({
     type: "turn.started",
@@ -159,4 +159,19 @@ test("event store thread isolation", () => {
   
   assert.strictEqual(stateA?.inFlight, true);
   assert.strictEqual(stateB, undefined);
+});
+
+test("event store prunes stale threads", () => {
+  const threadId = "thread-stale";
+  const staleTs = Date.now() - 40 * 60 * 1000;
+
+  codexEventStore.handleEvent({
+    type: "turn.started",
+    threadId,
+    turnId: "turn-stale",
+    timestamp: staleTs,
+  } as CodexEvent);
+
+  const state = codexEventStore.getThreadState(threadId);
+  assert.strictEqual(state, undefined);
 });

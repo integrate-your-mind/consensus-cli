@@ -36,6 +36,9 @@ test("clears inFlight on stop (case/format agnostic)", () => {
     sessionId,
     timestamp: t0,
   });
+  const active = getClaudeActivityBySession(sessionId, t0);
+  assert.ok(active);
+  assert.equal(active?.lastInFlightSignalAt, t0);
   handleClaudeEvent({
     type: "stop",
     sessionId,
@@ -46,6 +49,7 @@ test("clears inFlight on stop (case/format agnostic)", () => {
   assert.ok(state);
   assert.equal(state?.inFlight, false);
   assert.equal(state?.lastActivityAt, undefined);
+  assert.equal(state?.lastInFlightSignalAt, undefined);
 });
 
 test("clears inFlight on session_end alias", () => {

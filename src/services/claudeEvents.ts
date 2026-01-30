@@ -1,10 +1,10 @@
 import { Effect, Ref } from "effect";
 import type { ClaudeEvent, ClaudeSessionState } from "../claude/types.js";
+import { getLastSignalAt } from "../activity/signal.js";
+import { INFLIGHT_CONFIG } from "../config/inflight.js";
 
 const STALE_TTL_MS = Number(process.env.CONSENSUS_CLAUDE_EVENT_TTL_MS || 30 * 60 * 1000);
-const INFLIGHT_TIMEOUT_MS = Number(
-  process.env.CONSENSUS_CLAUDE_INFLIGHT_TIMEOUT_MS || 15000
-);
+const INFLIGHT_TIMEOUT_MS = INFLIGHT_CONFIG.claude.timeoutMs;
 
 const INFLIGHT_EVENTS = new Set<string>([
   "UserPromptSubmit",
@@ -61,7 +61,7 @@ function isActivityEvent(type: string): boolean {
 
 function expireInFlight(state: ClaudeSessionState, now: number): ClaudeSessionState {
   if (!state.inFlight) return state;
-  const lastSignal = state.lastActivityAt ?? state.lastSeenAt;
+  const lastSignal = getLastSignalAt(state);
   if (typeof lastSignal === "number" && now - lastSignal > INFLIGHT_TIMEOUT_MS) {
     return { ...state, inFlight: false };
   }
@@ -98,13 +98,21 @@ function applyEvent(map: StateMap, event: ClaudeEvent): StateMap {
     transcriptPath: event.transcriptPath ?? prev?.transcriptPath,
     lastEvent: type,
     lastActivityAt: prev?.lastActivityAt,
+    lastInFlightSignalAt: prev?.lastInFlightSignalAt,
   };
-  if (INFLIGHT_EVENTS.has(type)) next.inFlight = true;
+  if (INFLIGHT_EVENTS.has(type)) {
+    next.inFlight = true;
+    next.lastInFlightSignalAt = now;
+  }
   if (IDLE_EVENTS.has(type) || isIdleNotification) {
     next.inFlight = false;
     next.lastActivityAt = undefined;
+    next.lastInFlightSignalAt = undefined;
   } else if (isActivityEvent(type)) {
     next.lastActivityAt = now;
+    if (next.inFlight) {
+      next.lastInFlightSignalAt = now;
+    }
   }
   const nextMap = new Map(map);
   nextMap.set(event.sessionId, next);

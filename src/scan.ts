@@ -45,6 +45,7 @@ import {
 import { getOpenCodeSessionForDirectory } from "./opencodeStorage.js";
 import { deriveOpenCodeState } from "./opencodeState.js";
 import { shouldUseOpenCodeApiActivityAt } from "./opencodeApiActivity.js";
+import { resolveOpenCodeInFlight } from "./opencodeInFlight.js";
 import { shouldIncludeOpenCodeProcess } from "./opencodeFilter.js";
 import { summarizeClaudeCommand } from "./claudeCli.js";
 import { deriveStateWithHold } from "./activity.js";
@@ -52,6 +53,7 @@ import { getClaudeActivityByCwd, getClaudeActivityBySession } from "./services/c
 import { parseOpenCodeCommand, summarizeOpenCodeCommand } from "./opencodeCmd.js";
 import { redactText } from "./redact.js";
 import { dedupeAgents } from "./dedupe.js";
+import { isStartMsMismatch, resetSessionCachesOnRestart } from "./sessionCache.js";
 import {
   recordActivityCount,
   recordActivityTransition,
@@ -85,7 +87,6 @@ const opencodeSessionByPidCache = new Map<
   number,
   { sessionId: string; lastSeenAt: number }
 >();
-const START_MS_EPSILON_MS = 1000;
 
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
 
@@ -94,10 +95,6 @@ function logActivityDecision(message: string): void {
   process.stderr.write(`[consensus][activity] ${message}\n`);
 }
 
-function isStartMsMismatch(cached?: number, current?: number): boolean {
-  if (typeof cached !== "number" || typeof current !== "number") return false;
-  return Math.abs(cached - current) > START_MS_EPSILON_MS;
-}
 
 function providerForKind(kind: AgentKind): string {
   if (kind.startsWith("opencode")) return "opencode";
@@ -1420,6 +1417,20 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         ? now - elapsed
         : startTimes.get(proc.pid);
 
+    const id = `${proc.pid}`;
+    let cached = activityCache.get(id);
+    if (
+      resetSessionCachesOnRestart({
+        pid: proc.pid,
+        cachedStartMs: cached?.startMs,
+        currentStartMs: startMs,
+        activityCache,
+        sessionCache: opencodeSessionByPidCache,
+      })
+    ) {
+      cached = undefined;
+    }
+
     const cmdRaw = proc.cmd || proc.name || "";
     const kind = inferKind(cmdRaw);
     const isLspRun =
@@ -1562,8 +1573,13 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     if (!isServer && sessionId && opencodeApiAvailable) {
       const msgActivity = await getCachedOpenCodeSessionActivity(sessionId);
       if (msgActivity.ok) {
-        // Message API is authoritative for TUI - use its inFlight value directly
-        inFlight = msgActivity.inFlight;
+        const resolved = resolveOpenCodeInFlight({
+          sseInFlight: inFlight,
+          sseLastActivityAt: lastActivityAt,
+          apiInFlight: msgActivity.inFlight,
+          apiLastActivityAt: msgActivity.lastActivityAt,
+        });
+        inFlight = resolved.inFlight;
         if (typeof msgActivity.lastActivityAt === "number") {
           lastActivityAt = lastActivityAt
             ? Math.max(lastActivityAt, msgActivity.lastActivityAt)
@@ -1603,12 +1619,6 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const sessionIdentity = isServer
       ? (sessionId ? `opencode:${sessionId}` : `pid:${proc.pid}`)
       : `pid:${proc.pid}`;
-    const id = `${proc.pid}`;
-    let cached = activityCache.get(id);
-    if (isStartMsMismatch(cached?.startMs, startMs)) {
-      activityCache.delete(id);
-      cached = undefined;
-    }
     const opencodeStartedRecently =
       typeof startMs === "number" && now - startMs <= opencodeHoldMs;
     const previousActiveAt = opencodeStartedRecently ? now : cached?.lastActiveAt;

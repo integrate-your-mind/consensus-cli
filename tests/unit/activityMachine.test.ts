@@ -48,6 +48,20 @@ describe("activity/machine", () => {
       assert.strictEqual(result.reason, "in_flight")
     })
 
+    it("should honor inFlight grace when window is negative", async () => {
+      const ctx = {
+        ...baseContext,
+        inFlight: false,
+        strictInFlight: true,
+        lastInFlightSignalAt: baseContext.now - 1000,
+        inFlightGraceMs: -1,
+      }
+      const result = await Effect.runPromise(deriveState(ctx))
+
+      assert.strictEqual(result.state, "active")
+      assert.strictEqual(result.reason, "in_flight_grace")
+    })
+
     it("should return active on CPU spike", async () => {
       const ctx = { ...baseContext, cpu: 30 } // Above spike threshold (25)
       const result = await Effect.runPromise(deriveState(ctx))
