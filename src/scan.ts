@@ -48,6 +48,7 @@ import { shouldUseOpenCodeApiActivityAt } from "./opencodeApiActivity.js";
 import { shouldIncludeOpenCodeProcess } from "./opencodeFilter.js";
 import { summarizeClaudeCommand } from "./claudeCli.js";
 import { deriveStateWithHold } from "./activity.js";
+import { mergeLastActiveAt } from "./activity/cache.js";
 import { getClaudeActivityByCwd, getClaudeActivityBySession } from "./services/claudeEvents.js";
 import { parseOpenCodeCommand, summarizeOpenCodeCommand } from "./opencodeCmd.js";
 import { redactText } from "./redact.js";
@@ -1666,7 +1667,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       );
     }
     activityCache.set(id, {
-      lastActiveAt: activity.lastActiveAt,
+      lastActiveAt: mergeLastActiveAt(activity.lastActiveAt, cached?.lastActiveAt),
       lastSeenAt: now,
       lastState: state,
       lastReason: reason,
@@ -1776,7 +1777,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       );
     }
     activityCache.set(id, {
-      lastActiveAt: activity.lastActiveAt,
+      lastActiveAt: mergeLastActiveAt(activity.lastActiveAt, cached?.lastActiveAt),
       lastSeenAt: now,
       lastCpuAboveAt: cached?.lastCpuAboveAt,
       lastState: state,
