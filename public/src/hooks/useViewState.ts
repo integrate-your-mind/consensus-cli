@@ -150,7 +150,9 @@ export function useViewState(
   }, [pan, zoom]);
 
   const onWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
+    if (e.cancelable) {
+      e.preventDefault();
+    }
     const delta = Math.sign(e.deltaY) * -WHEEL_SENSITIVITY;
     zoom(delta);
   }, [zoom]);
