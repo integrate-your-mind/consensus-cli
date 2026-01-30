@@ -119,10 +119,6 @@ export const OpenCodeConfig = Schema.Struct({
     Schema.optionalWith({ default: () => 0 })
   ),
   
-  cpuWindowMs: Schema.Number.pipe(
-    Schema.optionalWith({ default: () => 0 })
-  ),
-  
   holdMs: Schema.Number.pipe(
     Schema.optionalWith({ default: () => 0 })
   ),
@@ -268,7 +264,7 @@ export const AppConfig = Schema.Struct({
   activity: ActivityConfig.pipe(
     Schema.optionalWith({ default: () => ({ 
       cpuThreshold: 1, 
-      holdMs: 600000, 
+      holdMs: 3000, 
       idleHoldMs: 200, 
       staleSpanMs: 15000 
     }) })
@@ -278,7 +274,7 @@ export const AppConfig = Schema.Struct({
       cpuThreshold: 1,
       sustainMs: 500,
       eventWindowMs: 30000,
-      holdMs: 0,
+      holdMs: 3000,
       inFlightIdleMs: 30000,
       inFlightTimeoutMs: 5000,
       spikeMultiplier: 10,
@@ -298,8 +294,7 @@ export const AppConfig = Schema.Struct({
       enableEvents: true,
       eventWindowMs: 0,
       staleActiveMs: 0,
-      cpuWindowMs: 0,
-      holdMs: 0,
+      holdMs: 3000,
       strictInFlight: true,
       inFlightTimeoutMs: 15000,
     }) })

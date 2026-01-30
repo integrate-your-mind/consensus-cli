@@ -22,3 +22,10 @@ test("parses continue mode", () => {
   const summary = summarizeClaudeCommand("/usr/local/bin/claude --continue");
   assert.equal(summary?.doing, "continue");
 });
+
+test("parses session id flags", () => {
+  const info = parseClaudeCommand("claude --session-id ses_123 --model sonnet");
+  assert.equal(info?.sessionId, "ses_123");
+  const short = parseClaudeCommand("claude -s ses_456");
+  assert.equal(short?.sessionId, "ses_456");
+});

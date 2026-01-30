@@ -3,6 +3,7 @@
 ## Data collected
 - Process metadata: pid, cmdline, cpu, memory, cwd.
 - Recent Codex session event summaries (best-effort).
+- Claude hook events (session id, cwd, transcript path, event type).
 
 ## Storage
 - No persistent storage outside the local machine.

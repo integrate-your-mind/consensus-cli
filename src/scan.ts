@@ -13,7 +13,7 @@ import type {
   SnapshotPayload,
   WorkSummary,
 } from "./types.js";
-import { deriveCodexState } from "./codexState.js";
+import { deriveCodexEventState } from "./codexState.js";
 import {
   listRecentSessions,
   findSessionById,
@@ -23,19 +23,32 @@ import {
   summarizeTail,
   updateTail,
   getTailState,
+  getSessionMeta,
+  getSessionStartMsFromPath,
 } from "./codexLogs.js";
+import { codexEventStore } from "./services/codexEvents.js";
 import type { SessionFile } from "./codexLogs.js";
-import { getOpenCodeSessions, type OpenCodeSessionResult } from "./opencodeApi.js";
+
+import { getOpenCodeSessions, getOpenCodeSessionActivity, type OpenCodeSessionResult } from "./opencodeApi.js";
 import { ensureOpenCodeServer } from "./opencodeServer.js";
 import {
   ensureOpenCodeEventStream,
   getOpenCodeActivityByPid,
   getOpenCodeActivityBySession,
 } from "./opencodeEvents.js";
+import {
+  getOpenCodeSessionId,
+  getOpenCodeSessionPid,
+  markOpenCodeSessionUsed,
+  selectOpenCodeSessionForTui,
+} from "./opencodeSessionAssign.js";
 import { getOpenCodeSessionForDirectory } from "./opencodeStorage.js";
 import { deriveOpenCodeState } from "./opencodeState.js";
+import { shouldUseOpenCodeApiActivityAt } from "./opencodeApiActivity.js";
 import { shouldIncludeOpenCodeProcess } from "./opencodeFilter.js";
-import { deriveClaudeState, getClaudeCpuThreshold, summarizeClaudeCommand } from "./claudeCli.js";
+import { summarizeClaudeCommand } from "./claudeCli.js";
+import { deriveStateWithHold } from "./activity.js";
+import { getClaudeActivityByCwd, getClaudeActivityBySession } from "./services/claudeEvents.js";
 import { parseOpenCodeCommand, summarizeOpenCodeCommand } from "./opencodeCmd.js";
 import { redactText } from "./redact.js";
 import { dedupeAgents } from "./dedupe.js";
@@ -45,6 +58,7 @@ import {
   runPromise,
 } from "./observability/index.js";
 
+const dirtySessionPaths = new Set<string>();
 const execFileAsync = promisify(execFile);
 const fsp = fs.promises;
 const repoCache = new Map<string, string | null>();
@@ -57,9 +71,9 @@ const activityCache = new Map<
     lastState?: AgentState;
     lastReason?: string;
     startMs?: number;
+    sessionId?: string;
   }
 >();
-const dirtySessionPaths = new Set<string>();
 let opencodeSessionCache: OpenCodeSessionResult | null = null;
 let opencodeSessionCacheAt = 0;
 const pidSessionCache = new Map<
@@ -67,6 +81,10 @@ const pidSessionCache = new Map<
   { path: string; lastSeenAt: number; startMs?: number }
 >();
 const opencodeServerLogged = new Set<number>();
+const opencodeSessionByPidCache = new Map<
+  number,
+  { sessionId: string; lastSeenAt: number }
+>();
 const START_MS_EPSILON_MS = 1000;
 
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
@@ -393,15 +411,6 @@ function parseTimestamp(value?: string | number): number | undefined {
   return undefined;
 }
 
-function coerceNumber(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string") {
-    const parsed = Number(value);
-    if (!Number.isNaN(parsed)) return parsed;
-  }
-  return undefined;
-}
-
 function deriveTitle(
   doing: string | undefined,
   repo: string | undefined,
@@ -654,28 +663,6 @@ async function getPidUsageForPids(
   return await fallback();
 }
 
-async function getCpuFromPs(pids: number[]): Promise<Map<number, number>> {
-  const result = new Map<number, number>();
-  if (pids.length === 0) return result;
-  if (process.platform === "win32") return result;
-  try {
-    const { stdout } = await execFileAsync("ps", ["-o", "pid=,pcpu=", "-p", pids.join(",")]);
-    const lines = stdout.split(/\r?\n/).filter(Boolean);
-    for (const line of lines) {
-      const match = line.trim().match(/^(\d+)\s+([\d.]+)/);
-      if (!match) continue;
-      const pid = Number(match[1]);
-      const cpu = Number(match[2]);
-      if (!Number.isNaN(pid) && Number.isFinite(cpu)) {
-        result.set(pid, cpu);
-      }
-    }
-  } catch {
-    return result;
-  }
-  return result;
-}
-
 function findRepoRoot(cwd: string): string | null {
   if (repoCache.has(cwd)) return repoCache.get(cwd) || null;
   let current = cwd;
@@ -720,6 +707,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   };
   const matchEnv = process.env.CONSENSUS_PROCESS_MATCH;
   const debugOpencode = process.env.CONSENSUS_DEBUG_OPENCODE === "1";
+  const logOpencode = (msg: string) => {
+    if (debugOpencode) process.stderr.write(`[consensus][opencode] ${msg}\n`);
+  };
   let matchRe: RegExp | undefined;
   if (matchEnv) {
     try {
@@ -733,6 +723,17 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     if (value === undefined) return fallback;
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  let nextTickAt: number | null = null;
+  const bumpNextTickAt = (candidate: number | undefined): void => {
+    if (typeof candidate !== "number" || !Number.isFinite(candidate)) return;
+    if (candidate <= now) {
+      nextTickAt = now;
+      return;
+    }
+    if (nextTickAt === null || candidate < nextTickAt) {
+      nextTickAt = candidate;
+    }
   };
   const processCacheMs = Math.max(100, resolveMs(process.env.CONSENSUS_PROCESS_CACHE_MS, 1000));
   const processCacheFastMs = Math.max(
@@ -772,9 +773,15 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     isCodexProcess(proc.cmd, proc.name, matchRe)
   );
   const codexWrapperPidSet = new Set(codexWrapperProcs.map((proc) => proc.pid));
-  const codexVendorProcs = processes
-    .filter((proc) => isCodexVendorProcess(proc.cmd, proc.name))
-    .filter((proc) => !codexWrapperPidSet.has(proc.ppid ?? -1));
+  const codexVendorCandidates = processes.filter((proc) =>
+    isCodexVendorProcess(proc.cmd, proc.name)
+  );
+  const codexVendorChildren = codexVendorCandidates.filter((proc) =>
+    codexWrapperPidSet.has(proc.ppid ?? -1)
+  );
+  const codexVendorProcs = codexVendorCandidates.filter(
+    (proc) => !codexWrapperPidSet.has(proc.ppid ?? -1)
+  );
   const includeVendor =
     process.env.CONSENSUS_INCLUDE_CODEX_VENDOR === "1" ||
     process.env.CONSENSUS_INCLUDE_CODEX_VENDOR === "true";
@@ -790,26 +797,30 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const pids = Array.from(
     new Set([...codexProcs, ...opencodeProcs, ...claudeProcs].map((proc) => proc.pid))
   );
+  const codexVendorPids = codexVendorChildren.map((proc) => proc.pid);
+  const usagePids = Array.from(new Set([...pids, ...codexVendorPids]));
   if (shouldUseProcessCache) {
-    const refreshPids = Array.from(
-      new Set([...opencodeProcs, ...claudeProcs].map((proc) => proc.pid))
+    const refreshPids = new Set<number>(
+      [...opencodeProcs, ...claudeProcs].map((proc) => proc.pid)
     );
-    if (refreshPids.length > 0) {
+    for (const pid of codexVendorPids) refreshPids.add(pid);
+    const refreshList = Array.from(refreshPids);
+    if (refreshList.length > 0) {
       const refreshTimer = startProfile("pidusage", "fast");
       try {
-        const refreshed = await getPidUsageForPids(refreshPids);
+        const refreshed = await getPidUsageForPids(refreshList);
         usage = { ...usage, ...refreshed };
         processCache.usage = usage;
       } catch {
         // ignore refresh failures
       }
-      endProfile(refreshTimer, { count: refreshPids.length });
+      endProfile(refreshTimer, { count: refreshList.length });
     }
   }
   if (!shouldUseProcessCache) {
     const usageTimer = startProfile("pidusage");
-    usage = await getPidUsageForPids(pids);
-    endProfile(usageTimer, { count: pids.length });
+    usage = await getPidUsageForPids(usagePids);
+    endProfile(usageTimer, { count: usagePids.length });
 
     const cwdTimer = startProfile("cwd");
     cwds = await getCwdsForPids(pids);
@@ -852,20 +863,21 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     processCache.jsonlByPid = jsonlByPid;
   }
 
-  const opencodeCpuPids = opencodeProcs.map((proc) => proc.pid);
-  const needsCpuOverride = opencodeCpuPids.some((pid) => (usage[pid]?.cpu ?? 0) <= 0);
-  if (needsCpuOverride) {
-    const psCpu = await getCpuFromPs(opencodeCpuPids);
-    if (psCpu.size > 0) {
-      for (const [pid, cpu] of psCpu.entries()) {
-        const existing = usage[pid];
-        if (!existing || existing.cpu <= 0) {
-          usage[pid] = {
-            cpu,
-            memory: existing?.memory ?? 0,
-            elapsed: existing?.elapsed,
-          };
-        }
+  if (codexVendorChildren.length > 0) {
+    const vendorCpuByWrapper = new Map<number, number>();
+    for (const vendor of codexVendorChildren) {
+      const parentPid = vendor.ppid;
+      if (typeof parentPid !== "number") continue;
+      if (!codexWrapperPidSet.has(parentPid)) continue;
+      const cpu = usage[vendor.pid]?.cpu ?? 0;
+      if (cpu <= 0) continue;
+      vendorCpuByWrapper.set(parentPid, (vendorCpuByWrapper.get(parentPid) || 0) + cpu);
+    }
+    if (vendorCpuByWrapper.size > 0) {
+      for (const [wrapperPid, cpu] of vendorCpuByWrapper.entries()) {
+        const existing = usage[wrapperPid];
+        if (!existing) continue;
+        usage[wrapperPid] = { ...existing, cpu: (existing.cpu ?? 0) + cpu };
       }
       processCache.usage = usage;
     }
@@ -904,18 +916,12 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   }
   const opencodeSessions = opencodeResult.ok ? opencodeResult.sessions : [];
   const opencodeApiAvailable = opencodeResult.ok;
-  const opencodeSessionsByPid = new Map<number, (typeof opencodeSessions)[number]>();
-  const opencodeSessionsByDir = new Map<string, (typeof opencodeSessions)[number]>();
-  const opencodeCwdCounts = new Map<string, number>();
-  for (const proc of opencodeProcs) {
-    const cmdRaw = proc.cmd || proc.name || "";
-    const kind = inferKind(cmdRaw);
-    if (kind !== "opencode-tui") continue;
-    const cwdRaw = cwds.get(proc.pid);
-    if (!cwdRaw) continue;
-    opencodeCwdCounts.set(cwdRaw, (opencodeCwdCounts.get(cwdRaw) || 0) + 1);
-  }
-  const opencodeSessionTimestamp = (session: (typeof opencodeSessions)[number]): number => {
+  type OpenCodeSession = (typeof opencodeSessions)[number];
+  const opencodeSessionsByPid = new Map<number, OpenCodeSession>();
+  const opencodeSessionsById = new Map<string, OpenCodeSession>();
+  // Track ALL recent sessions per directory for activity polling (not just the latest)
+  const opencodeAllSessionsByDir = new Map<string, OpenCodeSession[]>();
+  const opencodeSessionTimestamp = (session: OpenCodeSession): number => {
     return (
       parseTimestamp(
         session.lastActivity ||
@@ -929,32 +935,92 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       ) ?? 0
     );
   };
-  const setLatestSessionByDir = (dir: string | undefined, session: (typeof opencodeSessions)[number]) => {
+  // Helper to add session to all-sessions-by-dir index
+  const addSessionToDir = (dir: string | undefined, session: OpenCodeSession) => {
     if (!dir) return;
-    const existing = opencodeSessionsByDir.get(dir);
-    if (!existing) {
-      opencodeSessionsByDir.set(dir, session);
+    const existing = opencodeAllSessionsByDir.get(dir);
+    if (existing) {
+      existing.push(session);
       return;
     }
-    const existingTs = opencodeSessionTimestamp(existing);
-    const nextTs = opencodeSessionTimestamp(session);
-    if (nextTs >= existingTs) {
-      opencodeSessionsByDir.set(dir, session);
-    }
+    opencodeAllSessionsByDir.set(dir, [session]);
   };
   for (const session of opencodeSessions) {
-    const pid = coerceNumber(session.pid);
+    const pid = getOpenCodeSessionPid(session);
     if (typeof pid === "number") {
       opencodeSessionsByPid.set(pid, session);
     }
+    const sessionId = getOpenCodeSessionId(session);
+    if (sessionId) {
+      opencodeSessionsById.set(sessionId, session);
+    }
     if (typeof session.directory === "string") {
-      setLatestSessionByDir(session.directory, session);
+      addSessionToDir(session.directory, session);
     }
     if (typeof session.cwd === "string") {
-      setLatestSessionByDir(session.cwd, session);
+      addSessionToDir(session.cwd, session);
     }
   }
-
+  for (const sessions of opencodeAllSessionsByDir.values()) {
+    sessions.sort((a, b) => opencodeSessionTimestamp(b) - opencodeSessionTimestamp(a));
+  }
+  const opencodeTuiByDir = new Map<string, PsProcess[]>();
+  for (const proc of opencodeProcs) {
+    const cmdRaw = proc.cmd || proc.name || "";
+    const kind = inferKind(cmdRaw);
+    if (kind !== "opencode-tui") continue;
+    const cwdRaw = cwds.get(proc.pid);
+    if (!cwdRaw) continue;
+    const existing = opencodeTuiByDir.get(cwdRaw);
+    if (existing) {
+      existing.push(proc);
+    } else {
+      opencodeTuiByDir.set(cwdRaw, [proc]);
+    }
+  }
+  const opencodeMessageActivityCache = new Map<
+    string,
+    Awaited<ReturnType<typeof getOpenCodeSessionActivity>>
+  >();
+  const getCachedOpenCodeSessionActivity = async (sessionId: string) => {
+    const cached = opencodeMessageActivityCache.get(sessionId);
+    if (cached) return cached;
+    const result = await getOpenCodeSessionActivity(
+      sessionId,
+      opencodeHost,
+      opencodePort,
+      { silent: true, timeoutMs: 2000 }
+    );
+    opencodeMessageActivityCache.set(sessionId, result);
+    return result;
+  };
+  const opencodeActiveSessionIdsByDir = new Map<string, string[]>();
+  const prefetchActiveSessionsByDir = async () => {
+    const tasks: Promise<void>[] = [];
+    for (const [dir, sessions] of opencodeAllSessionsByDir.entries()) {
+      const tuiCount = opencodeTuiByDir.get(dir)?.length ?? 0;
+      if (tuiCount <= 1) continue;
+      const candidates = sessions.slice(0, Math.max(tuiCount, 2));
+      tasks.push(
+        (async () => {
+          const activeIds: string[] = [];
+          for (const session of candidates) {
+            const id = getOpenCodeSessionId(session);
+            if (!id) continue;
+            const activity = await getCachedOpenCodeSessionActivity(id);
+            if (activity.ok && activity.inFlight) {
+              activeIds.push(id);
+            }
+          }
+          if (activeIds.length > 0) {
+            opencodeActiveSessionIdsByDir.set(dir, activeIds);
+          }
+        })()
+      );
+    }
+    await Promise.all(tasks);
+  };
+  await prefetchActiveSessionsByDir();
   const cacheMatchesHome =
     sessionCache.home === codexHome && sessionCache.sessions.length > 0;
   let sessions: SessionFile[] = [];
@@ -989,39 +1055,13 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
 
   const agents: AgentSnapshot[] = [];
   const seenIds = new Set<string>();
-  const codexEventWindowMs = resolveMs(
-    process.env.CONSENSUS_CODEX_EVENT_ACTIVE_MS,
-    1000
-  );
-  const codexStaleActiveMs = resolveMs(
-    process.env.CONSENSUS_CODEX_STALE_ACTIVE_MS,
-    5000
-  );
-  const codexMtimeWindowMs = resolveMs(
-    process.env.CONSENSUS_CODEX_MTIME_ACTIVE_MS,
-    0
-  );
   const codexHoldMs = resolveMs(
     process.env.CONSENSUS_CODEX_ACTIVE_HOLD_MS,
-    0
+    3000
   );
-  const codexInFlightGraceMs = resolveMs(
-    process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS,
-    0
-  );
-  const codexInFlightIdleMs =
-    process.env.CONSENSUS_CODEX_INFLIGHT_IDLE_MS !== undefined
-      ? resolveMs(process.env.CONSENSUS_CODEX_INFLIGHT_IDLE_MS, 0)
-      : undefined;
-  const codexStrictEnv = process.env.CONSENSUS_CODEX_STRICT_INFLIGHT;
-  const codexStrictInFlight =
-    codexStrictEnv === undefined || codexStrictEnv === ""
-      ? true
-      : codexStrictEnv === "1" || codexStrictEnv === "true";
-  const cpuThreshold = Number(process.env.CONSENSUS_CPU_ACTIVE || 1);
-  const claudeStartGraceMs = resolveMs(
-    process.env.CONSENSUS_CLAUDE_START_ACTIVE_MS,
-    1200
+  const codexEventIdleMs = resolveMs(
+    process.env.CONSENSUS_CODEX_EVENT_IDLE_MS,
+    20000
   );
 
   type CodexContext = {
@@ -1036,36 +1076,20 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     jsonlPaths?: string[];
   };
   const codexContexts: CodexContext[] = [];
-  const codexCwdCounts = new Map<string, number>();
-  for (const proc of codexProcs) {
-    const cwdRaw = cwds.get(proc.pid);
-    if (!cwdRaw) continue;
-    codexCwdCounts.set(cwdRaw, (codexCwdCounts.get(cwdRaw) || 0) + 1);
-  }
   const usedSessionPaths = new Set<string>();
   const normalizeSessionPath = (value?: string): string | undefined =>
     value ? path.resolve(value) : undefined;
-  const pickUnusedSession = (startMs?: number): SessionFile | undefined => {
-    let best: SessionFile | undefined;
-    let bestDelta = Number.POSITIVE_INFINITY;
-    for (const session of sessions) {
-      const key = normalizeSessionPath(session.path);
-      if (key && usedSessionPaths.has(key)) continue;
-      if (startMs === undefined) return session;
-      const delta = Math.abs(session.mtimeMs - startMs);
-      if (delta < bestDelta) {
-        best = session;
-        bestDelta = delta;
-      }
-    }
-    return best;
-  };
+  const jsonlPathSet = new Set<string>();
 
   const jsonlPaths = Array.from(
     new Set(
       Array.from(jsonlByPid.values()).flatMap((paths) => paths)
     )
   );
+  for (const jsonlPath of jsonlPaths) {
+    const normalized = normalizeSessionPath(jsonlPath);
+    if (normalized) jsonlPathSet.add(normalized);
+  }
   const jsonlMtimes = await buildJsonlMtimeIndex(jsonlPaths);
 
   const childJsonlByPid = new Map<number, string[]>();
@@ -1110,11 +1134,6 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         pidSessionCache.delete(proc.pid);
       }
     }
-    const cwdCount = cwdRaw ? codexCwdCounts.get(cwdRaw) || 0 : 0;
-    const sessionByCwd =
-      !sessionId && cwdRaw && cwdCount === 1
-        ? await findSessionByCwd(sessions, cwdRaw, startMs)
-        : undefined;
     const directJsonl = jsonlByPid.get(proc.pid) || [];
     const childJsonl = childJsonlByPid.get(proc.pid) || [];
     const mappedJsonl = pickNewestJsonl([...directJsonl, ...childJsonl], jsonlMtimes);
@@ -1127,21 +1146,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       (sessionId ? await findSessionById(codexHome, sessionId) : undefined) ||
       cachedSession ||
       session;
-    if (!session) {
-      const byStart = startMs !== undefined ? pickUnusedSession(startMs) : undefined;
-      session = sessionByCwd || byStart || pickUnusedSession();
-    }
-    const allowReuse =
-      !!sessionId ||
-      /\bresume\b/i.test(cmdRaw);
+    const hasExplicitSession = !!sessionId || !!mappedJsonl;
+    const allowReuse = hasExplicitSession || /\bresume\b/i.test(cmdRaw);
     const initialSessionPath = normalizeSessionPath(session?.path);
-    const sessionByCwdPath = normalizeSessionPath(sessionByCwd?.path);
     if (initialSessionPath && usedSessionPaths.has(initialSessionPath) && !allowReuse) {
-      session =
-        sessionByCwd && sessionByCwdPath && !usedSessionPaths.has(sessionByCwdPath)
-          ? sessionByCwd
-          : undefined;
-      if (!session) session = pickUnusedSession(startMs);
+      session = undefined;
     }
     const sessionPath = normalizeSessionPath(session?.path);
     if (sessionPath) {
@@ -1198,12 +1207,31 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     let summary: WorkSummary | undefined;
     let lastEventAt: number | undefined;
     let lastActivityAt: number | undefined;
-    let lastInFlightSignalAt: number | undefined;
-    let lastIngestAt: number | undefined;
     let inFlight = false;
-    let lastMtimeMs: number | undefined;
 
     const sessionPath = normalizeSessionPath(session?.path);
+    
+    // Get thread state from event store (webhook-based events)
+    let threadId: string | undefined;
+    let threadState = undefined;
+    if (sessionPath) {
+      const meta = await getSessionMeta(sessionPath);
+      threadId = meta?.id;
+      if (threadId) {
+        threadState = codexEventStore.getThreadState(threadId);
+      }
+    }
+    
+    // Event store provides authoritative inFlight + lastActivityAt if available
+    const eventInFlight = threadState?.inFlight ?? false;
+    const eventActivityAt = threadState?.lastActivityAt;
+
+    let tailInFlight = false;
+    let tailActivityAt: number | undefined;
+    let tailEventAt: number | undefined;
+    let tailInFlightSignalAt: number | undefined;
+    let tailIngestAt: number | undefined;
+
     if (sessionPath) {
       const tail = includeActivity ? tailsByPath.get(sessionPath) : getTailState(sessionPath);
       if (tail) {
@@ -1214,14 +1242,34 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         hasError = tailSummary.hasError;
         title = normalizeTitle(tailSummary.title);
         summary = tailSummary.summary;
-        lastEventAt = tailSummary.lastEventAt;
-        lastActivityAt = tailSummary.lastActivityAt;
-        lastInFlightSignalAt = tailSummary.lastInFlightSignalAt;
-        lastIngestAt = tailSummary.lastIngestAt;
-        inFlight = !!tailSummary.inFlight;
-        lastMtimeMs = tail.lastMtimeMs;
+        tailInFlight = !!tailSummary.inFlight;
+        tailActivityAt = tailSummary.lastActivityAt;
+        tailEventAt = tailSummary.lastEventAt;
+        tailInFlightSignalAt = tailSummary.lastInFlightSignalAt;
+        tailIngestAt = tailSummary.lastIngestAt;
       }
     }
+
+    // Merge notify + JSONL tail events (no CPU/mtime heuristics)
+    const tailActivityAtCandidate =
+      typeof tailActivityAt === "number"
+        ? tailActivityAt
+        : typeof tailEventAt === "number"
+          ? tailEventAt
+          : undefined;
+    const tailSignalAtCandidate =
+      typeof tailInFlightSignalAt === "number"
+        ? tailInFlightSignalAt
+        : typeof tailIngestAt === "number"
+          ? tailIngestAt
+          : tailActivityAtCandidate;
+    inFlight = eventInFlight || tailInFlight;
+    const mergedActivityAt = Math.max(
+      typeof eventActivityAt === "number" ? eventActivityAt : 0,
+      typeof tailActivityAtCandidate === "number" ? tailActivityAtCandidate : 0
+    );
+    lastActivityAt = mergedActivityAt > 0 ? mergedActivityAt : undefined;
+    lastEventAt = tailEventAt ?? eventActivityAt;
 
     if (!doing) {
       doing =
@@ -1245,50 +1293,43 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       activityCache.delete(id);
       cached = undefined;
     }
-    const codexStartedRecently =
-      typeof startMs === "number" && now - startMs <= codexHoldMs;
-    const previousActiveAt = codexStartedRecently ? now : cached?.lastActiveAt;
-    const cpuAbove = cpu > cpuThreshold;
-    const cpuActiveMs =
-      cpuAbove && cached?.lastCpuAboveAt ? now - cached.lastCpuAboveAt : 0;
-    const lastCpuAboveAt = cpuAbove ? cached?.lastCpuAboveAt ?? now : undefined;
-    const mtimeSignalAt =
-      typeof lastMtimeMs === "number" && now - lastMtimeMs <= codexMtimeWindowMs
-        ? lastMtimeMs
-        : undefined;
-    const combinedActivityAt = lastActivityAt;
-    const inFlightGrace =
-      !inFlight &&
-      typeof lastInFlightSignalAt === "number" &&
-      now - lastInFlightSignalAt <= codexInFlightGraceMs;
-    const effectiveInFlight = inFlight || inFlightGrace;
-    const activity = deriveCodexState({
-      cpu,
-      hasError,
-      lastActivityAt: combinedActivityAt,
-      lastInFlightSignalAt,
-      inFlight: effectiveInFlight,
-      cpuActiveMs,
-      inFlightIdleMs: codexInFlightIdleMs,
-      previousActiveAt,
-      now,
-      cpuThreshold,
-      eventWindowMs: codexEventWindowMs,
-      holdMs: codexHoldMs,
-      strictInFlight: codexStrictInFlight,
-    });
-    let state = activity.state;
-    let reason = activity.reason || "unknown";
-    const activityAt =
-      typeof combinedActivityAt === "number" ? combinedActivityAt : activity.lastActiveAt;
-    if (
-      state === "active" &&
-      !effectiveInFlight &&
-      typeof activityAt === "number" &&
-      now - activityAt > codexStaleActiveMs
-    ) {
+    // Event-driven state only (notify + JSONL events)
+    const hasNotify = !!threadState;
+    const hasTailEvents =
+      typeof tailActivityAt === "number" ||
+      typeof tailEventAt === "number" ||
+      tailInFlight;
+    const activityAt = typeof lastActivityAt === "number" ? lastActivityAt : undefined;
+    let state: AgentState;
+    let reason: string;
+    if (!hasNotify && !hasTailEvents) {
       state = "idle";
-      reason = "stale_ttl";
+      reason = "no_hook";
+    } else {
+      const effectiveIdleMs = inFlight ? 0 : codexEventIdleMs;
+      const eventState = deriveCodexEventState({
+        inFlight,
+        lastActivityAt: activityAt,
+        hasError,
+        now,
+        holdMs: codexHoldMs,
+        idleMs: effectiveIdleMs,
+      });
+      state = eventState.state;
+      if (!hasNotify) {
+        reason = eventState.reason?.startsWith("event_")
+          ? eventState.reason.replace("event_", "tail_")
+          : "tail";
+      } else {
+        reason = eventState.reason || "event";
+      }
+    }
+    if (
+      reason === "event_hold" &&
+      typeof activityAt === "number" &&
+      codexHoldMs > 0
+    ) {
+      bumpNextTickAt(activityAt + codexHoldMs);
     }
     const prevState = cached?.lastState;
     if (prevState && prevState !== state) {
@@ -1296,14 +1337,15 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       trackTransition("codex", prevState, state, reason);
       logActivityDecision(
         `codex state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
-          `cpu=${cpu.toFixed(2)} inFlight=${effectiveInFlight ? 1 : 0} ` +
-          `lastActivity=${combinedActivityAt ?? "?"}`
+          `inFlight=${inFlight ? 1 : 0} ` +
+          `lastActivity=${activityAt ?? "?"} ` +
+          `eventStore=${hasNotify ? "yes" : "no"}`
       );
     }
+    // Don't track CPU for Codex - we're event-driven now
     activityCache.set(id, {
-      lastActiveAt: activity.lastActiveAt,
+      lastActiveAt: activityAt,
       lastSeenAt: now,
-      lastCpuAboveAt,
       lastState: state,
       lastReason: reason,
       startMs,
@@ -1346,17 +1388,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS,
     1000
   );
-  const opencodeStaleActiveMs = resolveMs(
-    process.env.CONSENSUS_OPENCODE_STALE_ACTIVE_MS,
-    5000
-  );
-  const opencodeCpuWindowMs = resolveMs(
-    process.env.CONSENSUS_OPENCODE_CPU_ACTIVE_MS,
-    0
-  );
   const opencodeHoldMs = resolveMs(
     process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS,
-    0
+    3000
   );
   const opencodeStrictEnv = process.env.CONSENSUS_OPENCODE_STRICT_INFLIGHT;
   const opencodeStrictInFlight =
@@ -1367,6 +1401,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS !== undefined
       ? resolveMs(process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS, 0)
       : undefined;
+  const usedOpenCodeSessionIds = new Map<string, number>();
   for (const proc of opencodeProcs) {
     const stats = usage[proc.pid] || ({} as pidusage.Status);
     const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
@@ -1386,25 +1421,65 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       (cmdRaw.includes("language-server") || cmdRaw.includes(".local/share/opencode/bin/node_modules"));
     if (isLspRun) continue;
     const isServer = kind === "opencode-server";
-    const sessionByPid = isServer ? undefined : opencodeSessionsByPid.get(proc.pid);
+    let cachedSessionId = opencodeSessionByPidCache.get(proc.pid)?.sessionId;
     const cwdMatch = cwds.get(proc.pid);
-    const cwdCount = cwdMatch ? opencodeCwdCounts.get(cwdMatch) || 0 : 0;
-    const allowDirMatch = cwdCount <= 1;
-    const sessionByDir =
-      sessionByPid || isServer || kind !== "opencode-tui" || !allowDirMatch
-        ? undefined
-        : opencodeSessionsByDir.get(cwdMatch || "");
-    const session = sessionByPid || sessionByDir;
+    // Check if cached session is still active; if not and there are active sessions available,
+    // invalidate the cache to allow reassignment to an active session.
+    if (cachedSessionId && cwdMatch && kind === "opencode-tui") {
+      const activeIds = opencodeActiveSessionIdsByDir.get(cwdMatch);
+      const cachedIsActive = activeIds?.includes(cachedSessionId);
+      const hasAvailableActive = activeIds?.some(id => !usedOpenCodeSessionIds.has(id));
+      logOpencode(`pid=${proc.pid} cachedSession=${cachedSessionId} activeIds=[${activeIds?.join(",") ?? ""}] cachedIsActive=${cachedIsActive} hasAvailableActive=${hasAvailableActive}`);
+      if (!cachedIsActive && hasAvailableActive) {
+        // Cached session is not active but there are active sessions available - allow reassignment
+        logOpencode(`pid=${proc.pid} invalidating cache for inactive session ${cachedSessionId}`);
+        cachedSessionId = undefined;
+        opencodeSessionByPidCache.delete(proc.pid);
+      }
+    }
+    const sessionByPid = isServer ? undefined : opencodeSessionsByPid.get(proc.pid);
+    const selection = !isServer
+      ? selectOpenCodeSessionForTui({
+          pid: proc.pid,
+          dir: kind === "opencode-tui" ? cwdMatch : undefined,
+          sessionByPid,
+          cachedSessionId,
+          sessionsById: opencodeSessionsById,
+          sessionsByDir: opencodeAllSessionsByDir,
+          activeSessionIdsByDir: opencodeActiveSessionIdsByDir,
+          usedSessionIds: usedOpenCodeSessionIds,
+        })
+      : { session: undefined, sessionId: undefined, source: "none" as const };
+    const session = selection.session;
+    let sessionId = selection.sessionId;
     const storageSession =
-      !isServer && !session && cwdMatch && allowDirMatch
+      !isServer && !session && cwdMatch
         ? await getOpenCodeSessionForDirectory(cwdMatch)
         : undefined;
-    const sessionId =
-      !isServer ? session?.id || storageSession?.id || extractOpenCodeSessionId(cmdRaw) : undefined;
+    if (!isServer && !sessionId && storageSession) {
+      const storageSessionId = getOpenCodeSessionId(storageSession);
+      if (storageSessionId) {
+        if (markOpenCodeSessionUsed(usedOpenCodeSessionIds, storageSessionId, proc.pid)) {
+          sessionId = storageSessionId;
+        }
+      }
+    }
+    if (!isServer && !sessionId) {
+      const extractedId = extractOpenCodeSessionId(cmdRaw);
+      if (extractedId) {
+        if (markOpenCodeSessionUsed(usedOpenCodeSessionIds, extractedId, proc.pid)) {
+          sessionId = extractedId;
+        }
+      }
+    }
+    if (sessionId) {
+      opencodeSessionByPidCache.set(proc.pid, { sessionId, lastSeenAt: now });
+    }
     const sessionTitle = normalizeTitle(
       !isServer ? session?.title || session?.name || storageSession?.title : undefined
     );
-    const sessionCwd = session?.cwd || session?.directory || storageSession?.directory;
+    const sessionCwd =
+      session?.cwd || session?.directory || storageSession?.directory;
     const cwdRaw = sessionCwd || cwds.get(proc.pid);
     const cwd = redactText(cwdRaw) || cwdRaw;
     const repoRoot = cwdRaw ? findRepoRoot(cwdRaw) : null;
@@ -1444,8 +1519,6 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       opencodeApiAvailable,
       hasSession: !!session || !!storageSession,
       hasEventActivity: !!eventActivity,
-      cpu,
-      cpuThreshold,
     });
     if (!includeOpenCode) continue;
     if (debugOpencode && isServer && !opencodeServerLogged.has(proc.pid)) {
@@ -1477,7 +1550,25 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       if (eventActivity.inFlight) inFlight = true;
       if (eventActivity.summary?.current) doing = eventActivity.summary.current;
     }
-    const allowApiActivityAt = !statusIsIdle && (!!eventActivity || !!inFlight);
+    // For TUI sessions, ALWAYS poll message API for activity since SSE doesn't reliably emit TUI events.
+    // Message API is the authoritative source for TUI inFlight state - it overrides SSE's potentially stale state.
+    if (!isServer && sessionId && opencodeApiAvailable) {
+      const msgActivity = await getCachedOpenCodeSessionActivity(sessionId);
+      if (msgActivity.ok) {
+        // Message API is authoritative for TUI - use its inFlight value directly
+        inFlight = msgActivity.inFlight;
+        if (typeof msgActivity.lastActivityAt === "number") {
+          lastActivityAt = lastActivityAt
+            ? Math.max(lastActivityAt, msgActivity.lastActivityAt)
+            : msgActivity.lastActivityAt;
+        }
+      }
+    }
+    const allowApiActivityAt = shouldUseOpenCodeApiActivityAt({
+      status,
+      apiUpdatedAt,
+      apiCreatedAt,
+    });
     const apiActivityAt = allowApiActivityAt ? apiUpdatedAt ?? apiCreatedAt : undefined;
     if (typeof apiActivityAt === "number") {
       lastEventAt =
@@ -1489,7 +1580,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
           ? Math.max(lastActivityAt, apiActivityAt)
           : apiActivityAt;
     }
-    if (statusIsIdle && !eventActivity?.inFlight) {
+    if (statusIsIdle && !eventActivity?.inFlight && !inFlight) {
       inFlight = false;
     }
     if (!lastEventAt && statusIsIdle) {
@@ -1501,29 +1592,24 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
     if (doing) summary = { current: doing };
 
-    const sessionIdentity = sessionId ? `opencode:${sessionId}` : `pid:${proc.pid}`;
+    // For TUI processes, use PID-based identity to avoid collapsing multiple TUIs onto one session.
+    const sessionIdentity = isServer
+      ? (sessionId ? `opencode:${sessionId}` : `pid:${proc.pid}`)
+      : `pid:${proc.pid}`;
     const id = `${proc.pid}`;
     let cached = activityCache.get(id);
     if (isStartMsMismatch(cached?.startMs, startMs)) {
       activityCache.delete(id);
       cached = undefined;
     }
-    const cpuAbove = cpu > cpuThreshold;
-    const lastCpuAboveAt = cpuAbove ? now : cached?.lastCpuAboveAt;
-    const cpuSignal =
-      typeof lastActivityAt === "number" || inFlight ? cpu : 0;
-    if (
-      typeof lastCpuAboveAt === "number" &&
-      now - lastCpuAboveAt <= opencodeCpuWindowMs &&
-      typeof lastActivityAt === "number"
-    ) {
-      lastActivityAt = Math.max(lastActivityAt, lastCpuAboveAt);
-    }
     const opencodeStartedRecently =
       typeof startMs === "number" && now - startMs <= opencodeHoldMs;
     const previousActiveAt = opencodeStartedRecently ? now : cached?.lastActiveAt;
+    // For TUI sessions with message API data, don't decay inFlight - the API is authoritative.
+    // Only use inFlightIdleMs decay for server processes or TUIs without direct API data.
+    // Pass -1 to explicitly disable decay (undefined falls back to defaults).
+    const useInFlightIdleMs = isServer || !sessionId || !opencodeApiAvailable ? opencodeInFlightIdleMs : -1;
     const activity = deriveOpenCodeState({
-      cpu: cpuSignal,
       hasError,
       lastEventAt,
       lastActivityAt,
@@ -1532,14 +1618,22 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       isServer: kind === "opencode-server",
       previousActiveAt,
       now,
-      cpuThreshold,
-      eventWindowMs: Math.max(opencodeEventWindowMs, opencodeCpuWindowMs),
+      eventWindowMs: opencodeEventWindowMs,
       holdMs: opencodeHoldMs,
-      inFlightIdleMs: opencodeInFlightIdleMs,
+      inFlightIdleMs: useInFlightIdleMs,
       strictInFlight: opencodeStrictInFlight,
     });
     let state = activity.state;
     let reason = activity.reason || "unknown";
+    logOpencode(`pid=${proc.pid} sessionId=${sessionId ?? "none"} inFlight=${inFlight} state=${state} reason=${reason} lastActivityAt=${lastActivityAt ?? "?"} source=${selection.source}`);
+    if (
+      activity.state === "active" &&
+      activity.reason === "hold" &&
+      typeof activity.lastActiveAt === "number" &&
+      opencodeHoldMs > 0
+    ) {
+      bumpNextTickAt(activity.lastActiveAt + opencodeHoldMs);
+    }
     const hasSignal =
       statusIsIdle ||
       statusIsError ||
@@ -1550,23 +1644,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       state = "idle";
       reason = "api_unavailable";
     }
-    if (!hasSignal && cpu <= cpuThreshold && !activity.lastActiveAt) {
+    if (!hasSignal && !activity.lastActiveAt) {
       state = "idle";
       reason = "no_signal";
-    }
-    if (
-      state === "active" &&
-      !inFlight &&
-      typeof activityAt === "number" &&
-      now - activityAt > opencodeStaleActiveMs &&
-      !activity.lastActiveAt
-    ) {
-      state = "idle";
-      reason = "stale_ttl";
-    }
-    if (isServer && state !== "error") {
-      state = "idle";
-      reason = "server_idle";
     }
     const prevState = cached?.lastState;
     if (prevState && prevState !== state) {
@@ -1581,7 +1661,6 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     activityCache.set(id, {
       lastActiveAt: activity.lastActiveAt,
       lastSeenAt: now,
-      lastCpuAboveAt,
       lastState: state,
       lastReason: reason,
       startMs,
@@ -1644,50 +1723,59 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
     const kind = claudeInfo?.kind || inferKind(cmdRaw);
 
-    const sessionIdentity = `pid:${proc.pid}`;
     const id = `${proc.pid}`;
     let cached = activityCache.get(id);
     if (isStartMsMismatch(cached?.startMs, startMs)) {
       activityCache.delete(id);
       cached = undefined;
     }
-    const claudeBaseThreshold = Number(
-      process.env.CONSENSUS_CLAUDE_CPU_ACTIVE || process.env.CONSENSUS_CPU_ACTIVE || 1
+    const sessionIdFromCmd = claudeInfo?.sessionId;
+    const cachedSessionId = cached?.sessionId;
+    let sessionState =
+      sessionIdFromCmd ? getClaudeActivityBySession(sessionIdFromCmd, now) : undefined;
+    if (!sessionState && cachedSessionId) {
+      sessionState = getClaudeActivityBySession(cachedSessionId, now);
+    }
+    if (!sessionState && cwdRaw) {
+      sessionState = getClaudeActivityByCwd(cwdRaw, now);
+    }
+    const sessionId = sessionState?.sessionId ?? sessionIdFromCmd ?? cachedSessionId;
+    const eventInFlight = sessionState?.inFlight ?? false;
+    const eventActivityAt = sessionState?.lastActivityAt;
+    const previousActiveAt = cached?.lastActiveAt;
+    const claudeHoldMs = resolveMs(
+      process.env.CONSENSUS_CLAUDE_ACTIVE_HOLD_MS,
+      3000
     );
-    const claudeThreshold = getClaudeCpuThreshold(claudeInfo, claudeBaseThreshold);
-    const cpuAbove = cpu > claudeThreshold;
-    const cpuActiveMs = cpuAbove && cached?.lastCpuAboveAt ? now - cached.lastCpuAboveAt : 0;
-    const lastCpuAboveAt = cpuAbove ? cached?.lastCpuAboveAt ?? now : undefined;
-    const startedRecently =
-      typeof startMs === "number" && now - startMs <= claudeStartGraceMs;
-    const previousActiveAt = startedRecently ? now : cached?.lastActiveAt;
-    const activity = deriveClaudeState({
-      cpu,
-      info: claudeInfo,
+    const activity = deriveStateWithHold({
+      cpu: 0,
+      hasError: false,
+      lastEventAt: eventActivityAt,
+      inFlight: eventInFlight,
       previousActiveAt,
       now,
-      cpuThreshold: claudeBaseThreshold,
-      cpuActiveMs,
+      holdMs: claudeHoldMs,
     });
     const state = activity.state;
     const reason = activity.reason || "unknown";
-    const activityAt = activity.lastActiveAt ?? cached?.lastActiveAt;
+    const activityAt = eventActivityAt ?? cached?.lastActiveAt;
     const prevState = cached?.lastState;
     if (prevState && prevState !== state) {
       metricEffects.push(recordActivityTransition("claude", prevState, state, reason));
       trackTransition("claude", prevState, state, reason);
       logActivityDecision(
         `claude state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
-          `cpu=${cpu.toFixed(2)} threshold=${claudeThreshold}`
+          `inFlight=${eventInFlight ? 1 : 0} lastEvent=${eventActivityAt ?? "?"}`
       );
     }
     activityCache.set(id, {
       lastActiveAt: activity.lastActiveAt,
       lastSeenAt: now,
-      lastCpuAboveAt,
+      lastCpuAboveAt: cached?.lastCpuAboveAt,
       lastState: state,
       lastReason: reason,
       startMs,
+      sessionId: sessionId ?? cachedSessionId,
     });
     seenIds.add(id);
 
@@ -1697,11 +1785,13 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const computedTitle = deriveTitle(doing, repoName, proc.pid, kind);
     const safeSummary = sanitizeSummary(summary);
 
+    const sessionIdentity = sessionId ? `claude:${sessionId}` : `pid:${proc.pid}`;
     agents.push({
       identity: sessionIdentity,
       id,
       pid: proc.pid,
       startedAt,
+      lastEventAt: eventActivityAt,
       title: redactText(computedTitle) || computedTitle,
       cmd,
       cmdShort,
@@ -1712,6 +1802,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       lastActivityAt: activityAt,
       activityReason: reason,
       doing: redactText(doing) || doing,
+      sessionPath: sessionId ? `claude:${sessionId}` : undefined,
       repo: repoName,
       cwd,
       model,
@@ -1764,13 +1855,20 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       opencodeServerLogged.delete(pid);
     }
   }
+  for (const pid of opencodeSessionByPidCache.keys()) {
+    if (!opencodePidSet.has(pid)) {
+      opencodeSessionByPidCache.delete(pid);
+    }
+  }
 
+  const hasCounts = Object.keys(activityCountMeta).length > 0;
+  const hasTransitions = Object.keys(activityTransitionMeta).length > 0;
   const activityMeta =
-    Object.keys(activityCountMeta).length > 0 ||
-    Object.keys(activityTransitionMeta).length > 0
+    hasCounts || hasTransitions || typeof nextTickAt === "number"
       ? {
-          counts: activityCountMeta,
-          transitions: activityTransitionMeta,
+          ...(hasCounts ? { counts: activityCountMeta } : {}),
+          ...(hasTransitions ? { transitions: activityTransitionMeta } : {}),
+          ...(typeof nextTickAt === "number" ? { nextTickAt } : {}),
         }
       : undefined;
   const meta = {

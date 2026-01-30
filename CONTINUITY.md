@@ -1,39 +1,234 @@
 Goal (incl. success criteria):
-- Maintain Codex session detection and reduced flicker with current changes.
-- Tests/build pass after changes.
+- Codex TUI detection is event-driven (notify + JSONL events), no CPU/mtime false positives.
+- Codex sessions show active during work and idle after completion.
+- Automated unit/integration/UI tests cover the event pipeline and UI state.
+- UI verified via agent-browser during changes.
+- Agent lane shows only open sessions; active vs inactive state is correct and stable (no overflow/reordering).
+ - Update: Agent lane shows all open sessions with active grouped on top and inactive below; ordering is stable and based on last activity (no constant rearranging).
+- Claude Code TUI sessions are tracked in the React app via Claude hooks only (no status line/CPU heuristics); active/idle state is accurate.
+- Claude hooks are received reliably and mapped to session activity; tests validate the hook pipeline and UI state.
+- Tile layout is pinned: existing tiles never move when new agents appear; no overlaps/obstructions; new tiles grow into nearest free slot; grouping by repo/cwd preserved.
 
 Constraints/Assumptions:
-- Keep dependencies minimal; no heavy frameworks.
-- No non-trivial tests unless explicitly requested (explicit tests requested in current plan).
 - Must maintain CONTINUITY.md each turn; responses begin with Ledger Snapshot.
+- Use Effect 3.x + TypeScript + Express patterns.
+- Codex notify hook is mandatory; degraded CPU/mtime detection removed.
+- Do not restart the server (hot reload only).
+- Use agent-browser for UI verification.
+- Reuse existing logic for session derivation; do not duplicate logic.
+- Tests required (unit/integration/UI) for agent lane behavior.
+- Use hooks only for Claude Code session activity; do not rely on status line/CPU heuristics.
+- React app is the only UI to update; do not use the legacy vanilla JS app.
+- Do not restart the server; it will auto-restart.
+- Tests requested: unit, integration, and UI coverage for Claude hook tracking.
+- OpenCode multi-session activity is stable (no flicker) and tests validate behavior without manual QA.
 
 Key decisions:
-- None yet; need repro + diagnosis.
+- Codex: notify + JSONL tail event signals are used for state (event-driven only, no CPU/mtime).
+- Codex hold default increased to 10s to avoid flicker between event bursts.
+- User message events now start in-flight activity.
+- JSONL tail is not a heuristic; it provides event stream for in-flight start when notify lacks start events.
+- Notify handler is TypeScript-only (compiled to dist/codexNotify.js); no JS source files.
+- Event idle timeout: CONSENSUS_CODEX_EVENT_IDLE_MS (default 20000ms).
+- Claude Code: hook-driven tracking only; status line and CPU heuristics disabled for Claude.
+- React UI is primary; server should serve React build when present.
+- Agent lane follows vanilla JS behavior: show all open sessions (active + idle) and sort by state rank then CPU.
+- Layout uses pinned positions per agent identity; only new agents are placed; existing tiles never move; placement uses max-height bounds to prevent overlap.
+- Codex prompt-like titles containing temp paths/turn markers are ignored for lane labels; fallback to repo or codex#pid.
+- Agent lane now shows only active/error sessions and uses stable sort (state rank then identity) to prevent reordering.
+- Active lane items now glow via `is-active` class (lane item box-shadow) to make active codex sessions visibly highlighted.
+- Live reload enabled in React client via `/__dev/reload` SSE; HTML responses now set `Cache-Control: no-cache` to avoid hard refreshes.
+- Server lane now filters to active/error servers only (idle servers hidden unless searching).
+- Update: Lane must show all open sessions/servers; active group on top, inactive below. Use shared grouping/sorting logic and avoid constant rearranging. Active-only filtering is superseded.
+ - Ordering preference confirmed: use lastActivityAt with fallback to lastEventAt then startedAt (user answer 1b). Search should still preserve active-first grouping (user answer 3a).
 
 State:
   - Done:
-    - OpenCode/Claude lastActiveAt preservation implemented and tests updated (from prior session).
-    - Codex sustained CPU activation fixed (no longer gated by activity signal).
-    - Removed unused Kimi modules/tests (activity/config/scanner/core + related tests).
-    - Ran `node --test --import tsx tests/unit/codexState.test.ts` (pass).
-    - Ran `npm test` (pass).
-    - Ran `npm run build` (pass).
-    - Committed changes: `6f8d645`.
-    - Recorded UI during work: `/Users/romanmondello/consensus/tmp/codex-flicker-before.webm`.
-    - Codex flicker fix applied (cpu passthrough) and tests updated; tests/build passed.
-    - User reports Codex sessions are working now.
-    - Committed Codex flicker changes: `88bdb74`.
-    - Pushed to `origin/main`.
+    - Added Codex event schemas: src/codex/types.ts.
+    - Added Codex event store service: src/services/codexEvents.ts.
+    - Added TS notify handler: src/codexNotify.ts (compiled to dist/codexNotify.js).
+    - Added CLI setup flow: src/cli/setup.ts; wired in src/cli.ts.
+    - Fixed dev/dev.mjs by removing TS type annotations (JS runtime compatibility).
+    - Added webhook handler in src/server.ts; removed codex watcher from runtime.
+    - Updated scan.ts to consult event store; CPU disabled for codex state.
+    - Added tests: tests/unit/codexEventStore.test.ts, tests/unit/codexNotify.test.ts, tests/integration/codexNotifyHook.test.ts.
+    - Added event-driven state tests: tests/unit/codexEventState.test.ts.
+    - Codex logs now treat user_message as in-flight activity; updated tests.
+    - Codex hold default set to 10s (scan.ts).
+    - Build/test pass after changes (unit + integration).
+    - UI tests pass: `npm run test:ui`.
+    - Codex logs now treat user_message as in-flight; tests updated.
+    - Agent-browser UI checks captured: /tmp/consensus-ui-notify-only.png, /tmp/consensus-ui-codex-merged.png.
+    - Implemented Claude hook ingestion endpoint and event store; manual hook event activates Claude lane (UNCONFIRMED in current repo).
+    - Added Claude hook script and parsing for session id (UNCONFIRMED in current repo).
+    - Updated Claude hook docs (README + troubleshooting) to use matcher-based hook schema and debug guidance.
+    - React test mode serves `index.html` to keep React UI primary (no legacy app.html).
+    - Correction: prior Done/Now items about Codex/Claude and ACTIVITY_TEST_MODE are stale; current focus is OpenCode flicker and React UI tests.
+    - Removed legacy client files: public/app.js, public/iso.js, public/app.html.
+    - Updated docs to reference React client (docs/architecture.md).
+    - Updated app layout test to use React format helpers (tests/unit/appLayout.test.ts).
+    - Playwright config now starts Vite dev server for React UI (playwright.config.ts).
+    - UI tests use React mock bridge helper; added UI test for multiple OpenCode TUI entries (e2e/ui.pw.ts).
+    - OpenCode activity now treats recent user message as in-flight (src/opencodeApi.ts) with integration test.
+    - Verified: unit appLayout test pass; integration opencodeSessionActivity test pass; UI test for multi-opencode pass.
+    - User confirms OpenCode flicker appears fixed.
+    - Correction: Codex/Claude items above are stale for current task; focus is OpenCode flicker + React UI tests.
+    - Updated React agent lane to show idle sessions (no active-only filter) and sort by state rank then CPU (matches vanilla JS).
+    - Updated lane unit/integration/UI tests to expect idle items remain visible and inactive.
+    - Agent-browser check: WS to localhost blocked in browser sandbox (status "disconnected"); lane screenshot saved at /tmp/consensus-agent-lane.png.
+    - Tests: `npm run test:unit` pass (140). `npm run test:integration` pass (49). `npm run test:ui` pass (19) with EADDRINUSE warning for port 8790 but suite completed.
+    - Ran full test suite on request: `npm run test:unit`, `npm run test:integration`, `npm run test:ui` (all pass).
+    - Updated Claude hook docs (README + troubleshooting) to use matcher-based hook schema and debug guidance.
+    - React test mode serves `index.html` to keep React UI primary (no legacy app.html).
+    - UI test stability fixes in e2e/ui.pw.ts (hitList wait, WS handshake + v1 snapshot format); UI tests re-run and pass.
+    - Claude hook handler moved to TypeScript/Effect: src/claudeHook.ts (compiled to dist/claudeHook.js); removed bin/claude-hook.js.
+    - Updated docs to reference dist/claudeHook.js and noted TS/Effect source.
+    - Added dev hook command in docs to run TS via tsx for live updates without rebuilds.
+    - Added dev/dev.mjs to run tsc watch + tsx server so dist/claudeHook.js stays current in dev; npm run dev updated, dev:server added.
+    - Updated ~/.claude/settings.json to matcher-based hook schema pointing at dist/claudeHook.js.
+    - Verified: Claude session appears in Consensus after hook change (recording + screenshot captured).
+    - Stop/SessionEnd no longer update Claude lastActivityAt; idle events now clear activity so sessions go idle quickly.
+    - Updated claudeEvents unit test accordingly.
+    - Claude event store refactored to Effect+Ref with Effect-based APIs; server now uses Effect handler.
+    - dev/dev.mjs now starts Vite with port retry; uses CONSENSUS_UI_PORT and retries next port on conflict.
+    - README + docs/configuration updated to mention CONSENSUS_UI_PORT.
+    - tests/integration/claudeHook.test.ts now runs src/claudeHook.ts via tsx.
+    - Tests run after hook change: npm run test (unit+integration) pass; npm run test:ui pass (rerun after one connection reset failure).
+    - Implemented non-overlapping tile layout (public/app.js, public/src/lib/layout.ts).
+    - Correction: legacy public/app.js removed; layout change applies to React layout only.
+    - Added React mock bridge for tests (public/src/lib/mockBridge.ts) and exposed hitList/view for UI tests.
+    - Added fallback `public/app.html` and gated server to use it only when no React build is present.
+    - Correction: legacy app.html/app.js fallback not present in current tree; ACTIVITY_TEST_MODE uses React index + build.
+    - Playwright config now builds React client and runs server with ACTIVITY_TEST_MODE for UI tests.
+    - Updated UI tests for layout no-overlap and idle visibility; `npm run test:ui` passes (19).
+    - Re-ran `npm run test:unit` (140 pass), `npm run test:integration` (49 pass), `npm run test:ui` (19 pass).
+    - Build run: `npm run build` (pass).
+    - Build re-run after user proceed (pass).
+    - Re-ran `npm run build` after layout/test updates (pass).
+    - Correction: `public/app.html` does not exist; React index is used for ACTIVITY_TEST_MODE.
+    - Correction: legacy `public/app.js` is removed; layout changes apply to React layout only.
+    - Updated label formatting to ignore codex titles that look like temp paths/turn markers or are too long; added unit tests for labelFor.
+    - Tests: `npm run test:unit` pass (142) after labelFor change.
+    - Reverted agent lane to active-only filtering and stable ordering (no CPU-based reordering).
+    - Updated UI tests to expect idle sessions hidden and stable lane order; activity UI test now uses mock mode.
+    - Filtered server lane to active/error only; idle servers hidden by default.
+    - Playwright config now reuses existing server on port 8787.
+    - Tests: `npm run test:unit` pass (143), `npm run test:integration` pass (49), `npm run test:ui` pass (19).
+    - `npm run build:client` executed to update public/dist (no server restart).
+    - Added active glow styling for lane items (`is-active` class) and rebuilt client.
+    - Added client-side live reload listener and HTML no-cache headers; rebuilt client.
+    - Normalized Claude hook event names (case/format-insensitive) so Stop/SessionEnd aliases match.
+    - Claude unit tests updated for stop/session_end aliases; `node --test --import tsx tests/unit/claudeEvents.test.ts` passed.
+    - Claude hook now forwards notification_type; Notification idle_prompt treated as idle (clears inFlight/activity).
+    - Claude unit tests updated for idle_prompt; `node --test --import tsx tests/unit/claudeEvents.test.ts` passed.
+    - OpenCode: prevented status=idle from overriding message API inFlight (scan.ts).
+    - Codex notify auto-install: normalized CONSENSUS_CODEX_NOTIFY_INSTALL to disable on 0/false.
+    - Added tests: normalizeCodexNotifyInstall (unit), opencode idle status does not override inFlight (unit), message API inFlight stays active even when status idle (integration), UI activity test updated for idle visibility.
+    - Tests run: `npm run test:unit`, `npm run test:integration`, `npm run test:ui` (all pass).
+    - Pinned layout update: existing tiles never move on add; group anchors retained; placement uses max-height bounds to prevent overlap (public/src/lib/layout.ts).
+    - Added grow-in animation for newly added tiles (public/src/hooks/useCanvasRenderer.ts).
+    - Layout updates moved to useLayoutEffect and spawn timing tracked (public/src/components/CanvasScene.tsx).
+    - Added layout stability tests and grouping fallback test (tests/unit/appLayout.test.ts).
+    - UI layout test asserts existing positions unchanged on add (e2e/ui.pw.ts).
+    - Tests re-run: `npm run test:unit` (149 pass), `npm run test:integration` (54 pass), `npm run test:ui` (19 pass).
+    - Build run after pinned layout changes: `npm run build` (pass).
+    - Copied edited files to clipboard via pbcopy; temp bundle at `/tmp/consensus-edited-files.txt`.
   - Now:
-    - Await further requests.
+    - Answer user question about hot reload configuration (Vite HMR + server watch + live reload SSE).
+    - Answer whether any additional setup is missing when using Vite.
+    - Answer whether `npx consensus-cli` users will have issues with the Vite-based React client.
+    - Investigate Claude sessions persisting after work stops; verify end-event handling.
+    - Ask user to re-test Claude stop/idle behavior after idle_prompt handling change.
+    - Decision: keep `npm run dev` using `node dev/dev.mjs` (not reverting to upstream).
+    - dev/dev.mjs now resolves tsx bin from package.json (fixes missing cli.js path).
+    - User confirms both active Codex sessions now show correctly.
+    - Notify events still not observed for all sessions; tail events act as event-driven fallback.
+    - Strengthen automated coverage (argv payload path + mapping edge cases).
+    - Investigate agent lane showing many/incorrect sessions and unstable ordering; fix without duplicating logic.
+    - User reports lane still reorders with too many active sessions despite active-only filtering; needs backend activity triage.
+    - Update lane to show all sessions with active grouped on top and inactive below (same for servers) using shared logic; eliminate constant reordering.
+    - Provide implementation plan for active/inactive grouping and stable ordering; confirm activity timestamp source with user.
+    - Clarify error-state semantics (from repo/docs) and choose whether to group error with active or inactive.
+    - Clarify tie-breaker rule when activity timestamps match.
+    - Plan fixes for review items: OpenCode inFlight override when status idle; CONSENSUS_CODEX_NOTIFY_INSTALL disable handling.
+    - User clarified: server sessions can be active when used; need idle-override rule that does not suppress real activity.
+    - Decide idle-override rule: never override inFlight=true with status idle (applies to both TUIs and servers). (done)
+    - Sync ledger items with current layout/test infrastructure changes.
+    - All unit/integration/UI tests green after layout + UI test infra changes.
+    - Awaiting commit/review request.
+    - Build artifacts updated by `npm run build`.
+    - Implement pinned layout placement and grow-in for new tiles; avoid any reflow on add.
+    - Claude CLI hooks not firing for real sessions; user reports Claude does not show active when working.
+    - Need to validate live Claude session while recording via agent-browser and inspect hook delivery.
+    - Copy edited layout/test files to clipboard via pbcopy. (DONE)
+    - User requested a best-practice plan (no code edits) to address review comment: `npm run dev` no longer starts Vite, so TSX client fails unless dev:client or build is run.
+    - Q&A answered for dev workflow: always start Vite; use CONSENSUS_UI_PORT for port; on port conflict try next port.
+    - Review plan requested for new P2/P3 items: Codex in-flight timeout default in codexLogs; TOML [tui] notifications insertion in cli/setup.
+    - User clarified default should be near-instant; suggested 500ms, possibly 300ms. Need final value selection before implementation.
   - Next:
-    - None unless user requests.
+    - Verify notify payload delivery for all sessions (debug logs). 
+    - Remove tail fallback if notify provides full start/stop coverage.
+    - Add UI test that posts /api/codex-event and asserts lane state (optional).
+    - Ensure agent lane displays only open sessions and active state matches real activity.
+    - Update agent lane/tests to display active + inactive grouping (active top, inactive below) with stable ordering by last activity.
+    - Verify Claude settings/hook matcher configuration so real Claude sessions emit hook events.
+    - Align React UI tests with ACTIVITY_TEST_MODE server and mock bridge.
+    - Audit code to ensure Claude status-line/CPU signals are not used.
+    - Re-run full unit/integration/UI tests after legacy removal.
+    - Decide if further OpenCode hold/idle tuning is required.
+    - Confirm Claude hooks are configured with matchers and stdin JSON payloads.
+    - Address review P2/P3 once default timeout value is confirmed; update docs/tests as needed.
 
 Open questions (UNCONFIRMED if needed):
-- None.
+- Do Codex notify events include start events, or only completion? (UNCONFIRMED)
+- Is notify payload delivered via stdin vs argv on this CLI build? (UNCONFIRMED)
+- Where does Claude CLI load settings/hooks from on this machine, and what schema does it require? (UNCONFIRMED)
+- Is Claude status line capable of false positives, and is it still used anywhere in code? (UNCONFIRMED)
+- Does OpenCode message API delay assistant message creation enough to require longer hold? (UNCONFIRMED)
+- What is needed from https://effect.website/llms-full.txt for the lane fix? (UNCONFIRMED)
+- Confirm expected "last activity" signal for grouping/sorting (event time vs lastEventAt vs startedAt). (UNCONFIRMED)
+ - Should error state be grouped with active or inactive? (UNCONFIRMED)
+- Tie-breaker when activity timestamps match (identity vs preserve prior order)? (UNCONFIRMED)
+- Should OpenCode status idle override inFlight for server sessions only? (UNCONFIRMED)
+ - Confirm idle-override policy: ignore status idle when inFlight is true (for all sessions) vs server-only override. (resolved: ignore status idle when inFlight is true).
+ - Confirm exact default for CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS: 300ms vs 500ms. (UNCONFIRMED)
 
 Working set (files/ids/commands):
-- `CONTINUITY.md`
-- `src/codexState.ts`
-- `tests/unit/codexState.test.ts`
-- `/Users/romanmondello/consensus/tmp/codex-flicker-before.webm`
+- src/scan.ts
+- src/codexNotify.ts
+- src/services/codexEvents.ts
+- src/codex/types.ts
+- src/cli/setup.ts
+- src/server.ts
+- tests/unit/codexEventStore.test.ts
+- tests/unit/codexNotify.test.ts
+- tests/unit/codexEventState.test.ts
+- tests/integration/codexNotifyHook.test.ts
+- e2e/ui.pw.ts
+- CONTINUITY.md
+- README.md
+- src/claudeCli.ts
+- src/claude/types.ts
+- src/services/claudeEvents.ts
+- src/claudeHook.ts
+- docs/configuration.md
+- docs/troubleshooting.md
+- public/src/lib/mockBridge.ts
+- public/src/hooks/useWebSocket.ts
+- public/src/App.tsx
+- public/src/components/CanvasScene.tsx
+- public/src/lib/layout.ts
+- public/src/main.tsx
+- public/app.html
+- playwright.config.ts
+- dev/dev.mjs
+ - public/src/components/AgentLane.tsx
+ - public/src/components/AgentListItem.tsx
+ - public/src/lib/agents.ts
+ - tests/unit/agentLane.test.ts
+ - tests/integration/agentLanePipeline.test.ts
+ - e2e/ui.pw.ts
+ - public/src/lib/layout.ts
+ - public/src/components/CanvasScene.tsx
+ - public/src/hooks/useCanvasRenderer.ts
+ - tests/unit/appLayout.test.ts

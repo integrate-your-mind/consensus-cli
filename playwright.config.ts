@@ -1,6 +1,6 @@
 import { defineConfig } from "@playwright/test";
 
-const PORT = process.env.CONSENSUS_PORT || "8790";
+const PORT = process.env.CONSENSUS_PORT || "8787";
 
 export default defineConfig({
   testDir: "./e2e",
@@ -11,7 +11,9 @@ export default defineConfig({
     headless: true,
   },
   webServer: {
-    command: `ACTIVITY_TEST_MODE=1 CONSENSUS_PORT=${PORT} CONSENSUS_HOST=127.0.0.1 npm run dev`,
+    command:
+      `npm run build:client && ` +
+      `ACTIVITY_TEST_MODE=1 CONSENSUS_PORT=${PORT} CONSENSUS_HOST=127.0.0.1 npm run dev`,
     url: `http://127.0.0.1:${PORT}/health`,
     reuseExistingServer: true,
   },

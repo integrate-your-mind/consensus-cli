@@ -12,6 +12,8 @@ const MAX_READ_BYTES = 512 * 1024;
 const MAX_EVENTS = 50;
 const SESSION_META_READ_BYTES = 16 * 1024;
 const SESSION_META_RESYNC_MS = 10000;
+const NOTIFY_MAX_EVENTS = 100;
+const NOTIFY_POLL_MS = 1000;
 const SESSION_CWD_CHECK_MAX = 256;
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
 
@@ -47,6 +49,10 @@ interface TailState {
   lastPrompt?: EventSummary;
   lastError?: EventSummary;
   model?: string;
+  notifyLastAt?: number;
+  notifyLastIngestAt?: number;
+  lastThreadId?: string;
+  lastTurnId?: string | number;
 }
 
 export interface CodexEventLite {
@@ -67,9 +73,20 @@ let lastSessionScan = 0;
 const tailStates = new Map<string, TailState>();
 const sessionIdCache = new Map<string, string | null>();
 const sessionIdLastScan = new Map<string, number>();
+const notifyCache: {
+  at: number;
+  mtimeMs: number;
+  path: string;
+  events: CodexEventLite[];
+} = {
+  at: 0,
+  mtimeMs: 0,
+  path: "",
+  events: [],
+};
 const sessionMetaCache = new Map<
   string,
-  { mtimeMs: number; cwd?: string; id?: string; checkedAt: number }
+  { mtimeMs: number; cwd?: string; id?: string; timestamp?: number; checkedAt: number }
 >();
 
 export function getTailState(sessionPath: string): TailState | undefined {
@@ -86,10 +103,10 @@ export function consumeRecentEvents(sessionPath: string): CodexEventLite[] {
 
 export async function getSessionMeta(
   sessionPath: string
-): Promise<{ cwd?: string; id?: string } | null> {
+): Promise<{ cwd?: string; id?: string; timestamp?: number } | null> {
   const cached = sessionMetaCache.get(sessionPath);
-  if (cached && (cached.id || cached.cwd)) {
-    return { cwd: cached.cwd, id: cached.id };
+  if (cached && (cached.id || cached.cwd || cached.timestamp)) {
+    return { cwd: cached.cwd, id: cached.id, timestamp: cached.timestamp };
   }
 
   const now = Date.now();
@@ -105,7 +122,9 @@ export async function getSessionMeta(
   }
 
   if (cached && cached.mtimeMs === stat.mtimeMs) {
-    return cached.id || cached.cwd ? { cwd: cached.cwd, id: cached.id } : null;
+    return cached.id || cached.cwd || cached.timestamp
+      ? { cwd: cached.cwd, id: cached.id, timestamp: cached.timestamp }
+      : null;
   }
 
   try {
@@ -126,7 +145,13 @@ export async function getSessionMeta(
       if (ev?.type === "session_meta" && ev?.payload) {
         const cwd = typeof ev.payload.cwd === "string" ? ev.payload.cwd : undefined;
         const id = typeof ev.payload.id === "string" ? ev.payload.id : undefined;
-        const meta = { mtimeMs: stat.mtimeMs, cwd, id, checkedAt: now };
+        const timestampRaw = ev.payload.timestamp ?? ev.timestamp ?? ev.ts;
+        const timestamp = typeof timestampRaw === "number"
+          ? (timestampRaw < 100_000_000_000 ? timestampRaw * 1000 : timestampRaw)
+          : typeof timestampRaw === "string"
+            ? Date.parse(timestampRaw)
+            : undefined;
+        const meta = { mtimeMs: stat.mtimeMs, cwd, id, timestamp, checkedAt: now };
         sessionMetaCache.set(sessionPath, meta);
         return meta;
       }
@@ -138,6 +163,13 @@ export async function getSessionMeta(
 
   sessionMetaCache.set(sessionPath, { mtimeMs: stat.mtimeMs, checkedAt: now });
   return null;
+}
+
+export function hydrateTailNotify(sessionPath: string, codexHome?: string): void {
+  const state = tailStates.get(sessionPath);
+  if (!state) return;
+  const home = codexHome ?? resolveCodexHome();
+  ingestNotifyEvents(home, state);
 }
 
 export async function findSessionByCwd(
@@ -154,7 +186,11 @@ export async function findSessionByCwd(
     if (!meta?.cwd) continue;
     if (path.resolve(meta.cwd) !== target) continue;
     if (startMs === undefined) return session;
-    const delta = Math.abs(session.mtimeMs - startMs);
+    const sessionStart =
+      typeof meta.timestamp === "number"
+        ? meta.timestamp
+        : getSessionStartMsFromPath(session.path) ?? session.mtimeMs;
+    const delta = Math.abs(sessionStart - startMs);
     if (delta < bestDelta) {
       best = session;
       bestDelta = delta;
@@ -173,6 +209,101 @@ export function resolveCodexHome(env: NodeJS.ProcessEnv = process.env): string {
     return path.join(os.homedir(), override.slice(2));
   }
   return path.resolve(override);
+}
+
+function resolveNotifyPath(codexHome: string): string {
+  return path.join(codexHome, "consensus", "codex-notify.jsonl");
+}
+
+function loadNotifyEvents(codexHome: string): CodexEventLite[] {
+  const now = Date.now();
+  if (now - notifyCache.at < NOTIFY_POLL_MS) {
+    return notifyCache.events;
+  }
+  notifyCache.at = now;
+  const notifyPath = resolveNotifyPath(codexHome);
+  if (notifyCache.path !== notifyPath) {
+    notifyCache.path = notifyPath;
+    notifyCache.mtimeMs = 0;
+    notifyCache.events = [];
+  }
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(notifyPath);
+  } catch {
+    notifyCache.events = [];
+    notifyCache.mtimeMs = 0;
+    return notifyCache.events;
+  }
+  if (notifyCache.mtimeMs === stat.mtimeMs && notifyCache.events.length > 0) {
+    return notifyCache.events;
+  }
+  let text = "";
+  try {
+    text = fs.readFileSync(notifyPath, "utf8");
+  } catch {
+    notifyCache.events = [];
+    notifyCache.mtimeMs = stat.mtimeMs;
+    return notifyCache.events;
+  }
+  if (!text.trim()) {
+    notifyCache.events = [];
+    notifyCache.mtimeMs = stat.mtimeMs;
+    return notifyCache.events;
+  }
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  const slice = lines.slice(-NOTIFY_MAX_EVENTS);
+  const events: CodexEventLite[] = [];
+  for (const line of slice) {
+    if (!line.trim().startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(line);
+      const ts =
+        typeof parsed.ts === "number" ? parsed.ts : Number(parsed.ts ?? 0) || now;
+      const threadId =
+        typeof parsed.threadId === "string" ? parsed.threadId : undefined;
+      const turnIdRaw = parsed.turnId;
+      const turnId =
+        typeof turnIdRaw === "string" || typeof turnIdRaw === "number"
+          ? turnIdRaw
+          : undefined;
+      const type = typeof parsed.event === "string" ? parsed.event : "notify";
+      events.push({ ts, type, threadId, turnId });
+    } catch {
+      continue;
+    }
+  }
+  notifyCache.events = events;
+  notifyCache.mtimeMs = stat.mtimeMs;
+  return notifyCache.events;
+}
+
+function ingestNotifyEvents(codexHome: string, state: TailState): void {
+  if (!state.lastThreadId && state.lastTurnId === undefined) return;
+  const events = loadNotifyEvents(codexHome);
+  if (events.length === 0) return;
+  const threadId = state.lastThreadId;
+  const turnId = state.lastTurnId;
+  const turnKey = turnId === undefined ? undefined : String(turnId);
+  let latest: CodexEventLite | undefined;
+  for (const event of events) {
+    const matchesThread =
+      !!threadId && typeof event.threadId === "string" && event.threadId === threadId;
+    const matchesTurn =
+      turnKey !== undefined &&
+      (typeof event.turnId === "string" || typeof event.turnId === "number") &&
+      String(event.turnId) === turnKey;
+    if (!matchesThread && !matchesTurn) continue;
+    if (!latest || (typeof event.ts === "number" && event.ts > (latest.ts || 0))) {
+      latest = event;
+    }
+  }
+  if (!latest) return;
+  const now = Date.now();
+  state.notifyLastIngestAt = now;
+  if (typeof latest.ts === "number") {
+    state.notifyLastAt = Math.max(state.notifyLastAt || 0, latest.ts);
+  }
 }
 
 async function walk(dir: string, out: SessionFile[], windowMs: number): Promise<void> {
@@ -282,15 +413,27 @@ export function pickSessionForProcess(
   if (sessions.length === 0) return undefined;
   if (!startTimeMs) return sessions[0];
   let best = sessions[0];
-  let bestDelta = Math.abs(best.mtimeMs - startTimeMs);
+  const bestStartMs = getSessionStartMsFromPath(best.path) ?? best.mtimeMs;
+  let bestDelta = Math.abs(bestStartMs - startTimeMs);
   for (const session of sessions) {
-    const delta = Math.abs(session.mtimeMs - startTimeMs);
+    const sessionStartMs = getSessionStartMsFromPath(session.path) ?? session.mtimeMs;
+    const delta = Math.abs(sessionStartMs - startTimeMs);
     if (delta < bestDelta) {
       best = session;
       bestDelta = delta;
     }
   }
   return best;
+}
+
+export function getSessionStartMsFromPath(sessionPath: string): number | undefined {
+  const match = sessionPath.match(/rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-/);
+  if (!match) return undefined;
+  const raw = match[1];
+  if (!raw) return undefined;
+  const iso = raw.replace(/T(\d{2})-(\d{2})-(\d{2})/, "T$1:$2:$3");
+  const parsed = Date.parse(iso);
+  return Number.isNaN(parsed) ? undefined : parsed;
 }
 
 function getEventTimestamp(ev: any): number {
@@ -514,12 +657,25 @@ function summarizeEvent(ev: any): {
 
 export async function updateTail(sessionPath: string): Promise<TailState | null> {
   const nowMs = Date.now();
-  const inflightTimeoutMs = Number(
-    process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS || 5000
-  );
-  const signalFreshMs = Number(
-    process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS || inflightTimeoutMs
-  );
+  const inflightEnv = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  const defaultInflightTimeoutMs = 300;
+  const inflightTimeoutMs = (() => {
+    if (inflightEnv === undefined || inflightEnv.trim() === "") {
+      return defaultInflightTimeoutMs;
+    }
+    const parsed = Number(inflightEnv);
+    if (!Number.isFinite(parsed)) return defaultInflightTimeoutMs;
+    if (parsed <= 0) return 0;
+    return parsed;
+  })();
+  const signalFreshMs = (() => {
+    const raw = process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS;
+    if (raw === undefined || raw.trim() === "") return inflightTimeoutMs;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return inflightTimeoutMs;
+    if (parsed <= 0) return 0;
+    return parsed;
+  })();
   const fileFreshMs = Number(
     process.env.CONSENSUS_CODEX_FILE_FRESH_MS || 1500
   );
@@ -558,6 +714,8 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
 
   const expireInFlight = () => {
     if (!state.inFlight) return;
+    if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
+    if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
     if (fileFresh) {
       return;
     }
@@ -718,6 +876,8 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       typeof turnIdRaw === "string" || typeof turnIdRaw === "number"
         ? turnIdRaw
         : undefined;
+    if (threadId) state.lastThreadId = threadId;
+    if (turnId !== undefined) state.lastTurnId = turnId;
     const itemIdRaw = item?.id || item?.item_id || item?.itemId;
     const itemId = typeof itemIdRaw === "string" ? itemIdRaw : undefined;
     const itemStatusRaw = item?.status || item?.state;
@@ -734,14 +894,17 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       payloadRole,
       callId,
     });
-    const isResponseStart = responseStartRe.test(typeStr);
-    const isResponseEnd = responseEndRe.test(typeStr);
+    // Check both event type and payload type for inFlight detection
+    // Codex sends events with wrapper type (e.g., "event_msg") and semantic type in payload
+    const combinedType = `${typeStr} ${payloadType}`.trim();
+    const isResponseStart = responseStartRe.test(combinedType);
+    const isResponseEnd = responseEndRe.test(combinedType);
     const isTurnEnd = /turn\.(completed|failed|errored|canceled|cancelled|aborted|interrupted|stopped)/i.test(
-      typeStr
+      combinedType
     );
-    const isTurnStart = typeStr === "turn.started";
-    const isResponseDelta = responseDeltaTypes.has(typeStr);
-    const isItemStarted = typeStr === "item.started";
+    const isTurnStart = combinedType.includes("turn.started");
+    const isResponseDelta = responseDeltaTypes.has(typeStr) || responseDeltaTypes.has(payloadType);
+    const isItemStarted = typeStr === "item.started" || payloadType === "item.started";
     const itemStartWorkTypes = new Set([
       "command_execution",
       "mcp_tool_call",
@@ -794,6 +957,15 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       state.inFlight = true;
       state.inFlightStart = true;
       markInFlightSignal();
+    }
+  }
+  if (payloadType.includes("user_message") || payloadRole === "user") {
+    if (canSignal) {
+      state.turnOpen = true;
+      state.inFlight = true;
+      state.inFlightStart = true;
+      markInFlightSignal();
+      state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
     }
   }
   if (payloadType === "token_count") {
@@ -1033,6 +1205,8 @@ export function summarizeTail(state: TailState): {
   lastInFlightSignalAt?: number;
   lastIngestAt?: number;
   inFlight?: boolean;
+  notifyLastAt?: number;
+  notifyLastIngestAt?: number;
 } {
   const title = state.lastPrompt?.summary;
   const doing =
@@ -1064,5 +1238,7 @@ export function summarizeTail(state: TailState): {
     lastInFlightSignalAt: state.lastInFlightSignalAt,
     lastIngestAt: state.lastIngestAt,
     inFlight: state.inFlight,
+    notifyLastAt: state.notifyLastAt,
+    notifyLastIngestAt: state.notifyLastIngestAt,
   };
 }

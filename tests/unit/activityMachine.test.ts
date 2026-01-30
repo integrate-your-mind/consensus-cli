@@ -134,7 +134,7 @@ describe("activity/machine", () => {
   })
 
   describe("deriveOpenCodeState", () => {
-    it("should return idle for server processes", async () => {
+    it("should return idle for server processes without in-flight signals", async () => {
       const result = await Effect.runPromise(
         deriveOpenCodeState({
           cpu: 30,
@@ -150,7 +150,7 @@ describe("activity/machine", () => {
       )
       
       assert.strictEqual(result.state, "idle")
-      assert.strictEqual(result.reason, "server_idle")
+      assert.strictEqual(result.reason, "no_in_flight")
     })
 
     it("should return error for server with error", async () => {

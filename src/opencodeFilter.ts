@@ -3,8 +3,6 @@ export interface OpenCodeIncludeInput {
   opencodeApiAvailable: boolean;
   hasSession: boolean;
   hasEventActivity: boolean;
-  cpu: number;
-  cpuThreshold: number;
 }
 
 export function shouldIncludeOpenCodeProcess(input: OpenCodeIncludeInput): boolean {
@@ -13,6 +11,5 @@ export function shouldIncludeOpenCodeProcess(input: OpenCodeIncludeInput): boole
   if (input.opencodeApiAvailable) {
     return input.hasSession || input.hasEventActivity;
   }
-  if (input.hasEventActivity) return true;
-  return input.cpu > input.cpuThreshold;
+  return input.hasEventActivity;
 }

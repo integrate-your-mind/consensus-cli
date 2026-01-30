@@ -88,7 +88,6 @@ const buildOpenCodeConfig = () => ({
   home: process.env.CONSENSUS_OPENCODE_HOME,
   eventWindowMs: Option.getOrUndefined(parseNumber(process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS)),
   staleActiveMs: Option.getOrUndefined(parseNumber(process.env.CONSENSUS_OPENCODE_STALE_ACTIVE_MS)),
-  cpuWindowMs: Option.getOrUndefined(parseNumber(process.env.CONSENSUS_OPENCODE_CPU_ACTIVE_MS)),
   holdMs: Option.getOrUndefined(parseNumber(process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS)),
   strictInFlight: Option.getOrUndefined(parseBoolean(process.env.CONSENSUS_OPENCODE_STRICT_INFLIGHT)),
   inFlightIdleMs: Option.getOrUndefined(parseNumber(process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS ?? process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS)),

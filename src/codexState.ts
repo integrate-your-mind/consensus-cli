@@ -3,7 +3,7 @@ import { deriveStateWithHold } from "./activity.js";
 
 const DEFAULT_CODEX_CPU_SUSTAIN_MS = 500;
 const DEFAULT_CODEX_INFLIGHT_IDLE_MS = 30_000;
-const DEFAULT_CODEX_HOLD_MS = 2000;
+const DEFAULT_CODEX_HOLD_MS = 3000;
 
 export interface CodexStateInput {
   cpu: number;
@@ -35,12 +35,6 @@ export function deriveCodexState(input: CodexStateInput): ActivityHoldResult {
   const sustainMs =
     input.cpuSustainMs ??
     Number(process.env.CONSENSUS_CODEX_CPU_SUSTAIN_MS || DEFAULT_CODEX_CPU_SUSTAIN_MS);
-  const spikeEnv = Number(process.env.CONSENSUS_CODEX_CPU_SPIKE || "");
-  const spikeThreshold =
-    input.cpuSpikeThreshold ??
-    (Number.isFinite(spikeEnv) && spikeEnv > 0
-      ? spikeEnv
-      : Math.max(cpuThreshold * 10, 25));
   const envInFlightIdle = process.env.CONSENSUS_CODEX_INFLIGHT_IDLE_MS;
   let inFlightIdleMs = input.inFlightIdleMs;
   if (typeof inFlightIdleMs !== "number") {
@@ -84,10 +78,9 @@ export function deriveCodexState(input: CodexStateInput): ActivityHoldResult {
 
   const hasSignal = recentWork || !!inFlight;
   const sustained =
-    input.cpu >= spikeThreshold ||
-    (typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs);
+    typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs;
 
-  const cpu = input.cpu;
+  const cpu = hasSignal || sustained ? input.cpu : 0;
 
   const holdMs =
     input.holdMs ??
@@ -104,4 +97,70 @@ export function deriveCodexState(input: CodexStateInput): ActivityHoldResult {
     eventWindowMs,
     holdMs,
   });
+}
+
+export interface CodexEventStateInput {
+  inFlight?: boolean;
+  lastActivityAt?: number;
+  hasError: boolean;
+  now?: number;
+  holdMs?: number;
+  idleMs?: number;
+}
+
+/**
+ * Event-driven Codex state (notify only)
+ */
+export function deriveCodexEventState(
+  input: CodexEventStateInput
+): ActivityHoldResult {
+  const now = input.now ?? Date.now();
+  const holdMs =
+    typeof input.holdMs === "number" ? input.holdMs : DEFAULT_CODEX_HOLD_MS;
+  const idleMs =
+    typeof input.idleMs === "number"
+      ? input.idleMs
+      : Number(process.env.CONSENSUS_CODEX_EVENT_IDLE_MS || 20000);
+  const lastActivityAt = input.lastActivityAt;
+  const hasRecentEvent =
+    typeof lastActivityAt === "number" && now - lastActivityAt <= holdMs;
+  const eventStale =
+    typeof lastActivityAt === "number" &&
+    Number.isFinite(idleMs) &&
+    idleMs > 0 &&
+    now - lastActivityAt > idleMs;
+
+  if (input.hasError) {
+    return { state: "error", lastActiveAt: lastActivityAt, reason: "error" };
+  }
+
+  if (input.inFlight && !eventStale) {
+    return {
+      state: "active",
+      lastActiveAt: lastActivityAt ?? now,
+      reason: "event_in_flight",
+    };
+  }
+
+  if (input.inFlight && eventStale) {
+    return {
+      state: "idle",
+      lastActiveAt: lastActivityAt,
+      reason: "event_timeout",
+    };
+  }
+
+  if (hasRecentEvent) {
+    return {
+      state: "active",
+      lastActiveAt: lastActivityAt,
+      reason: "event_hold",
+    };
+  }
+
+  return {
+    state: "idle",
+    lastActiveAt: lastActivityAt,
+    reason: "event_idle",
+  };
 }

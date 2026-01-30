@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { updateTail, summarizeTail, findSessionByCwd } from "../../src/codexLogs.ts";
+import { getSessionStartMsFromPath, pickSessionForProcess } from "../../src/codexLogs.ts";
 
 test("summarizes codex exec session logs", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
@@ -87,6 +88,92 @@ test("matches session by cwd using session_meta", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("matches session by cwd using session_meta timestamp", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const cwd = path.join(dir, "project");
+  const fileA = path.join(dir, "a.jsonl");
+  const fileB = path.join(dir, "b.jsonl");
+  const now = Date.now();
+
+  const linesA = [
+    {
+      type: "session_meta",
+      ts: now - 60_000,
+      payload: { cwd, id: "session-a", timestamp: new Date(now - 60_000).toISOString() },
+    },
+  ];
+  const linesB = [
+    {
+      type: "session_meta",
+      ts: now - 5_000,
+      payload: { cwd, id: "session-b", timestamp: new Date(now - 5_000).toISOString() },
+    },
+  ];
+
+  await fs.writeFile(fileA, `${linesA.map((line) => JSON.stringify(line)).join("\n")}\n`);
+  await fs.writeFile(fileB, `${linesB.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  const sessions = [
+    { path: fileA, mtimeMs: now - 1_000 },
+    { path: fileB, mtimeMs: now - 120_000 },
+  ];
+
+  const picked = await findSessionByCwd(sessions, cwd, now - 4_000);
+  assert.ok(picked);
+  assert.equal(picked?.path, fileB);
+
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("parses session start from filename", () => {
+  const path = "/tmp/rollout-2026-01-29T15-46-57-019c0b82-foo.jsonl";
+  const start = getSessionStartMsFromPath(path);
+  assert.ok(start);
+  const expected = Date.parse("2026-01-29T15:46:57");
+  assert.equal(start, expected);
+});
+
+test("pickSessionForProcess uses session start over mtime", () => {
+  const sessions = [
+    {
+      path: "/tmp/rollout-2026-01-29T15-46-57-aaaa.jsonl",
+      mtimeMs: Date.parse("2026-01-29T16:46:57Z"),
+    },
+    {
+      path: "/tmp/rollout-2026-01-29T15-40-00-bbbb.jsonl",
+      mtimeMs: Date.parse("2026-01-29T15:40:00Z"),
+    },
+  ];
+  const startMs = getSessionStartMsFromPath(sessions[0].path) ?? 0;
+  const picked = pickSessionForProcess(sessions, startMs);
+  assert.ok(picked);
+  assert.equal(picked?.path, sessions[0].path);
+});
+
+test("treats user_message as in-flight activity", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+
+  const lines = [
+    {
+      type: "event_msg",
+      timestamp: "2026-01-29T20:00:00.000Z",
+      payload: { type: "user_message", role: "user", content: "Run tests" },
+    },
+  ];
+
+  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  const state = await updateTail(file);
+  assert.ok(state);
+
+  const summary = summarizeTail(state);
+  assert.equal(summary.inFlight, true);
+  assert.ok(summary.lastActivityAt);
+
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
 test("marks prompts and assistant responses as activity", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
@@ -125,7 +212,7 @@ test("marks prompts and assistant responses as activity", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("stores user-only prompts without activating inFlight", async () => {
+test("treats user-only prompts as in-flight activity", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
   const now = Date.now();
@@ -159,8 +246,8 @@ test("stores user-only prompts without activating inFlight", async () => {
   const summary = summarizeTail(state);
   assert.equal(summary.summary.lastPrompt, "prompt: still waiting");
   assert.equal(summary.summary.lastMessage, undefined);
-  assert.equal(summary.lastActivityAt, undefined);
-  assert.equal(summary.inFlight, undefined);
+  assert.ok(summary.lastActivityAt);
+  assert.equal(summary.inFlight, true);
 
   await fs.rm(dir, { recursive: true, force: true });
 });
@@ -694,10 +781,11 @@ test("response.completed clears in-flight even without turn end", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("does not expire in-flight codex state without explicit end", async () => {
+test("does not expire in-flight codex state without explicit end when disabled", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
   const originalNow = Date.now;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "0";
   const lines = [
     {
       type: "response.started",
@@ -720,6 +808,71 @@ test("does not expire in-flight codex state without explicit end", async () => {
 
   Date.now = originalNow;
   delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("expires in-flight codex state by default", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+  const originalNow = Date.now;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  delete process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS;
+  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const lines = [
+    {
+      type: "response.started",
+      ts: 1,
+    },
+  ];
+  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  Date.now = () => 1_000;
+  const stateStart = await updateTail(file);
+  assert.ok(stateStart);
+  const summaryStart = summarizeTail(stateStart);
+  assert.equal(summaryStart.inFlight, true);
+
+  Date.now = () => 2_000;
+  const stateLater = await updateTail(file);
+  assert.ok(stateLater);
+  const summaryLater = summarizeTail(stateLater);
+  assert.equal(summaryLater.inFlight, false);
+
+  Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("invalid in-flight timeout falls back to default", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+  const originalNow = Date.now;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "not-a-number";
+  delete process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS;
+  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const lines = [
+    {
+      type: "response.started",
+      ts: 1,
+    },
+  ];
+  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  Date.now = () => 1_000;
+  const stateStart = await updateTail(file);
+  assert.ok(stateStart);
+  const summaryStart = summarizeTail(stateStart);
+  assert.equal(summaryStart.inFlight, true);
+
+  Date.now = () => 2_000;
+  const stateLater = await updateTail(file);
+  assert.ok(stateLater);
+  const summaryLater = summarizeTail(stateLater);
+  assert.equal(summaryLater.inFlight, false);
+
+  Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
   await fs.rm(dir, { recursive: true, force: true });
 });
 

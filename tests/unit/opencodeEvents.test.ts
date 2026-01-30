@@ -33,6 +33,31 @@ test("tracks opencode in-flight state from tool execution events", () => {
   assert.equal(idle?.lastEventAt, 200000);
 });
 
+test("retains lastActivityAt after in-flight ends", () => {
+  const sessionId = "session-activity";
+  ingestOpenCodeEvent({
+    type: "tool.execute.before",
+    sessionId,
+    ts: 10,
+  });
+
+  const started = getOpenCodeActivityBySession(sessionId);
+  assert.ok(started);
+  assert.equal(started?.inFlight, true);
+  assert.equal(started?.lastActivityAt, 10000);
+
+  ingestOpenCodeEvent({
+    type: "session.idle",
+    sessionId,
+    ts: 20,
+  });
+
+  const idle = getOpenCodeActivityBySession(sessionId);
+  assert.ok(idle);
+  assert.equal(idle?.inFlight, false);
+  assert.equal(idle?.lastActivityAt, 10000);
+});
+
 test("captures in-flight transitions across tool events", () => {
   const sessionId = "session-456";
   const pid = 4242;
@@ -157,4 +182,5 @@ test("tui prompt append does not set in-flight", () => {
   const activity = getOpenCodeActivityBySession(sessionId);
   assert.ok(activity);
   assert.equal(activity?.inFlight, undefined);
+  assert.equal(activity?.lastActivityAt, 6000);
 });

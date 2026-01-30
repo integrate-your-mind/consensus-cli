@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { deriveCodexState } from "../../src/codexState.ts";
 
-test("codex treats cpu-only work as active to avoid flicker", () => {
+test("codex ignores cpu spikes without activity", () => {
   const result = deriveCodexState({
     cpu: 12,
     hasError: false,
@@ -10,7 +10,7 @@ test("codex treats cpu-only work as active to avoid flicker", () => {
     inFlight: false,
     now: 1_000,
   });
-  assert.equal(result.state, "active");
+  assert.equal(result.state, "idle");
 });
 
 test("codex activates after sustained cpu without activity timestamps", () => {
@@ -65,7 +65,7 @@ test("codex clears in-flight when activity is stale and cpu is low", () => {
   assert.equal(result.state, "idle");
 });
 
-test("codex stays active when cpu is high even if activity is stale", () => {
+test("codex drops to idle when activity is stale even if cpu is high", () => {
   const result = deriveCodexState({
     cpu: 5,
     hasError: false,
@@ -76,7 +76,7 @@ test("codex stays active when cpu is high even if activity is stale", () => {
     inFlightIdleMs: 5_000,
     eventWindowMs: 1_000,
   });
-  assert.equal(result.state, "active");
+  assert.equal(result.state, "idle");
 });
 
 test("codex activates when activity timestamp is recent", () => {

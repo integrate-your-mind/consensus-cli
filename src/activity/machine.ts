@@ -199,14 +199,6 @@ export const deriveOpenCodeState = (
       strictInFlight: input.strictInFlight ?? true,
     }
 
-    // Server processes are always idle unless error
-    if (input.isServer && !ctx.hasError) {
-      return {
-        state: "idle",
-        reason: "server_idle",
-      }
-    }
-
     // Check for idle status
     const statusIsIdle = input.status && /idle|stopped|paused/.test(input.status)
     if (statusIsIdle && !hasInFlightSignal(ctx)) {

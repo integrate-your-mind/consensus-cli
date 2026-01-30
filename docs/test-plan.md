@@ -20,8 +20,8 @@ Each case uses Given/When/Then (GWT).
   - Given OpenCode events marked started/running
   - When snapshots are computed
   - Then the agent state is active until completed/idle
-- Claude idle on input typing only
-  - Given Claude TUI (terminal user interface) with CPU spike but no prompt/resume
+- Claude idle without hook events
+  - Given Claude TUI (terminal user interface) with no hook events
   - When snapshots are computed
   - Then the agent remains idle
 

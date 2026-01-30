@@ -9,15 +9,21 @@ const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
 const INFLIGHT_TIMEOUT_MS = Number(
   process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS || 15000
 );
-const ACTIVITY_KINDS = new Set<string>(["command", "edit", "message", "tool"]);
+const ACTIVITY_KINDS = new Set<string>(["command", "edit", "message", "prompt", "tool"]);
+// Meta events that don't indicate real activity
 const META_EVENT_RE =
-  /^(session|snapshot|history|heartbeat|connected|ready|ping|pong)(\.|$)/i;
+  /^(server\.(connected|disconnected|instance)|installation\.|snapshot|history|heartbeat|connected|ready|ping|pong)(\.|$)/i;
+// Events that start in-flight activity
 const START_EVENT_RE =
-  /(tool\.execute\.before|response\.(started|in_progress|running)|run\.(started|in_progress|running))/i;
+  /(tool\.execute\.before|response\.(started|in_progress|running)|run\.(started|in_progress|running)|session\.status)/i;
+// Events that end in-flight activity
 const END_EVENT_RE =
   /((response|run)\.(completed|failed|errored|canceled|cancelled|aborted|interrupted|stopped)|session\.idle)/i;
+// Delta/streaming events that indicate ongoing activity
 const DELTA_EVENT_RE =
   /(response\.((output_text|function_call_arguments|content_part|text)\.delta)|message\.part\.updated)/i;
+// OpenCode session status values that indicate busy
+const BUSY_STATUS_RE = /^(busy|running|generating|processing)$/i;
 
 interface ActivityState {
   events: EventSummary[];
@@ -125,14 +131,42 @@ function extractText(value: any): string | undefined {
 }
 
 function getSessionId(raw: any): string | undefined {
-  return (
-    raw?.sessionId ||
-    raw?.session_id ||
-    raw?.session?.id ||
-    raw?.session?.sessionId ||
-    raw?.properties?.sessionId ||
-    raw?.properties?.session_id
-  );
+  // Direct session ID fields
+  if (raw?.sessionId) return raw.sessionId;
+  if (raw?.session_id) return raw.session_id;
+  if (raw?.sessionID) return raw.sessionID;
+  
+  // Nested in session object
+  if (raw?.session?.id) return raw.session.id;
+  if (raw?.session?.sessionId) return raw.session.sessionId;
+  if (raw?.session?.sessionID) return raw.session.sessionID;
+  if (raw?.session?.session_id) return raw.session.session_id;
+  
+  // OpenCode event format: properties.sessionID (for session.status, session.idle, etc.)
+  if (raw?.properties?.sessionID) return raw.properties.sessionID;
+  if (raw?.properties?.sessionId) return raw.properties.sessionId;
+  if (raw?.properties?.session_id) return raw.properties.session_id;
+  
+  // OpenCode event format: properties.session.id
+  if (raw?.properties?.session?.id) return raw.properties.session.id;
+  if (raw?.properties?.session?.sessionId) return raw.properties.session.sessionId;
+  if (raw?.properties?.session?.sessionID) return raw.properties.session.sessionID;
+  if (raw?.properties?.session?.session_id) return raw.properties.session.session_id;
+  
+  // OpenCode event format: properties.part.sessionID (for message.part.updated)
+  if (raw?.properties?.part?.sessionID) return raw.properties.part.sessionID;
+  if (raw?.properties?.part?.sessionId) return raw.properties.part.sessionId;
+  if (raw?.properties?.part?.session_id) return raw.properties.part.session_id;
+  
+  // OpenCode event format: properties.info.id (for session.created/updated)
+  if (raw?.properties?.info?.id) return raw.properties.info.id;
+  
+  // Message events: properties.info.sessionID
+  if (raw?.properties?.info?.sessionID) return raw.properties.info.sessionID;
+  if (raw?.properties?.info?.sessionId) return raw.properties.info.sessionId;
+  if (raw?.properties?.info?.session_id) return raw.properties.info.session_id;
+  
+  return undefined;
 }
 
 function getPid(raw: any): number | undefined {
@@ -140,7 +174,9 @@ function getPid(raw: any): number | undefined {
     raw?.pid ||
     raw?.process?.pid ||
     raw?.properties?.pid ||
-    raw?.properties?.processId;
+    raw?.properties?.processId ||
+    raw?.properties?.session?.pid ||
+    raw?.properties?.session?.processId;
   if (typeof pid === "number" && Number.isFinite(pid)) return pid;
   if (typeof pid === "string") {
     const parsed = Number(pid);
@@ -165,12 +201,15 @@ function summarizeEvent(raw: any): {
     "event";
   const type = typeof typeRaw === "string" ? typeRaw : "event";
   const lowerType = type.toLowerCase();
+  const normalizedType = lowerType.startsWith("tui.")
+    ? lowerType.slice(4)
+    : lowerType;
   const status = raw?.status || raw?.state || raw?.properties?.status;
   const statusStr = typeof status === "string" ? status.toLowerCase() : "";
   const isError =
     !!raw?.error || lowerType.includes("error") || statusStr.includes("error");
   let inFlight: boolean | undefined;
-  const isMessagePartUpdated = /message\.part\.updated/i.test(lowerType);
+  const isMessagePartUpdated = /message\.part\.updated/i.test(normalizedType);
   const partRole =
     raw?.role ||
     raw?.message?.role ||
@@ -184,15 +223,26 @@ function summarizeEvent(raw: any): {
       partRole === "assistant_response" ||
       partType === "output_text" ||
       partType === "text");
-  if (START_EVENT_RE.test(lowerType) || DELTA_EVENT_RE.test(lowerType)) {
+  // Handle session.status event with status property
+  const sessionStatus = raw?.properties?.status?.type || raw?.properties?.status;
+  const sessionStatusStr = typeof sessionStatus === "string" ? sessionStatus : "";
+  
+  if (normalizedType === "session.status") {
+    // session.status event: check if status is "busy" for in-flight
+    if (BUSY_STATUS_RE.test(sessionStatusStr)) {
+      inFlight = true;
+    } else {
+      inFlight = false;
+    }
+  } else if (START_EVENT_RE.test(normalizedType) || DELTA_EVENT_RE.test(normalizedType)) {
     if (!isMessagePartUpdated || shouldTreatMessagePartActive) {
       inFlight = true;
     }
-  } else if (END_EVENT_RE.test(lowerType) || isError) {
+  } else if (END_EVENT_RE.test(normalizedType) || isError) {
     inFlight = false;
   }
 
-  if (lowerType.includes("compaction")) {
+  if (normalizedType.includes("compaction")) {
     const phase = statusStr || raw?.phase || raw?.properties?.phase;
     const summary = phase ? `compaction: ${phase}` : "compaction";
     return { summary, kind: "other", isError, type, inFlight };
@@ -218,7 +268,7 @@ function summarizeEvent(raw: any): {
     raw?.target ||
     raw?.properties?.path ||
     raw?.properties?.file;
-  if (typeof pathHint === "string" && pathHint.trim() && lowerType.includes("file")) {
+  if (typeof pathHint === "string" && pathHint.trim() && normalizedType.includes("file")) {
     const summary = redactText(`edit: ${pathHint.trim()}`) || `edit: ${pathHint.trim()}`;
     return { summary, kind: "edit", isError, type, inFlight };
   }
@@ -239,7 +289,7 @@ function summarizeEvent(raw: any): {
     extractText(raw?.input) ||
     extractText(raw?.instruction) ||
     extractText(raw?.properties?.prompt);
-  if (promptText && lowerType.includes("prompt")) {
+  if (promptText && normalizedType.includes("prompt")) {
     const trimmed = promptText.replace(/\s+/g, " ").trim();
     const snippet = trimmed.slice(0, 120);
     const summary = redactText(`prompt: ${snippet}`) || `prompt: ${snippet}`;
@@ -293,10 +343,15 @@ function isActivityEvent(input: {
 }): boolean {
   const type = typeof input.type === "string" ? input.type : "";
   const lowerType = type.toLowerCase();
-  if (META_EVENT_RE.test(lowerType)) return false;
+  const normalizedType = lowerType.startsWith("tui.")
+    ? lowerType.slice(4)
+    : lowerType;
+  if (META_EVENT_RE.test(normalizedType)) return false;
   if (input.inFlight) return true;
   if (input.kind && ACTIVITY_KINDS.has(input.kind)) return true;
-  if (START_EVENT_RE.test(lowerType) || DELTA_EVENT_RE.test(lowerType)) return true;
+  if (lowerType.startsWith("tui.")) return true;
+  if (START_EVENT_RE.test(normalizedType) || DELTA_EVENT_RE.test(normalizedType))
+    return true;
   return false;
 }
 
@@ -358,7 +413,11 @@ function handleRawEvent(raw: any): void {
       raw?.created_at ||
       raw?.createdAt ||
       raw?.properties?.time ||
-      raw?.properties?.timestamp
+      raw?.properties?.timestamp ||
+      raw?.properties?.time?.created ||
+      raw?.properties?.time?.updated ||
+      raw?.properties?.created_at ||
+      raw?.properties?.createdAt
   );
   const ts = parsedTs ?? now;
   const sessionId = getSessionId(raw);
@@ -405,7 +464,6 @@ function handleRawEvent(raw: any): void {
         state.lastInFlightSignalAt = now;
       } else {
         state.lastInFlightSignalAt = undefined;
-        state.lastActivityAt = undefined;
       }
     } else if (activity && state.inFlight) {
       state.lastInFlightSignalAt = now;
@@ -443,7 +501,6 @@ function handleRawEvent(raw: any): void {
         state.lastInFlightSignalAt = now;
       } else {
         state.lastInFlightSignalAt = undefined;
-        state.lastActivityAt = undefined;
       }
     } else if (activity && state.inFlight) {
       state.lastInFlightSignalAt = now;

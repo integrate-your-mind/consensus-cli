@@ -26,8 +26,11 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "build": "tsc",
+    "dev": "node dev/dev.mjs",
+    "dev:server": "tsx watch src/server.ts",
+    "dev:client": "cd public && vite",
+    "build": "tsc && npm run build:client",
+    "build:client": "cd public && vite build",
     "start": "node dist/server.js",
     "scan": "node dist/scan.js",
     "tail": "node dist/tail.js",
@@ -42,6 +45,8 @@
   "dependencies": {
     "@effect/opentelemetry": "^0.61.0",
     "@effect/platform": "^0.94.2",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/exporter-metrics-otlp-http": "^0.211.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.211.0",
@@ -63,9 +68,13 @@
     "@playwright/test": "^1.58.0",
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.2",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
     "@types/ws": "^8.5.10",
+    "@vitejs/plugin-react": "^4.3.0",
     "tsx": "^4.15.7",
-    "typescript": "^5.5.4"
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0"
   },
   "engines": {
     "node": ">=20"

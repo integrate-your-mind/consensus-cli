@@ -1,44 +1,78 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs/promises";
-import path from "node:path";
-
-async function loadLayoutFns(): Promise<{
-  agentIdentity: (agent: Record<string, unknown>) => unknown;
-  groupKeyForAgent: (agent: Record<string, unknown>) => unknown;
-  keyForAgent: (agent: Record<string, unknown>) => string;
-}> {
-  const source = await fs.readFile(path.join(process.cwd(), "public/app.js"), "utf8");
-  const identityMatch = source.match(/function agentIdentity\(agent\) \{[\s\S]*?\n\}/);
-  const groupMatch = source.match(/function groupKeyForAgent\(agent\) \{[\s\S]*?\n\}/);
-  const keyMatch = source.match(/function keyForAgent\(agent\) \{[\s\S]*?\n\}/);
-  assert.ok(identityMatch, "agentIdentity not found in public/app.js");
-  assert.ok(groupMatch, "groupKeyForAgent not found in public/app.js");
-  assert.ok(keyMatch, "keyForAgent not found in public/app.js");
-  const factory = new Function(
-    `${identityMatch[0]}\n${groupMatch[0]}\n${keyMatch[0]}\nreturn { agentIdentity, groupKeyForAgent, keyForAgent };`
-  ) as () => {
-    agentIdentity: (agent: Record<string, unknown>) => unknown;
-    groupKeyForAgent: (agent: Record<string, unknown>) => unknown;
-    keyForAgent: (agent: Record<string, unknown>) => string;
-  };
-  return factory();
-}
+import { groupKeyForAgent, keyForAgent, labelFor } from "../../public/src/lib/format.ts";
+import { createLayoutState, updateLayout } from "../../public/src/lib/layout.ts";
 
 test("keeps unique layout keys for same repo with different pids", async () => {
-  const { groupKeyForAgent, keyForAgent } = await loadLayoutFns();
-  const agentA = { repo: "alpha", id: "101" };
-  const agentB = { repo: "alpha", id: "202" };
-  assert.equal(groupKeyForAgent(agentA), "alpha");
-  assert.equal(groupKeyForAgent(agentB), "alpha");
-  assert.notEqual(keyForAgent(agentA), keyForAgent(agentB));
+  const agentA = { repo: "alpha", id: "101", pid: 101 };
+  const agentB = { repo: "alpha", id: "202", pid: 202 };
+  assert.equal(groupKeyForAgent(agentA as any), "alpha");
+  assert.equal(groupKeyForAgent(agentB as any), "alpha");
+  assert.notEqual(keyForAgent(agentA as any), keyForAgent(agentB as any));
 });
 
 test("falls back to id when repo is missing to avoid collisions", async () => {
-  const { groupKeyForAgent, keyForAgent } = await loadLayoutFns();
-  const agentA = { id: "303" };
-  const agentB = { id: "404" };
-  assert.equal(groupKeyForAgent(agentA), "303");
-  assert.equal(groupKeyForAgent(agentB), "404");
-  assert.notEqual(keyForAgent(agentA), keyForAgent(agentB));
+  const agentA = { id: "303", pid: 303 };
+  const agentB = { id: "404", pid: 404 };
+  assert.equal(groupKeyForAgent(agentA as any), "303");
+  assert.equal(groupKeyForAgent(agentB as any), "404");
+  assert.notEqual(keyForAgent(agentA as any), keyForAgent(agentB as any));
+});
+
+test("labelFor ignores codex titles that look like temp paths", async () => {
+  const agent = {
+    pid: 505,
+    kind: "tui",
+    title:
+      "/var/folders/79/v8mgm0w50vv5qvv3l3_nvb7h0000gn/T/TemporaryItems/NSIRD_screencaptureui/Screenshot.png",
+    repo: "consensus",
+  };
+  assert.equal(labelFor(agent as any), "consensus");
+});
+
+test("labelFor keeps non-codex titles", async () => {
+  const agent = {
+    pid: 606,
+    kind: "opencode-tui",
+    title: "OpenCode Work",
+    repo: "consensus",
+  };
+  assert.equal(labelFor(agent as any), "OpenCode Work");
+});
+
+test("groupKeyForAgent falls back to cwd then cmd", async () => {
+  const repoAgent = { repo: "alpha", cwd: "/tmp/alpha", cmd: "codex", id: "1" };
+  const cwdAgent = { cwd: "/tmp/beta", cmd: "codex", id: "2" };
+  const cmdAgent = { cmd: "codex exec", id: "3" };
+  assert.equal(groupKeyForAgent(repoAgent as any), "alpha");
+  assert.equal(groupKeyForAgent(cwdAgent as any), "/tmp/beta");
+  assert.equal(groupKeyForAgent(cmdAgent as any), "codex exec");
+});
+
+test("layout keeps existing positions when adding agents", async () => {
+  const state = createLayoutState();
+  const agentA = { id: "101", pid: 101, repo: "alpha", mem: 80_000_000, state: "active" };
+  const agentB = { id: "202", pid: 202, repo: "beta", mem: 70_000_000, state: "active" };
+  updateLayout(state, [agentA as any, agentB as any]);
+  const posA = state.layout.get("101");
+  const posB = state.layout.get("202");
+  assert.ok(posA);
+  assert.ok(posB);
+
+  const agentC = { id: "303", pid: 303, repo: "gamma", mem: 60_000_000, state: "active" };
+  updateLayout(state, [agentA as any, agentB as any, agentC as any]);
+  assert.deepEqual(state.layout.get("101"), posA);
+  assert.deepEqual(state.layout.get("202"), posB);
+});
+
+test("group anchor remains stable for same repo", async () => {
+  const state = createLayoutState();
+  const agentA = { id: "111", pid: 111, repo: "alpha", mem: 80_000_000, state: "active" };
+  updateLayout(state, [agentA as any]);
+  const anchor = state.groupAnchors.get("alpha");
+  assert.ok(anchor);
+
+  const agentB = { id: "112", pid: 112, repo: "alpha", mem: 75_000_000, state: "active" };
+  updateLayout(state, [agentA as any, agentB as any]);
+  assert.deepEqual(state.groupAnchors.get("alpha"), anchor);
 });

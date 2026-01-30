@@ -68,6 +68,7 @@ export interface SnapshotMeta {
         byState: Record<string, number>;
       }
     >;
+    nextTickAt?: number;
   };
 }
 

@@ -2,7 +2,7 @@ import type { AgentState } from "./types.js";
 
 const DEFAULT_CPU_THRESHOLD = 1;
 const DEFAULT_EVENT_WINDOW_MS = 300000;
-const DEFAULT_ACTIVE_HOLD_MS = 600000;
+const DEFAULT_ACTIVE_HOLD_MS = 3000;
 
 export interface ActivityInput {
   cpu: number;

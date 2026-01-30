@@ -9,6 +9,9 @@ All configuration is via environment variables.
 - `CONSENSUS_PORT`
   - Default: `8787`
   - Port for the HTTP server.
+- `CONSENSUS_UI_PORT`
+  - Default: `5173`
+  - Port for the Vite dev server when running `npm run dev`.
 - `CONSENSUS_POLL_MS`
   - Default: `250`
   - Poll interval for process presence scans.
@@ -48,6 +51,11 @@ All configuration is via environment variables.
 - `CONSENSUS_CODEX_HOME`
   - Default: `~/.codex`
   - Override Codex home directory.
+- `CONSENSUS_CODEX_NOTIFY_INSTALL`
+  - Optional. If set, consensus will run `codex config set -g notify=["<path>"]` on startup.
+  - Intended for wiring Codex TUI `notify` hook to consensus without manual setup.
+  - Use `CONSENSUS_CODEX_NOTIFY_INSTALL_TIMEOUT_MS` to cap install time (default 5000).
+  - Set to `0`, `false`, or `off` to disable the auto-install.
 - `CONSENSUS_CODEX_WATCH_POLL`
   - Default: enabled
   - Set to `0` to disable polling for Codex JSONL watch events. Polling is the default because native FS events are unreliable for these files.
@@ -78,11 +86,8 @@ All configuration is via environment variables.
 - `CONSENSUS_OPENCODE_EVENT_ACTIVE_MS`
   - Default: `0`
   - OpenCode event window before dropping to idle.
-- `CONSENSUS_OPENCODE_CPU_ACTIVE_MS`
-  - Default: `1500`
-  - OpenCode CPU window to treat recent CPU spikes as activity.
 - `CONSENSUS_OPENCODE_ACTIVE_HOLD_MS`
-  - Default: `0`
+  - Default: `3000`
   - OpenCode hold window after activity.
 - `CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS`
   - Default: `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`
@@ -109,7 +114,7 @@ All configuration is via environment variables.
   - Default: `750`
   - Treat recent Codex JSONL file mtime as activity within this window (bridges log write lag).
 - `CONSENSUS_CODEX_ACTIVE_HOLD_MS`
-  - Default: `500`
+  - Default: `3000`
   - Codex hold window after activity.
 - `CONSENSUS_CODEX_INFLIGHT_GRACE_MS`
   - Default: `750`
@@ -121,7 +126,7 @@ All configuration is via environment variables.
   - Default: `30000`
   - Idle timeout to clear Codex in-flight when activity is stale. Set to `0` to disable.
 - `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`
-  - Default: `3000`
+  - Default: `300`
   - Hard timeout to clear Codex in-flight if no recent signals and file is not fresh.
 - `CONSENSUS_CODEX_FILE_FRESH_MS`
   - Default: `10000`
@@ -153,6 +158,7 @@ All configuration is via environment variables.
 - `CONSENSUS_EVENT_ACTIVE_MS`
   - Default: `300000`
   - Window after the last event to mark an agent active.
+- Claude activity is hook-driven; CPU thresholds are legacy and ignored for TUI activity.
 - `CONSENSUS_CPU_ACTIVE`
   - Default: `1`
   - CPU threshold for marking an agent active.
@@ -165,14 +171,20 @@ All configuration is via environment variables.
 - `CONSENSUS_CLAUDE_CPU_SPIKE`
   - Default: derived
   - Claude spike threshold override.
+- `CONSENSUS_CLAUDE_EVENT_TTL_MS`
+  - Default: `1800000`
+  - Claude hook event TTL before a session is pruned.
+- `CONSENSUS_CLAUDE_INFLIGHT_TIMEOUT_MS`
+  - Default: `15000`
+  - Clear Claude in-flight if no hook activity arrives within this window.
 - `CONSENSUS_CLAUDE_ACTIVE_HOLD_MS`
-  - Default: `1000`
-  - Claude-specific active hold window to smooth brief CPU spikes (reduce flicker).
+  - Default: `3000`
+  - Claude-specific active hold window to smooth brief hook gaps (reduce flicker).
 - `CONSENSUS_CLAUDE_START_ACTIVE_MS`
   - Default: `1200`
-  - Grace window to show Claude sessions as active immediately after process start.
+  - Legacy (not used for hook-driven Claude activity).
 - `CONSENSUS_ACTIVE_HOLD_MS`
-  - Default: `600000`
+  - Default: `3000`
   - Keep agents active for this long after activity.
 - `CONSENSUS_IDLE_HOLD_MS`
   - Default: `200`

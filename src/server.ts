@@ -1,4 +1,5 @@
 import express from "express";
+import { spawn } from "child_process";
 import http from "http";
 import path from "path";
 import fs from "fs";
@@ -10,8 +11,14 @@ import { Effect, Fiber } from "effect";
 import { scanCodexProcesses, markSessionDirty } from "./scan.js";
 import { resolveCodexHome } from "./codexLogs.js";
 import { onOpenCodeEvent, stopOpenCodeEventStream } from "./opencodeEvents.js";
+import { codexEventStore } from "./services/codexEvents.js";
+import { CodexEventSchema } from "./codex/types.js";
+import { ClaudeEventSchema } from "./claude/types.js";
+import { handleClaudeEventEffect } from "./services/claudeEvents.js";
+import { Schema, ParseResult } from "effect";
 import type { SnapshotPayload, AgentSnapshot, SnapshotMeta } from "./types.js";
 import { registerActivityTestRoutes } from "./server/activityTestRoutes.js";
+import { normalizeCodexNotifyInstall } from "./codexNotifyInstall.js";
 import {
   annotateSpan,
   disposeObservability,
@@ -30,6 +37,10 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const isDevRuntime = path.extname(__filename) === ".ts";
+const liveReloadEnabled =
+  process.env.CONSENSUS_LIVE_RELOAD === "1" ||
+  (isDevRuntime && process.env.CONSENSUS_LIVE_RELOAD !== "0");
 
 const app = express();
 const server = http.createServer(app);
@@ -150,9 +161,103 @@ const codexWatchBinaryInterval = Math.max(
     process.env.CONSENSUS_CODEX_WATCH_BINARY_INTERVAL_MS || codexWatchInterval
   )
 );
+const codexNotifyInstall = normalizeCodexNotifyInstall(
+  process.env.CONSENSUS_CODEX_NOTIFY_INSTALL
+);
+const codexNotifyInstallTimeout = Math.max(
+  2000,
+  Number(process.env.CONSENSUS_CODEX_NOTIFY_INSTALL_TIMEOUT_MS || 5000)
+);
+let holdTickTimeout: ReturnType<typeof setTimeout> | null = null;
+let holdTickAt = 0;
 
 const publicDir = path.join(__dirname, "..", "public");
+const clientBuildDir = path.join(publicDir, "dist");
+const activityTestMode = process.env.ACTIVITY_TEST_MODE === "1";
+const testUiPath = fs.existsSync(path.join(clientBuildDir, "index.html"))
+  ? path.join(clientBuildDir, "index.html")
+  : path.join(publicDir, "index.html");
+if (activityTestMode) {
+  app.get("/", (_req, res) => {
+    res.setHeader("Cache-Control", "no-cache");
+    res.sendFile(testUiPath);
+  });
+}
+app.use((req, res, next) => {
+  if (req.path === "/" || req.path.endsWith(".html")) {
+    res.setHeader("Cache-Control", "no-cache");
+  }
+  next();
+});
+// Serve built client files if they exist, otherwise fall back to public for dev.
+if (fs.existsSync(clientBuildDir)) {
+  app.use(express.static(clientBuildDir));
+}
 app.use(express.static(publicDir));
+
+const reloadClients = new Set<express.Response>();
+let reloadWatcher: FSWatcher | null = null;
+let reloadTimer: NodeJS.Timeout | null = null;
+let reloadReason = "change";
+
+function broadcastReload(reason: string): void {
+  if (!reloadClients.size) return;
+  const payload = JSON.stringify({ ts: Date.now(), reason });
+  const message = `event: reload\ndata: ${payload}\n\n`;
+  for (const res of reloadClients) {
+    try {
+      res.write(message);
+    } catch {
+      reloadClients.delete(res);
+    }
+  }
+}
+
+function scheduleReload(reason: string): void {
+  if (!liveReloadEnabled) return;
+  reloadReason = reason;
+  if (reloadTimer) return;
+  reloadTimer = setTimeout(() => {
+    reloadTimer = null;
+    broadcastReload(reloadReason);
+  }, 80);
+}
+
+function startReloadWatcher(): void {
+  if (!liveReloadEnabled || reloadWatcher) return;
+  reloadWatcher = chokidar.watch(publicDir, {
+    ignoreInitial: true,
+    ignored: /(^|[\/\\])\../,
+  });
+  reloadWatcher.on("error", (err) => {
+    process.stderr.write(`[consensus] reload watcher error: ${String(err)}\n`);
+  });
+  reloadWatcher.on("all", (event, filePath) => {
+    const relative = path.relative(publicDir, filePath);
+    scheduleReload(`${event}:${relative || "public"}`);
+  });
+}
+
+function stopReloadWatcher(): Promise<void> | void {
+  if (!reloadWatcher) return;
+  const closing = reloadWatcher.close();
+  reloadWatcher = null;
+  return closing;
+}
+
+if (liveReloadEnabled) {
+  app.get("/__dev/reload", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders?.();
+    res.write("event: ready\ndata: ok\n\n");
+    reloadClients.add(res);
+    req.on("close", () => {
+      reloadClients.delete(res);
+    });
+  });
+}
 
 function runHttpEffect(
   req: express.Request,
@@ -243,6 +348,69 @@ app.post("/__debug/activity", express.json(), (req, res) => {
   runHttpEffect(req, res, "/__debug/activity", effect);
 });
 
+// Codex webhook endpoint - receives events from notify hook
+app.post("/api/codex-event", express.json(), (req, res) => {
+  const effect = Effect.gen(function* () {
+    // Decode and validate event
+    const decodeResult = Schema.decodeUnknownEither(CodexEventSchema)(req.body);
+    
+    if (decodeResult._tag === "Left") {
+      const error = ParseResult.TreeFormatter.formatErrorSync(decodeResult.left);
+      res.status(400).json({ 
+        ok: false, 
+        error: "Invalid event schema",
+        details: error 
+      });
+      return 400;
+    }
+    
+    const event = decodeResult.right;
+
+    if (process.env.CONSENSUS_CODEX_NOTIFY_DEBUG === "1") {
+      process.stderr.write(
+        `[consensus] codex event type=${event.type} thread=${event.threadId}\n`
+      );
+    }
+    
+    // Store event (sync for immediate availability)
+    codexEventStore.handleEvent(event);
+    
+    // Trigger fast scan to update UI
+    requestTick("fast");
+    
+    res.json({ ok: true, received: event.type });
+    return 200;
+  });
+  
+  runHttpEffect(req, res, "/api/codex-event", effect);
+});
+
+// Claude webhook endpoint - receives events from Claude hooks
+app.post("/api/claude-event", express.json(), (req, res) => {
+  const effect = Effect.gen(function* () {
+    const decodeResult = Schema.decodeUnknownEither(ClaudeEventSchema)(req.body);
+
+    if (decodeResult._tag === "Left") {
+      const error = ParseResult.TreeFormatter.formatErrorSync(decodeResult.left);
+      res.status(400).json({
+        ok: false,
+        error: "Invalid event schema",
+        details: error,
+      });
+      return 400;
+    }
+
+    const event = decodeResult.right;
+    yield* handleClaudeEventEffect(event);
+    requestTick("fast");
+
+    res.json({ ok: true, received: event.type });
+    return 200;
+  });
+
+  runHttpEffect(req, res, "/api/claude-event", effect);
+});
+
 let lastSnapshot: SnapshotPayload = { ts: Date.now(), agents: [] };
 let lastBaseSnapshot: SnapshotPayload = lastSnapshot;
 let scanning = false;
@@ -252,7 +420,6 @@ let scanLastStallAt = 0;
 let pendingMode: "fast" | "full" | null = null;
 let codexWatcher: FSWatcher | null = null;
 let unsubscribeOpenCode: (() => void) | null = null;
-const activityTestMode = process.env.ACTIVITY_TEST_MODE === "1";
 const testActivity = new Map<
   string,
   { laneId: string; source: string; active: boolean; updatedAt: number }
@@ -364,6 +531,25 @@ function applyTestOverrides(snapshot: SnapshotPayload): SnapshotPayload {
   return { ...snapshot, agents };
 }
 
+function scheduleHoldTick(nextTickAt: number | undefined): void {
+  if (typeof nextTickAt !== "number" || !Number.isFinite(nextTickAt)) return;
+  const now = Date.now();
+  if (nextTickAt <= now) {
+    requestTick("fast");
+    return;
+  }
+  if (holdTickAt && nextTickAt >= holdTickAt - 5) return;
+  holdTickAt = nextTickAt;
+  if (holdTickTimeout) {
+    clearTimeout(holdTickTimeout);
+  }
+  holdTickTimeout = setTimeout(() => {
+    holdTickTimeout = null;
+    holdTickAt = 0;
+    requestTick("fast");
+  }, Math.max(0, nextTickAt - Date.now()));
+}
+
 function broadcastSnapshot(snapshot: SnapshotPayload, deltaOps: DeltaOp[] = []): void {
   const payload = JSON.stringify(snapshot);
   for (const client of wss.clients) {
@@ -382,6 +568,7 @@ function emitSnapshot(snapshot: SnapshotPayload): void {
   const prevSnapshot = lastSnapshot;
   lastBaseSnapshot = snapshot;
   lastSnapshot = applyTestOverrides(snapshot);
+  scheduleHoldTick(snapshot.meta?.activity?.nextTickAt);
   const deltaOps = buildDelta(prevSnapshot, lastSnapshot);
   broadcastSnapshot(lastSnapshot, deltaOps);
 }
@@ -618,12 +805,47 @@ const stallLoop = Effect.forever(
   Effect.sleep(`${scanStallCheckMs} millis`).pipe(Effect.tap(() => Effect.sync(checkScanStall)))
 );
 
+/**
+ * @deprecated Use `npx consensus-cli setup` instead.
+ * Legacy notify hook installation via env var.
+ * Kept for backward compatibility only.
+ */
+function installCodexNotifyHook(): void {
+  if (!codexNotifyInstall) return;
+  process.stderr.write(
+    "[consensus] Warning: CONSENSUS_CODEX_NOTIFY_INSTALL is deprecated. " +
+    "Use 'npx consensus-cli setup' for reliable Codex integration.\n"
+  );
+  const notifier = codexNotifyInstall.trim();
+  if (!notifier) return;
+  const script = `notify=["${notifier.replace(/"/g, "\\\"")}"]`;
+  const args = ["config", "set", "-g", script];
+  const child = spawn("codex", args, {
+    stdio: "ignore",
+    env: process.env,
+    detached: true,
+  });
+  const timeout = setTimeout(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // ignore
+    }
+  }, codexNotifyInstallTimeout);
+  child.on("error", () => clearTimeout(timeout));
+  child.on("exit", () => clearTimeout(timeout));
+  child.unref();
+}
+
 const runtime = runFork(
   Effect.scoped(
     Effect.gen(function* () {
+      // Note: Codex file watcher removed - using webhook-based events instead
+      // Legacy notify hook install kept for backward compatibility
+      yield* Effect.sync(() => installCodexNotifyHook());
       yield* Effect.acquireRelease(
-        Effect.sync(() => startCodexWatcher()),
-        () => Effect.promise(() => Promise.resolve(stopCodexWatcher()))
+        Effect.sync(() => startReloadWatcher()),
+        () => Effect.promise(() => Promise.resolve(stopReloadWatcher()))
       );
       yield* Effect.acquireRelease(
         Effect.sync(() => startOpenCodeListener()),

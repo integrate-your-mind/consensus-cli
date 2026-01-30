@@ -10,6 +10,7 @@ export interface ClaudeCommandInfo {
   continued?: boolean;
   model?: string;
   print?: boolean;
+  sessionId?: string;
 }
 
 export interface ClaudeActivityInput {
@@ -75,6 +76,8 @@ function findPrompt(parts: string[], startIndex: number): string | undefined {
         "--resume",
         "-r",
         "--session-id",
+        "--session",
+        "-s",
         "--continue",
         "-c",
       ]);
@@ -97,6 +100,10 @@ export function parseClaudeCommand(command: string): ClaudeCommandInfo | null {
   const continued = parts.includes("--continue") || parts.includes("-c");
   const resume = readFlagValue(parts, "--resume") || readFlagValue(parts, "-r");
   const model = readFlagValue(parts, "--model");
+  const sessionId =
+    readFlagValue(parts, "--session-id") ||
+    readFlagValue(parts, "--session") ||
+    readFlagValue(parts, "-s");
   const prompt = findPrompt(parts, claudeIndex + 1);
 
   return {
@@ -106,6 +113,7 @@ export function parseClaudeCommand(command: string): ClaudeCommandInfo | null {
     continued,
     model,
     print: hasPrint,
+    sessionId,
   };
 }
 
@@ -153,7 +161,7 @@ export function deriveClaudeState(input: ClaudeActivityInput): ActivityHoldResul
     : typeof input.cpuActiveMs === "number" && input.cpuActiveMs >= sustainMs;
   const cpuValue = isTui && !hasWork && !sustained ? 0 : input.cpu;
   const holdMs =
-    input.holdMs ?? Number(process.env.CONSENSUS_CLAUDE_ACTIVE_HOLD_MS || 1000);
+    input.holdMs ?? Number(process.env.CONSENSUS_CLAUDE_ACTIVE_HOLD_MS || 3000);
   const result = deriveStateWithHold({
     cpu: cpuValue,
     hasError: false,

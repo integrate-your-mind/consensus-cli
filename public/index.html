@@ -14,46 +14,8 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <a class="skip-link" href="#main">Skip to main content</a>
-    <main id="main">
-      <canvas
-        id="scene"
-        role="img"
-        aria-label="Codex process map"
-        tabindex="0"
-      ></canvas>
-      <div id="hud">
-        <div class="brand">
-          <div class="title">consensus</div>
-          <div class="subtitle">codex process atlas</div>
-        </div>
-        <div class="meta" aria-live="polite">
-          <div id="status">connecting…</div>
-          <div id="count">0 agents</div>
-        </div>
-      </div>
-      <div id="active-lane" role="region" aria-label="Active agents">
-        <div class="lane-title">agents</div>
-        <input
-          id="search"
-          type="search"
-          placeholder="Search metadata…"
-          aria-label="Search metadata"
-        />
-        <div id="active-list"></div>
-        <div class="lane-divider" aria-hidden="true"></div>
-        <div class="lane-title server-title">servers</div>
-        <div id="server-list"></div>
-      </div>
-      <div id="tooltip" class="hidden"></div>
-      <aside id="panel" class="collapsed" aria-label="Agent details">
-        <div class="panel-header">
-          <div class="panel-title">agent</div>
-          <button id="panel-close" aria-label="Close">x</button>
-        </div>
-        <div id="panel-content"></div>
-      </aside>
-    </main>
-    <script type="module" src="app.js"></script>
+    <a class="skip-link" href="#root">Skip to main content</a>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
