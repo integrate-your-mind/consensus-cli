@@ -142,6 +142,7 @@ State:
     - Added dev packCell range guard and spatial index validator; new unit tests for boundary ranges and index consistency (public/src/lib/layout.ts, tests/unit/appLayout.test.ts).
     - Tests run after guard/validator changes: `npm run test:unit` (154 pass), `npm run test:integration` (58 pass), `npm run test:ui` (19 pass).
     - `npm install` run to restore tsx dependency before tests.
+    - PR opened: https://github.com/integrate-your-mind/consensus-cli/pull/4
   - Now:
     - Answer user question about hot reload configuration (Vite HMR + server watch + live reload SSE).
     - Answer whether any additional setup is missing when using Vite.
