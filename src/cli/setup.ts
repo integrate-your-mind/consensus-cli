@@ -10,6 +10,13 @@ const __dirname = path.dirname(__filename);
 const CONFIG_VERSION = "1";
 const CONSENSUS_CONFIG_PATH = path.join(os.homedir(), ".consensus", "config.json");
 
+const resolveNotifyScriptPath = (): string => {
+  const notifyScriptRaw = path.resolve(__dirname, "..", "codexNotify.js");
+  return process.platform === "win32"
+    ? notifyScriptRaw.replace(/\\/g, "/")
+    : notifyScriptRaw;
+};
+
 /**
  * Check if setup has already been completed
  */
@@ -29,10 +36,27 @@ async function verifyCodexHookInstalled(): Promise<boolean> {
   const configPath = path.join(os.homedir(), ".codex", "config.toml");
   try {
     const content = await fs.readFile(configPath, "utf-8");
-    const notifyScript = path.resolve(__dirname, "..", "codexNotify.js");
+    const notifyScript = resolveNotifyScriptPath();
+    const hasNotifyScript =
+      process.platform === "win32"
+        ? content.includes(notifyScript)
+        : content.includes("codexNotify.js") || content.includes(notifyScript);
+    const invalidArrayNotify = content
+      .split("\n")
+      .some(
+        (line) =>
+          line.trim().startsWith("notify = [") &&
+          line.includes("/api/codex-event")
+      );
+    const notifyIndex = content.indexOf("notify =");
+    const tuiIndex = content.indexOf("[tui]");
+    const notifyBeforeTui =
+      notifyIndex !== -1 && (tuiIndex === -1 || notifyIndex < tuiIndex);
     return (
       content.includes("/api/codex-event") &&
-      (content.includes("codexNotify.js") || content.includes(notifyScript))
+      hasNotifyScript &&
+      notifyBeforeTui &&
+      !invalidArrayNotify
     );
   } catch {
     return false;
@@ -78,9 +102,9 @@ export async function setupCodexHook(): Promise<HookSetupResult> {
   }
   
   // Generate notify script path (compiled JS in dist)
-  const notifyScript = path.resolve(__dirname, "..", "codexNotify.js");
+  const notifyScript = resolveNotifyScriptPath();
   
-  const notifyLine = `notify = ["node", "${notifyScript}", "http://127.0.0.1:${consensusPort}/api/codex-event"]`;
+  const notifyLine = `notify = "node ${notifyScript} http://127.0.0.1:${consensusPort}/api/codex-event"`;
   const notificationsLine =
     'notifications = ["thread.started", "turn.started", "agent-turn-complete", "item.started", "item.completed"]';
 
@@ -89,6 +113,7 @@ export async function setupCodexHook(): Promise<HookSetupResult> {
     .split("\n")
     .filter((line) => {
       const trimmed = line.trim();
+      if (trimmed === "# Added by consensus-cli") return false;
       if (!trimmed.startsWith("notify =")) return true;
       if (trimmed.includes("/api/codex-event")) return false;
       return true;
@@ -100,18 +125,17 @@ export async function setupCodexHook(): Promise<HookSetupResult> {
     (line) => !line.trim().startsWith("notifications =")
   );
   const lines: string[] = withoutNotifications.filter((line) => line.trim() !== "");
-  lines.push("");
-  lines.push("# Added by consensus-cli");
-  lines.push(notifyLine);
+  const notifyBlock = ["", "# Added by consensus-cli", notifyLine];
   if (!hasTuiSection) {
-    lines.push("");
-    lines.push("[tui]");
-    lines.push(notificationsLine);
+    lines.push(...notifyBlock, "", "[tui]", notificationsLine);
   } else {
     const tuiIndex = lines.findIndex((line) => line.trim() === "[tui]");
+    const insertNotifyAt = tuiIndex === -1 ? lines.length : tuiIndex;
+    lines.splice(insertNotifyAt, 0, ...notifyBlock);
+    const updatedTuiIndex = lines.findIndex((line) => line.trim() === "[tui]");
     const insertAt = (() => {
-      if (tuiIndex === -1) return lines.length;
-      for (let i = tuiIndex + 1; i < lines.length; i += 1) {
+      if (updatedTuiIndex === -1) return lines.length;
+      for (let i = updatedTuiIndex + 1; i < lines.length; i += 1) {
         const trimmed = lines[i].trim();
         if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
           return i;

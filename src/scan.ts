@@ -89,6 +89,54 @@ const START_MS_EPSILON_MS = 1000;
 
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
 
+const windowsPsListMaxBuffer = 32 * 1024 * 1024;
+
+async function listWindowsProcesses(): Promise<PsProcess[]> {
+  const script =
+    "Get-CimInstance Win32_Process | " +
+    "Select-Object ProcessId, ParentProcessId, Name, CommandLine | " +
+    "ConvertTo-Json -Compress";
+  const { stdout } = await execFileAsync(
+    "powershell",
+    ["-NoProfile", "-Command", script],
+    { maxBuffer: windowsPsListMaxBuffer }
+  );
+  const trimmed = stdout.trim();
+  if (!trimmed) return [];
+  const data = JSON.parse(trimmed) as
+    | {
+        ProcessId?: number;
+        ParentProcessId?: number;
+        Name?: string;
+        CommandLine?: string;
+      }
+    | Array<{
+        ProcessId?: number;
+        ParentProcessId?: number;
+        Name?: string;
+        CommandLine?: string;
+      }>;
+  const rows = Array.isArray(data) ? data : [data];
+  return rows.map(
+    (row) =>
+      ({
+        pid: row.ProcessId ?? 0,
+        ppid: row.ParentProcessId,
+        name: row.Name ?? "",
+        cmd: row.CommandLine ?? "",
+      }) as PsProcess
+  );
+}
+
+async function listProcesses(): Promise<PsProcess[]> {
+  try {
+    return await psList();
+  } catch (err) {
+    if (process.platform !== "win32") throw err;
+    return await listWindowsProcesses();
+  }
+}
+
 function logActivityDecision(message: string): void {
   if (!isDebugActivity()) return;
   process.stderr.write(`[consensus][activity] ${message}\n`);
@@ -576,7 +624,7 @@ async function getStartTimesForPidsWindows(pids: number[]): Promise<Map<number, 
     "Get-CimInstance Win32_Process -Filter",
     `'${filter}'`,
     "| Select-Object ProcessId,",
-    "@{Name='StartMs';Expression={[int64](([System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate).ToUniversalTime() - [DateTime]::Parse('1970-01-01T00:00:00Z')).TotalMilliseconds)}}",
+    "@{Name='StartMs';Expression={$dt=$_.CreationDate; if ($dt -is [string]) { $dt = [System.Management.ManagementDateTimeConverter]::ToDateTime($dt) } [int64](($dt.ToUniversalTime() - [DateTime]::Parse('1970-01-01T00:00:00Z')).TotalMilliseconds)}}",
     "| ConvertTo-Json -Compress",
   ].join(" ");
   const run = async (shell: string): Promise<string> => {
@@ -766,7 +814,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     jsonlByPid = processCache.jsonlByPid || new Map();
   } else {
     const psTimer = startProfile("psList");
-    processes = await psList();
+    processes = await listProcesses();
     endProfile(psTimer, { count: processes.length });
   }
   const codexWrapperProcs = processes.filter((proc) =>
@@ -1080,6 +1128,28 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const normalizeSessionPath = (value?: string): string | undefined =>
     value ? path.resolve(value) : undefined;
   const jsonlPathSet = new Set<string>();
+  const pickSessionByStartMs = (
+    sessionsList: SessionFile[],
+    startMs?: number,
+    usedPaths?: Set<string>,
+    allowReuse?: boolean
+  ): SessionFile | undefined => {
+    if (!startMs) return undefined;
+    let best: SessionFile | undefined;
+    let bestDelta = Number.POSITIVE_INFINITY;
+    for (const session of sessionsList) {
+      const resolvedPath = normalizeSessionPath(session.path);
+      if (resolvedPath && usedPaths?.has(resolvedPath) && !allowReuse) continue;
+      const sessionStart =
+        getSessionStartMsFromPath(session.path) ?? session.mtimeMs;
+      const delta = Math.abs(sessionStart - startMs);
+      if (delta < bestDelta) {
+        best = session;
+        bestDelta = delta;
+      }
+    }
+    return best;
+  };
 
   const jsonlPaths = Array.from(
     new Set(
@@ -1158,6 +1228,14 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
     if (!session && cwdRaw) {
       session = await findSessionByCwd(sessions, cwdRaw, startMs);
+    }
+    if (!session && process.platform === "win32") {
+      session = pickSessionByStartMs(
+        sessions,
+        startMs,
+        usedSessionPaths,
+        allowReuse
+      );
     }
     const sessionPath = normalizeSessionPath(session?.path);
     if (sessionPath) {
