@@ -6,3 +6,9 @@ tmp/
 .DS_Store
 .env
 .env.local
+.envrc
+.brv/
+coverage/
+coverage-v8/
+claude-hook-check.png
+*.webm
