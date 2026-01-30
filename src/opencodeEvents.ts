@@ -89,7 +89,13 @@ function logDebug(message: string): void {
 
 function expireInFlight(state: ActivityState, now: number): void {
   if (!state.inFlight) return;
-  if (typeof state.lastStatusAt === "number") return;
+  if (typeof state.lastStatusAt === "number") {
+    if (now - state.lastStatusAt <= INFLIGHT_TIMEOUT_MS) {
+      return;
+    }
+    state.lastStatusAt = undefined;
+    state.lastStatus = undefined;
+  }
   const lastSignal = state.lastInFlightSignalAt ?? state.lastActivityAt ?? state.lastEventAt;
   if (typeof lastSignal === "number" && now - lastSignal > INFLIGHT_TIMEOUT_MS) {
     state.inFlight = false;

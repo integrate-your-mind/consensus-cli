@@ -1000,6 +1000,10 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     string,
     Awaited<ReturnType<typeof getOpenCodeSessionActivity>>
   >();
+  const opencodeStatusFreshMs = Math.max(
+    2500,
+    resolveMs(process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS, 2500)
+  );
   const getCachedOpenCodeSessionActivity = async (sessionId: string) => {
     const cached = opencodeMessageActivityCache.get(sessionId);
     if (cached) return cached;
@@ -1032,7 +1036,10 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
             }
             const statusActivity = getOpenCodeActivityBySession(id);
             const statusValue = statusActivity?.lastStatus?.toLowerCase();
-            if (statusValue) {
+            const statusAt = statusActivity?.lastStatusAt;
+            const statusFresh =
+              typeof statusAt === "number" && now - statusAt <= opencodeStatusFreshMs;
+            if (statusValue && statusFresh) {
               if (statusValue !== "idle") {
                 activeIds.push(id);
               }
@@ -1627,8 +1634,14 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         ? getOpenCodeActivityBySession(sessionId) || getOpenCodeActivityByPid(proc.pid)
         : null;
     const statusAuthority = eventActivity?.lastStatus;
+    const statusAuthorityAt = eventActivity?.lastStatusAt;
+    const statusAuthorityFresh =
+      typeof statusAuthorityAt === "number" &&
+      now - statusAuthorityAt <= opencodeStatusFreshMs;
     const statusAuthorityLower =
-      typeof statusAuthority === "string" ? statusAuthority.toLowerCase() : undefined;
+      statusAuthorityFresh && typeof statusAuthority === "string"
+        ? statusAuthority.toLowerCase()
+        : undefined;
     const statusAuthorityIsIdle = statusAuthorityLower === "idle";
     const statusAuthorityIsBusy =
       !!statusAuthorityLower && statusAuthorityLower !== "idle";

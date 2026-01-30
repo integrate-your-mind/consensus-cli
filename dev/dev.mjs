@@ -52,7 +52,6 @@ const tsc = spawnChild("tsc", [
   "--pretty",
   "false",
 ]);
-const server = spawnChild("server", [tsxPath, "watch", "src/server.ts"]);
 
 const parsePort = (value) => {
   const num = Number(value);
@@ -65,6 +64,77 @@ const basePort =
   parsePort(process.env.CONSENSUS_UI_PORT) ??
   parsePort(process.env.VITE_PORT) ??
   5173;
+
+const baseServerPort = parsePort(process.env.CONSENSUS_PORT) ?? 8787;
+
+const startServer = async () => {
+  const maxAttempts = 6;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const port = baseServerPort + attempt;
+    process.stderr.write(`[dev] starting server on port ${port}\n`);
+
+    const child = spawn(
+      process.execPath,
+      [tsxPath, "watch", "src/server.ts"],
+      {
+        env: { ...process.env, CONSENSUS_PORT: String(port) },
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
+
+    let output = "";
+    let running = false;
+    const onData = (chunk) => {
+      const text = chunk.toString();
+      output += text;
+      process.stdout.write(text);
+    };
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+
+    child.on("exit", (code) => {
+      if (running) {
+        process.stderr.write(`[dev] server exited with ${code ?? 0}\n`);
+        shutdown(code ?? 1);
+      }
+    });
+
+    const result = await new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        running = true;
+        children.push(child);
+        resolve({ status: "running" });
+      }, 1500);
+
+      child.on("exit", (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const conflict = /EADDRINUSE|address already in use|port .* in use/i.test(
+          output
+        );
+        resolve({ status: conflict ? "conflict" : "exit", code });
+      });
+    });
+
+    if (result.status === "running") return;
+    if (result.status === "conflict") {
+      process.stderr.write(`[dev] port ${port} in use, trying next\n`);
+      continue;
+    }
+
+    process.stderr.write("[dev] server exited unexpectedly\n");
+    shutdown(1);
+    return;
+  }
+
+  process.stderr.write("[dev] failed to find an open port for server\n");
+  shutdown(1);
+};
 
 const startVite = async () => {
   const maxAttempts = 6;
@@ -127,6 +197,7 @@ const startVite = async () => {
   shutdown(1);
 };
 
+void startServer();
 void startVite();
 
 const shutdown = (code = 0) => {
@@ -138,7 +209,6 @@ const shutdown = (code = 0) => {
 };
 
 tsc.on("exit", (code) => shutdown(code ?? 0));
-server.on("exit", (code) => shutdown(code ?? 0));
 
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
