@@ -1150,7 +1150,14 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const allowReuse = hasExplicitSession || /\bresume\b/i.test(cmdRaw);
     const initialSessionPath = normalizeSessionPath(session?.path);
     if (initialSessionPath && usedSessionPaths.has(initialSessionPath) && !allowReuse) {
-      session = undefined;
+      const alternate = await findSessionByCwd(sessions, cwdRaw, startMs);
+      const alternatePath = normalizeSessionPath(alternate?.path);
+      if (alternate && alternatePath && alternatePath !== initialSessionPath) {
+        session = alternate;
+      }
+    }
+    if (!session && cwdRaw) {
+      session = await findSessionByCwd(sessions, cwdRaw, startMs);
     }
     const sessionPath = normalizeSessionPath(session?.path);
     if (sessionPath) {

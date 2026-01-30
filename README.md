@@ -95,7 +95,7 @@ consensus dev server running on http://127.0.0.1:8787
 - `CONSENSUS_CODEX_INFLIGHT_IDLE_MS`: Codex in-flight idle timeout in ms (default `30000`, set to `0` to disable).
 - `CONSENSUS_CODEX_CPU_SUSTAIN_MS`: sustained CPU window before Codex becomes active without logs (default `500`).
 - `CONSENSUS_CODEX_CPU_SPIKE`: Codex CPU spike threshold for immediate activation (default derived).
-- `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`: Codex in-flight timeout in ms (default `300`).
+- `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`: Codex in-flight timeout in ms (default `3000`).
 - `CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS`: Codex max event age for in-flight signals (default `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`).
 - `CONSENSUS_PROCESS_CACHE_MS`: process cache TTL in ms for full scans (default `1000`).
 - `CONSENSUS_PROCESS_CACHE_FAST_MS`: process cache TTL in ms for fast scans (default `500`).

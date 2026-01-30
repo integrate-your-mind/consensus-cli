@@ -126,7 +126,7 @@ All configuration is via environment variables.
   - Default: `30000`
   - Idle timeout to clear Codex in-flight when activity is stale. Set to `0` to disable.
 - `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`
-  - Default: `300`
+  - Default: `3000`
   - Hard timeout to clear Codex in-flight if no recent signals and file is not fresh.
 - `CONSENSUS_CODEX_FILE_FRESH_MS`
   - Default: `10000`

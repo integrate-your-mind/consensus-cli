@@ -760,7 +760,7 @@ test("response.completed clears in-flight even without turn end", async () => {
   };
   await fs.appendFile(file, `${JSON.stringify(completed)}\n`);
 
-  Date.now = () => 2_000;
+  Date.now = () => 5_000;
   const second = await updateTail(file);
   assert.ok(second);
   const secondSummary = summarizeTail(second);
@@ -811,6 +811,93 @@ test("does not expire in-flight codex state without explicit end when disabled",
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("review mode keeps in-flight until exited", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+  const originalNow = Date.now;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  delete process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS;
+  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+
+  const entered = {
+    type: "event_msg",
+    ts: 1,
+    payload: {
+      type: "entered_review_mode",
+      target: { type: "uncommittedChanges" },
+    },
+  };
+  await fs.writeFile(file, `${JSON.stringify(entered)}\n`);
+
+  Date.now = () => 1_000;
+  const stateStart = await updateTail(file);
+  assert.ok(stateStart);
+  const summaryStart = summarizeTail(stateStart);
+  assert.equal(summaryStart.inFlight, true);
+
+  Date.now = () => 10_000;
+  const stateLater = await updateTail(file);
+  assert.ok(stateLater);
+  const summaryLater = summarizeTail(stateLater);
+  assert.equal(summaryLater.inFlight, true);
+
+  const exited = {
+    type: "event_msg",
+    ts: 11,
+    payload: {
+      type: "exited_review_mode",
+    },
+  };
+  await fs.appendFile(file, `${JSON.stringify(exited)}\n`);
+
+  Date.now = () => 11_000;
+  const stateExit = await updateTail(file);
+  assert.ok(stateExit);
+  const summaryExit = summarizeTail(stateExit);
+  assert.equal(summaryExit.inFlight, false);
+
+  Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("open tool call keeps in-flight without new events", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+  const originalNow = Date.now;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "3000";
+  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+
+  const start = {
+    type: "response_item",
+    ts: 1,
+    payload: {
+      type: "function_call",
+      name: "mcp__brv__brv-query",
+      call_id: "call_1",
+      arguments: "{}",
+    },
+  };
+  await fs.writeFile(file, `${JSON.stringify(start)}\n`);
+
+  Date.now = () => 1_000;
+  const stateStart = await updateTail(file);
+  assert.ok(stateStart);
+  const summaryStart = summarizeTail(stateStart);
+  assert.equal(summaryStart.inFlight, true);
+
+  Date.now = () => 10_000;
+  const stateLater = await updateTail(file);
+  assert.ok(stateLater);
+  const summaryLater = summarizeTail(stateLater);
+  assert.equal(summaryLater.inFlight, true);
+
+  Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
 test("expires in-flight codex state by default", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
@@ -832,7 +919,7 @@ test("expires in-flight codex state by default", async () => {
   const summaryStart = summarizeTail(stateStart);
   assert.equal(summaryStart.inFlight, true);
 
-  Date.now = () => 2_000;
+  Date.now = () => 5_000;
   const stateLater = await updateTail(file);
   assert.ok(stateLater);
   const summaryLater = summarizeTail(stateLater);
@@ -864,7 +951,7 @@ test("invalid in-flight timeout falls back to default", async () => {
   const summaryStart = summarizeTail(stateStart);
   assert.equal(summaryStart.inFlight, true);
 
-  Date.now = () => 2_000;
+  Date.now = () => 5_000;
   const stateLater = await updateTail(file);
   assert.ok(stateLater);
   const summaryLater = summarizeTail(stateLater);

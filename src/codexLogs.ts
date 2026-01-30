@@ -41,6 +41,7 @@ interface TailState {
   inFlightStart?: boolean;
   lastInFlightSignalAt?: number;
   turnOpen?: boolean;
+  reviewMode?: boolean;
   openCallIds?: Set<string>;
   lastCommand?: EventSummary;
   lastEdit?: EventSummary;
@@ -658,7 +659,7 @@ function summarizeEvent(ev: any): {
 export async function updateTail(sessionPath: string): Promise<TailState | null> {
   const nowMs = Date.now();
   const inflightEnv = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  const defaultInflightTimeoutMs = 300;
+  const defaultInflightTimeoutMs = 3000;
   const inflightTimeoutMs = (() => {
     if (inflightEnv === undefined || inflightEnv.trim() === "") {
       return defaultInflightTimeoutMs;
@@ -716,6 +717,8 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     if (!state.inFlight) return;
     if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
     if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
+    if (state.reviewMode) return;
+    if (state.openCallIds && state.openCallIds.size > 0) return;
     if (fileFresh) {
       return;
     }
@@ -905,6 +908,8 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     const isTurnStart = combinedType.includes("turn.started");
     const isResponseDelta = responseDeltaTypes.has(typeStr) || responseDeltaTypes.has(payloadType);
     const isItemStarted = typeStr === "item.started" || payloadType === "item.started";
+    const isReviewEnter = payloadType === "entered_review_mode";
+    const isReviewExit = payloadType === "exited_review_mode";
     const itemStartWorkTypes = new Set([
       "command_execution",
       "mcp_tool_call",
@@ -948,6 +953,24 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
           state.inFlightStart = true;
           markInFlightSignal();
         }
+        state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
+      }
+      if (isReviewEnter) {
+        state.reviewMode = true;
+        state.turnOpen = true;
+        if (canSignal) {
+          state.inFlight = true;
+          state.inFlightStart = true;
+          markInFlightSignal();
+        }
+        state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
+      }
+      if (isReviewExit) {
+        state.reviewMode = false;
+        state.turnOpen = false;
+        state.inFlight = false;
+        state.inFlightStart = false;
+        clearActivitySignals();
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
     }
