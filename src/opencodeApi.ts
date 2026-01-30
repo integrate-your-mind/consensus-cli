@@ -189,6 +189,11 @@ export async function getOpenCodeSessionActivity(
   port: number = 4096,
   options?: OpenCodeApiOptions
 ): Promise<OpenCodeMessageActivityResult> {
+  const staleMsRaw = process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS;
+  const staleMs =
+    staleMsRaw !== undefined && staleMsRaw !== ""
+      ? Number(staleMsRaw)
+      : 0;
   const controller = new AbortController();
   const timeoutMs = options?.timeoutMs ?? 3000;
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -276,6 +281,7 @@ export async function getOpenCodeSessionActivity(
     // Also check for pending/running tool calls in message parts
     let hasPendingTool = false;
     let hasIncompletePart = false;
+    let latestPartStart: number | undefined;
     
     if (Array.isArray(latestAssistant.parts)) {
       for (const part of latestAssistant.parts) {
@@ -287,17 +293,29 @@ export async function getOpenCodeSessionActivity(
           }
         }
         // Check for parts with start but no end time (still in progress)
-        if (typeof part?.time?.start === "number" && typeof part?.time?.end !== "number") {
-          hasIncompletePart = true;
+        if (typeof part?.time?.start === "number") {
+          if (typeof part?.time?.end !== "number") {
+            hasIncompletePart = true;
+          }
+          latestPartStart = latestPartStart
+            ? Math.max(latestPartStart, part.time.start)
+            : part.time.start;
         }
       }
     }
     
     // Session is in flight if:
     // 1. Assistant message has no completed timestamp, OR
-    // 2. There's a pending/running tool call, OR
-    // 3. There's a part still in progress
-    let inFlight = !hasCompleted || hasPendingTool || hasIncompletePart;
+    // 2. There's a pending/running tool call
+    // Incomplete parts only matter when the message is not completed.
+    let inFlight = hasPendingTool || !hasCompleted;
+    const assistantCreatedAt = latestAssistant?.info?.time?.created;
+    const inFlightSignalAt =
+      !hasCompleted && typeof assistantCreatedAt === "number"
+        ? assistantCreatedAt
+        : hasPendingTool && typeof latestPartStart === "number"
+          ? latestPartStart
+          : undefined;
 
     if (!inFlight && latestMessageRole === "user" && typeof latestMessageAt === "number") {
       const windowMsRaw = process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS;
@@ -310,6 +328,16 @@ export async function getOpenCodeSessionActivity(
       }
     }
     
+    if (inFlight && Number.isFinite(staleMs) && staleMs > 0) {
+      if (typeof inFlightSignalAt === "number") {
+        if (Date.now() - inFlightSignalAt > staleMs) {
+          inFlight = false;
+        }
+      } else if (typeof latestActivityAt !== "number") {
+        inFlight = false;
+      }
+    }
+
     return {
       ok: true,
       inFlight,

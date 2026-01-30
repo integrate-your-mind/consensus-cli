@@ -13,7 +13,7 @@ interface CanvasSceneProps {
   onSelect: (agent: AgentSnapshot | null) => void;
   onMouseDown: (e: React.MouseEvent) => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
-  onWheel: (e: React.WheelEvent) => void;
+  onWheel: (e: WheelEvent) => void;
 }
 
 export function CanvasScene({
@@ -92,6 +92,16 @@ export function CanvasScene({
     setHovered(null);
   }, []);
 
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const handleWheel = (e: WheelEvent) => onWheel(e);
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      canvas.removeEventListener('wheel', handleWheel);
+    };
+  }, [canvasRef, onWheel]);
+
   const handleClick = useCallback((e: React.MouseEvent) => {
     // First try hovered state, otherwise calculate from click position
     if (hovered) {
@@ -118,7 +128,6 @@ export function CanvasScene({
         onClick={handleClick}
         onMouseDown={onMouseDown}
         onKeyDown={onKeyDown}
-        onWheel={onWheel}
       />
       <Tooltip agent={hovered} x={tooltipPos.x} y={tooltipPos.y} />
     </div>

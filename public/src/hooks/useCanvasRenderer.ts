@@ -44,6 +44,18 @@ interface HitItem {
   markerY?: number;
 }
 
+interface CanvasRendererHook {
+  canvasRef: React.RefObject<HTMLCanvasElement>;
+  startRender: (
+    view: ViewState,
+    agents: AgentSnapshot[],
+    options: RendererOptions
+  ) => void;
+  stopRender: () => void;
+  getAgentAtPoint: (screenX: number, screenY: number) => AgentSnapshot | null;
+  getHitList: () => HitItem[];
+}
+
 function drawRoundedRect(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -367,7 +379,7 @@ function renderFrame(context: RenderContext): HitItem[] {
   return hitList;
 }
 
-export function useCanvasRenderer() {
+export function useCanvasRenderer(): CanvasRendererHook {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const hitListRef = useRef<HitItem[]>([]);
   const rafRef = useRef<number | null>(null);

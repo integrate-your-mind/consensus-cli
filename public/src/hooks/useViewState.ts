@@ -26,7 +26,7 @@ export function useViewState(
 ): [ViewState, ViewActions, DragState, {
   onMouseDown: (e: React.MouseEvent) => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
-  onWheel: (e: React.WheelEvent) => void;
+  onWheel: (e: WheelEvent) => void;
 }] {
   const [view, setView] = useState<ViewState>({
     x: initialView.x ?? window.innerWidth / 2,
@@ -149,7 +149,7 @@ export function useViewState(
     }
   }, [pan, zoom]);
 
-  const onWheel = useCallback((e: React.WheelEvent) => {
+  const onWheel = useCallback((e: WheelEvent) => {
     e.preventDefault();
     const delta = Math.sign(e.deltaY) * -WHEEL_SENSITIVITY;
     zoom(delta);

@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { getOpenCodeSessionActivity } from "../../src/opencodeApi.ts";
 
+const originalStale = process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS;
+process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS = "0";
+
 type ServerHandle = { server: http.Server; port: number };
 
 async function startServer(
@@ -47,6 +50,14 @@ test("getOpenCodeSessionActivity detects in-flight assistant message", async () 
     assert.equal(result.lastActivityAt, 2000);
   } finally {
     await closeServer(server);
+  }
+});
+
+process.on("exit", () => {
+  if (originalStale === undefined) {
+    delete process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS;
+  } else {
+    process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS = originalStale;
   }
 });
 

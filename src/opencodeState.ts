@@ -2,7 +2,7 @@ import type { AgentState } from "./types.js";
 import type { ActivityHoldResult } from "./activity.js";
 import { deriveStateWithHold } from "./activity.js";
 
-const DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS = 15000;
+const DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS = 2500;
 
 export interface OpenCodeStateInput {
   hasError: boolean;
@@ -33,7 +33,7 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
     return { state, lastActiveAt: input.inFlight ? now : undefined, reason };
   }
   const holdMs =
-    input.holdMs ?? Number(process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS || 3000);
+    input.holdMs ?? Number(process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS || 0);
   const envInFlightIdle = process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS;
   const envInFlightTimeout = process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS;
   let inFlightIdleMs: number | undefined =
