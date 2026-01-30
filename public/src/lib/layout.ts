@@ -10,6 +10,15 @@ const CELL_H = TILE_H;
 const MAX_PULSE = 7;
 const MAX_LAYOUT_HEIGHT = 120 + MAX_PULSE;
 const CELL_OFFSET = 32768;
+const DEV_ASSERTS = (() => {
+  const meta = typeof import.meta !== 'undefined' ? (import.meta as { env?: { MODE?: string } }) : undefined;
+  const mode = meta?.env?.MODE;
+  if (mode) return mode !== 'production';
+  if (typeof process !== 'undefined' && process?.env?.NODE_ENV) {
+    return process.env.NODE_ENV !== 'production';
+  }
+  return false;
+})();
 
 type CellBucket = string | string[];
 
@@ -96,6 +105,16 @@ function worldToCellY(y: number): number {
 }
 
 function packCell(cx: number, cy: number): number {
+  if (DEV_ASSERTS) {
+    if (
+      cx < -CELL_OFFSET ||
+      cx > CELL_OFFSET - 1 ||
+      cy < -CELL_OFFSET ||
+      cy > CELL_OFFSET - 1
+    ) {
+      throw new Error(`cell out of range: (${cx}, ${cy})`);
+    }
+  }
   const ux = (cx + CELL_OFFSET) & 0xffff;
   const uy = (cy + CELL_OFFSET) & 0xffff;
   return ((ux << 16) | uy) >>> 0;
@@ -485,6 +504,54 @@ export function setLayoutPositions(
     if (!group.spiral.started) {
       group.anchor = coord;
       group.spiral = spiralInit(coord);
+    }
+  }
+}
+
+export function debugCellRangeForBounds(bounds: {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+}): { minCx: number; maxCx: number; minCy: number; maxCy: number } {
+  return cellRangeForBounds(bounds as BoundsRect);
+}
+
+export function validateSpatialIndex(spatial: {
+  cells: Map<number, CellBucket>;
+  bounds: Map<string, BoundsRect>;
+}): void {
+  const bucketToArray = (bucket: CellBucket): string[] =>
+    typeof bucket === 'string' ? [bucket] : bucket;
+
+  for (const [key, bucket] of spatial.cells.entries()) {
+    const { cx, cy } = unpackCell(key >>> 0);
+    for (const id of bucketToArray(bucket)) {
+      const bounds = spatial.bounds.get(id);
+      if (!bounds) {
+        throw new Error(`cell references missing bounds: ${id}`);
+      }
+      const range = cellRangeForBounds(bounds);
+      if (cx < range.minCx || cx > range.maxCx || cy < range.minCy || cy > range.maxCy) {
+        throw new Error(`cell/bounds mismatch for ${id} at cell (${cx}, ${cy})`);
+      }
+    }
+  }
+
+  for (const [id, bounds] of spatial.bounds.entries()) {
+    const range = cellRangeForBounds(bounds);
+    for (let cx = range.minCx; cx <= range.maxCx; cx += 1) {
+      for (let cy = range.minCy; cy <= range.maxCy; cy += 1) {
+        const key = packCell(cx, cy) >>> 0;
+        const bucket = spatial.cells.get(key);
+        if (!bucket) {
+          throw new Error(`missing cell for ${id} at (${cx}, ${cy})`);
+        }
+        const entries = bucketToArray(bucket);
+        if (!entries.includes(id)) {
+          throw new Error(`agent ${id} missing from cell (${cx}, ${cy})`);
+        }
+      }
     }
   }
 }
