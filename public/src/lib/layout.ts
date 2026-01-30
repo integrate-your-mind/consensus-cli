@@ -5,8 +5,13 @@ import { isoToScreen } from './iso';
 const GRID_SCALE = 2;
 const TILE_W = 96;
 const TILE_H = 48;
+const CELL_W = TILE_W;
+const CELL_H = TILE_H;
 const MAX_PULSE = 7;
 const MAX_LAYOUT_HEIGHT = 120 + MAX_PULSE;
+const CELL_OFFSET = 32768;
+
+type CellBucket = string | string[];
 
 interface BoundsRect {
   left: number;
@@ -15,20 +20,50 @@ interface BoundsRect {
   bottom: number;
 }
 
+interface SpatialIndex {
+  cells: Map<number, CellBucket>;
+  bounds: Map<string, BoundsRect>;
+}
+
+interface SpiralState {
+  cx: number;
+  cy: number;
+  dir: 0 | 1 | 2 | 3;
+  legLen: number;
+  legProgress: number;
+  legsAtLen: 0 | 1;
+  started: boolean;
+}
+
+interface GroupState {
+  anchor: Coordinate;
+  spiral: SpiralState;
+  freeStack: number[];
+}
+
 export interface LayoutState {
   layout: Map<string, Coordinate>;
-  occupied: Map<string, string>;
-  bounds: Map<string, BoundsRect>;
   groupAnchors: Map<string, Coordinate>;
+  agentGroupKey: Map<string, string>;
+  groups: Map<string, GroupState>;
+  spatial: SpatialIndex;
+  seenGen: Map<string, number>;
+  generation: number;
   locked: boolean;
 }
 
 export function createLayoutState(): LayoutState {
   return {
     layout: new Map(),
-    occupied: new Map(),
-    bounds: new Map(),
     groupAnchors: new Map(),
+    agentGroupKey: new Map(),
+    groups: new Map(),
+    spatial: {
+      cells: new Map(),
+      bounds: new Map(),
+    },
+    seenGen: new Map(),
+    generation: 0,
     locked: false,
   };
 }
@@ -45,10 +80,66 @@ function hashString(input: string): number {
 function layoutIdForAgent(agent: AgentSnapshot): string {
   const identity = agentIdentity(agent);
   if (identity) return identity;
+  if (typeof agent.pid === 'number') return `${agent.pid}`;
+  if (agent.id) return agent.id;
   const groupKey = groupKeyForAgent(agent);
   if (groupKey) return groupKey;
-  if (typeof agent.pid === 'number') return `${agent.pid}`;
-  return agent.id || 'unknown';
+  return 'unknown';
+}
+
+function worldToCellX(x: number): number {
+  return Math.floor(x / CELL_W);
+}
+
+function worldToCellY(y: number): number {
+  return Math.floor(y / CELL_H);
+}
+
+function packCell(cx: number, cy: number): number {
+  const ux = (cx + CELL_OFFSET) & 0xffff;
+  const uy = (cy + CELL_OFFSET) & 0xffff;
+  return ((ux << 16) | uy) >>> 0;
+}
+
+function unpackCell(key: number): { cx: number; cy: number } {
+  const ux = key >>> 16;
+  const uy = key & 0xffff;
+  return { cx: ux - CELL_OFFSET, cy: uy - CELL_OFFSET };
+}
+
+function cellToWorld(cx: number, cy: number): Coordinate {
+  return { x: cx * GRID_SCALE, y: cy * GRID_SCALE };
+}
+
+function gridKeyFromWorld(coord: Coordinate): number {
+  const cx = Math.round(coord.x / GRID_SCALE);
+  const cy = Math.round(coord.y / GRID_SCALE);
+  return packCell(cx, cy);
+}
+
+function bucketAdd(bucket: CellBucket | undefined, id: string): CellBucket {
+  if (bucket === undefined) return id;
+  if (typeof bucket === 'string') {
+    if (bucket === id) return bucket;
+    return [bucket, id];
+  }
+  for (let i = 0; i < bucket.length; i += 1) {
+    if (bucket[i] === id) return bucket;
+  }
+  bucket.push(id);
+  return bucket;
+}
+
+function bucketRemove(bucket: CellBucket | undefined, id: string): CellBucket | undefined {
+  if (bucket === undefined) return undefined;
+  if (typeof bucket === 'string') return bucket === id ? undefined : bucket;
+  const index = bucket.indexOf(id);
+  if (index === -1) return bucket;
+  const last = bucket.pop();
+  if (last === undefined) return undefined;
+  if (index < bucket.length) bucket[index] = last;
+  if (bucket.length === 1) return bucket[0];
+  return bucket.length ? bucket : undefined;
 }
 
 function boundsForCoord(coord: Coordinate): BoundsRect {
@@ -67,46 +158,123 @@ function boundsIntersect(a: BoundsRect, b: BoundsRect): boolean {
   return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 }
 
-function hasBoundsOverlap(testBounds: BoundsRect, placedBounds: Map<string, BoundsRect>): boolean {
-  for (const bounds of placedBounds.values()) {
-    if (boundsIntersect(testBounds, bounds)) return true;
+function cellRangeForBounds(bounds: BoundsRect): {
+  minCx: number;
+  maxCx: number;
+  minCy: number;
+  maxCy: number;
+} {
+  const minCx = worldToCellX(bounds.left);
+  const maxCx = worldToCellX(bounds.right - 1);
+  const minCy = worldToCellY(bounds.top);
+  const maxCy = worldToCellY(bounds.bottom - 1);
+  return { minCx, maxCx, minCy, maxCy };
+}
+
+function indexAgent(id: string, coord: Coordinate, spatial: SpatialIndex): void {
+  const bounds = boundsForCoord(coord);
+  spatial.bounds.set(id, bounds);
+
+  const range = cellRangeForBounds(bounds);
+  for (let cx = range.minCx; cx <= range.maxCx; cx += 1) {
+    for (let cy = range.minCy; cy <= range.maxCy; cy += 1) {
+      const key = packCell(cx, cy);
+      const bucket = spatial.cells.get(key);
+      spatial.cells.set(key, bucketAdd(bucket, id));
+    }
   }
-  return false;
 }
 
-function tryPlaceCoordinate(
-  coord: Coordinate,
-  nextOccupied: Map<string, string>,
-  nextBounds: Map<string, BoundsRect>
-): { coord: Coordinate; bounds: BoundsRect; cellKey: string } | null {
-  const cellKey = `${coord.x / GRID_SCALE},${coord.y / GRID_SCALE}`;
-  if (nextOccupied.has(cellKey)) return null;
-  const testBounds = boundsForCoord(coord);
-  if (hasBoundsOverlap(testBounds, nextBounds)) return null;
-  return { coord, bounds: testBounds, cellKey };
-}
+function unindexAgent(id: string, spatial: SpatialIndex): void {
+  const bounds = spatial.bounds.get(id);
+  if (!bounds) return;
 
-function findPlacementNearAnchor(
-  anchor: Coordinate,
-  maxRadius: number,
-  nextOccupied: Map<string, string>,
-  nextBounds: Map<string, BoundsRect>
-): { coord: Coordinate; bounds: BoundsRect; cellKey: string } | null {
-  const baseX = Math.round(anchor.x / GRID_SCALE);
-  const baseY = Math.round(anchor.y / GRID_SCALE);
-
-  for (let radius = 0; radius <= maxRadius; radius += 1) {
-    for (let dx = -radius; dx <= radius; dx += 1) {
-      for (let dy = -radius; dy <= radius; dy += 1) {
-        if (Math.abs(dx) !== radius && Math.abs(dy) !== radius) continue;
-        const coord = { x: (baseX + dx) * GRID_SCALE, y: (baseY + dy) * GRID_SCALE };
-        const placed = tryPlaceCoordinate(coord, nextOccupied, nextBounds);
-        if (placed) return placed;
+  const range = cellRangeForBounds(bounds);
+  for (let cx = range.minCx; cx <= range.maxCx; cx += 1) {
+    for (let cy = range.minCy; cy <= range.maxCy; cy += 1) {
+      const key = packCell(cx, cy);
+      const bucket = spatial.cells.get(key);
+      const next = bucketRemove(bucket, id);
+      if (next === undefined) {
+        spatial.cells.delete(key);
+      } else {
+        spatial.cells.set(key, next);
       }
     }
   }
 
-  return null;
+  spatial.bounds.delete(id);
+}
+
+function hasCollision(bounds: BoundsRect, spatial: SpatialIndex): boolean {
+  const range = cellRangeForBounds(bounds);
+  for (let cx = range.minCx; cx <= range.maxCx; cx += 1) {
+    for (let cy = range.minCy; cy <= range.maxCy; cy += 1) {
+      const key = packCell(cx, cy);
+      const bucket = spatial.cells.get(key);
+      if (!bucket) continue;
+      if (typeof bucket === 'string') {
+        const other = spatial.bounds.get(bucket);
+        if (other && boundsIntersect(bounds, other)) return true;
+      } else {
+        for (let i = 0; i < bucket.length; i += 1) {
+          const other = spatial.bounds.get(bucket[i]);
+          if (other && boundsIntersect(bounds, other)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function spiralInit(anchor: Coordinate): SpiralState {
+  const cx = Math.round(anchor.x / GRID_SCALE);
+  const cy = Math.round(anchor.y / GRID_SCALE);
+  return {
+    cx,
+    cy,
+    dir: 0,
+    legLen: 1,
+    legProgress: 0,
+    legsAtLen: 0,
+    started: false,
+  };
+}
+
+function spiralNext(state: SpiralState): { cx: number; cy: number } {
+  if (!state.started) {
+    state.started = true;
+    return { cx: state.cx, cy: state.cy };
+  }
+
+  switch (state.dir) {
+    case 0:
+      state.cx += 1;
+      break;
+    case 1:
+      state.cy -= 1;
+      break;
+    case 2:
+      state.cx -= 1;
+      break;
+    case 3:
+      state.cy += 1;
+      break;
+  }
+
+  state.legProgress += 1;
+  if (state.legProgress === state.legLen) {
+    state.legProgress = 0;
+    state.dir = ((state.dir + 1) & 3) as 0 | 1 | 2 | 3;
+    if (state.legsAtLen === 1) {
+      state.legsAtLen = 0;
+      state.legLen += 1;
+    } else {
+      state.legsAtLen = 1;
+    }
+  }
+
+  return { cx: state.cx, cy: state.cy };
 }
 
 function hashedAnchorForGroup(groupKey: string): Coordinate {
@@ -116,22 +284,97 @@ function hashedAnchorForGroup(groupKey: string): Coordinate {
   return { x: baseX * GRID_SCALE, y: baseY * GRID_SCALE };
 }
 
+function ensureGroupState(
+  state: LayoutState,
+  groupKey: string,
+  fallbackAnchor?: Coordinate
+): GroupState {
+  let group = state.groups.get(groupKey);
+  if (!group) {
+    const anchor = state.groupAnchors.get(groupKey) ?? fallbackAnchor ?? hashedAnchorForGroup(groupKey);
+    group = {
+      anchor,
+      spiral: spiralInit(anchor),
+      freeStack: [],
+    };
+    state.groups.set(groupKey, group);
+    if (!state.groupAnchors.has(groupKey)) {
+      state.groupAnchors.set(groupKey, anchor);
+    }
+  } else if (!state.groupAnchors.has(groupKey)) {
+    state.groupAnchors.set(groupKey, group.anchor);
+  }
+  return group;
+}
+
+function findPlacement(
+  group: GroupState,
+  spatial: SpatialIndex,
+  maxAttempts = 256
+): Coordinate | null {
+  while (group.freeStack.length) {
+    const key = group.freeStack.pop();
+    if (key === undefined) break;
+    const { cx, cy } = unpackCell(key);
+    const coord = cellToWorld(cx, cy);
+    const bounds = boundsForCoord(coord);
+    if (!hasCollision(bounds, spatial)) return coord;
+  }
+
+  for (let i = 0; i < maxAttempts; i += 1) {
+    const { cx, cy } = spiralNext(group.spiral);
+    const coord = cellToWorld(cx, cy);
+    const bounds = boundsForCoord(coord);
+    if (!hasCollision(bounds, spatial)) return coord;
+  }
+
+  return null;
+}
+
+function addAgent(
+  state: LayoutState,
+  id: string,
+  groupKey: string
+): void {
+  const hadGroup = state.groups.has(groupKey);
+  const group = ensureGroupState(state, groupKey);
+  const placement = findPlacement(group, state.spatial);
+  if (!placement) return;
+  state.layout.set(id, placement);
+  state.agentGroupKey.set(id, groupKey);
+  indexAgent(id, placement, state.spatial);
+
+  if (!hadGroup) {
+    group.anchor = placement;
+    group.spiral = spiralInit(placement);
+    state.groupAnchors.set(groupKey, placement);
+  }
+}
+
+function removeAgent(state: LayoutState, id: string): void {
+  const coord = state.layout.get(id);
+  if (coord) {
+    unindexAgent(id, state.spatial);
+  }
+  state.layout.delete(id);
+
+  const groupKey = state.agentGroupKey.get(id);
+  if (groupKey && coord) {
+    const group = state.groups.get(groupKey);
+    if (group) {
+      group.freeStack.push(gridKeyFromWorld(coord));
+    }
+  }
+  state.agentGroupKey.delete(id);
+}
+
 export function assignCoordinate(
   state: LayoutState,
   key: string,
   baseKey: string
 ): void {
   if (state.layout.has(key)) return;
-  const anchor = state.groupAnchors.get(baseKey) ?? hashedAnchorForGroup(baseKey || key);
-  const maxRadius = Math.max(24, Math.ceil(Math.sqrt(state.layout.size + 1)) * 32);
-  const placement = findPlacementNearAnchor(anchor, maxRadius, state.occupied, state.bounds);
-  if (!placement) return;
-  state.layout.set(key, placement.coord);
-  state.occupied.set(placement.cellKey, key);
-  state.bounds.set(key, placement.bounds);
-  if (!state.groupAnchors.has(baseKey)) {
-    state.groupAnchors.set(baseKey, placement.coord);
-  }
+  addAgent(state, key, baseKey || key);
 }
 
 export function updateLayout(
@@ -139,74 +382,49 @@ export function updateLayout(
   agents: AgentSnapshot[]
 ): void {
   if (state.locked) return;
+
   if (agents.length === 0) {
     state.layout.clear();
-    state.occupied.clear();
-    state.bounds.clear();
     state.groupAnchors.clear();
+    state.agentGroupKey.clear();
+    state.groups.clear();
+    state.spatial.cells.clear();
+    state.spatial.bounds.clear();
+    state.seenGen.clear();
     return;
   }
 
-  const agentMap = new Map<string, { agent: AgentSnapshot; groupKey: string }>();
+  state.generation += 1;
+  const gen = state.generation;
+  const added: Array<{ id: string; agent: AgentSnapshot; groupKey: string }> = [];
+
   for (const agent of agents) {
     const id = layoutIdForAgent(agent);
     const groupKey = groupKeyForAgent(agent) || id;
-    agentMap.set(id, { agent, groupKey });
+    state.seenGen.set(id, gen);
+    state.agentGroupKey.set(id, groupKey);
+
+    const existingCoord = state.layout.get(id);
+    if (existingCoord) {
+      ensureGroupState(state, groupKey, existingCoord);
+      continue;
+    }
+    added.push({ id, agent, groupKey });
   }
 
-  for (const id of state.layout.keys()) {
-    if (!agentMap.has(id)) {
-      const coord = state.layout.get(id);
-      if (coord) {
-        state.occupied.delete(`${coord.x / GRID_SCALE},${coord.y / GRID_SCALE}`);
-      }
-      state.layout.delete(id);
-      state.bounds.delete(id);
+  for (const id of Array.from(state.layout.keys())) {
+    if (state.seenGen.get(id) !== gen) {
+      removeAgent(state, id);
     }
   }
 
-  state.occupied.clear();
-  state.bounds.clear();
-  for (const [id, coord] of state.layout.entries()) {
-    state.occupied.set(`${coord.x / GRID_SCALE},${coord.y / GRID_SCALE}`, id);
-    state.bounds.set(id, boundsForCoord(coord));
-  }
+  added.sort((a, b) => {
+    if (a.groupKey === b.groupKey) return a.id.localeCompare(b.id);
+    return a.groupKey.localeCompare(b.groupKey);
+  });
 
-  const activeGroups = new Set<string>();
-  for (const { agent, groupKey } of agentMap.values()) {
-    activeGroups.add(groupKey);
-    if (!state.groupAnchors.has(groupKey)) {
-      const coord = state.layout.get(layoutIdForAgent(agent));
-      if (coord) state.groupAnchors.set(groupKey, coord);
-    }
-  }
-  for (const key of state.groupAnchors.keys()) {
-    if (!activeGroups.has(key)) state.groupAnchors.delete(key);
-  }
-
-  const addedAgents = Array.from(agentMap.values())
-    .filter(({ agent }) => !state.layout.has(layoutIdForAgent(agent)))
-    .sort((a, b) => {
-      if (a.groupKey === b.groupKey) {
-        return layoutIdForAgent(a.agent).localeCompare(layoutIdForAgent(b.agent));
-      }
-      return a.groupKey.localeCompare(b.groupKey);
-    });
-
-  const maxRadius = Math.max(32, Math.ceil(Math.sqrt(state.layout.size + addedAgents.length)) * 32);
-
-  for (const entry of addedAgents) {
-    const layoutId = layoutIdForAgent(entry.agent);
-    const groupKey = entry.groupKey || layoutId;
-    const anchor = state.groupAnchors.get(groupKey) ?? hashedAnchorForGroup(groupKey);
-    const placement = findPlacementNearAnchor(anchor, maxRadius, state.occupied, state.bounds);
-    if (!placement) continue;
-    state.layout.set(layoutId, placement.coord);
-    state.occupied.set(placement.cellKey, layoutId);
-    state.bounds.set(layoutId, placement.bounds);
-    if (!state.groupAnchors.has(groupKey)) {
-      state.groupAnchors.set(groupKey, placement.coord);
-    }
+  for (const entry of added) {
+    addAgent(state, entry.id, entry.groupKey);
   }
 }
 
@@ -231,11 +449,14 @@ export function setLayoutPositions(
   positions: Array<{ id?: string; pid?: number; x: number; y: number }>
 ): void {
   state.layout.clear();
-  state.occupied.clear();
-  state.bounds.clear();
   state.groupAnchors.clear();
+  state.agentGroupKey.clear();
+  state.groups.clear();
+  state.spatial.cells.clear();
+  state.spatial.bounds.clear();
+  state.seenGen.clear();
   state.locked = true;
-  
+
   const byIdentity = new Map(
     agents.map((agent) => [agentIdentity(agent), agent])
   );
@@ -244,21 +465,26 @@ export function setLayoutPositions(
       .filter((agent) => typeof agent.pid === 'number')
       .map((agent) => [`${agent.pid}`, agent])
   );
-  
+
   for (const entry of positions) {
     const keyId = entry?.id ?? entry?.pid;
     if (keyId === undefined || keyId === null) continue;
     const agent =
       byIdentity.get(String(keyId)) || byPid.get(String(keyId)) || null;
     if (!agent) continue;
-    const key = layoutIdForAgent(agent);
+    const id = layoutIdForAgent(agent);
+    const groupKey = groupKeyForAgent(agent) || id;
     const coord = { x: Number(entry.x) || 0, y: Number(entry.y) || 0 };
-    state.layout.set(key, coord);
-    state.occupied.set(`${coord.x / GRID_SCALE},${coord.y / GRID_SCALE}`, key);
-    state.bounds.set(key, boundsForCoord(coord));
-    const groupKey = groupKeyForAgent(agent) || key;
+    state.layout.set(id, coord);
+    state.agentGroupKey.set(id, groupKey);
+    indexAgent(id, coord, state.spatial);
+    const group = ensureGroupState(state, groupKey, coord);
     if (!state.groupAnchors.has(groupKey)) {
       state.groupAnchors.set(groupKey, coord);
+    }
+    if (!group.spiral.started) {
+      group.anchor = coord;
+      group.spiral = spiralInit(coord);
     }
   }
 }
