@@ -1,10 +1,8 @@
 import type { AgentSnapshot } from '../types';
 import {
-  agentIdentity,
   labelFor,
   formatBytes,
   formatPercent,
-  escapeHtml,
   formatDate,
   formatDateFull,
 } from '../lib/format';
@@ -56,7 +54,7 @@ export function AgentPanel({ agent, showMetadata, onClose }: AgentPanelProps) {
           <div className="panel-list">
             <div>
               <span className="panel-key">name</span>
-              {escapeHtml(labelFor(agent))}
+              {labelFor(agent)}
             </div>
             <div>
               <span className="panel-key">pid</span>
@@ -64,16 +62,16 @@ export function AgentPanel({ agent, showMetadata, onClose }: AgentPanelProps) {
             </div>
             <div>
               <span className="panel-key">kind</span>
-              {escapeHtml(agent.kind)}
+              {agent.kind}
             </div>
             <div>
               <span className="panel-key">state</span>
-              {escapeHtml(agent.state)}
+              {agent.state}
             </div>
             {startedAt && (
               <div>
                 <span className="panel-key">started</span>
-                {escapeHtml(startedAt)}
+                {startedAt}
               </div>
             )}
           </div>
@@ -85,8 +83,8 @@ export function AgentPanel({ agent, showMetadata, onClose }: AgentPanelProps) {
             {summaryRows.length > 0 ? (
               summaryRows.map(([label, value]) => (
                 <div key={label}>
-                  <span className="panel-key">{escapeHtml(label)}</span>
-                  {escapeHtml(value)}
+                <span className="panel-key">{label}</span>
+                {value}
                 </div>
               ))
             ) : (
@@ -95,19 +93,19 @@ export function AgentPanel({ agent, showMetadata, onClose }: AgentPanelProps) {
             {agent.activityReason && (
               <div>
                 <span className="panel-key">activity reason</span>
-                {escapeHtml(agent.activityReason)}
+                {agent.activityReason}
               </div>
             )}
             {lastActivityAt && (
               <div>
                 <span className="panel-key">last activity</span>
-                {escapeHtml(lastActivityAt)}
+                {lastActivityAt}
               </div>
             )}
             {lastEventAt && (
               <div>
                 <span className="panel-key">last event</span>
-                {escapeHtml(lastEventAt)}
+                {lastEventAt}
               </div>
             )}
             <div>
@@ -127,23 +125,23 @@ export function AgentPanel({ agent, showMetadata, onClose }: AgentPanelProps) {
             <div className="panel-list">
               <div>
                 <span className="panel-key">repo</span>
-                {escapeHtml(agent.repo || '-')}
+                {agent.repo || '-'}
               </div>
               <div>
                 <span className="panel-key">cwd</span>
-                {escapeHtml(agent.cwd || '-')}
+                {agent.cwd || '-'}
               </div>
               <div>
                 <span className="panel-key">session</span>
-                {escapeHtml(agent.sessionPath || '-')}
+                {agent.sessionPath || '-'}
               </div>
               <div>
                 <span className="panel-key">cmd</span>
-                {escapeHtml(agent.cmd || '-')}
+                {agent.cmd || '-'}
               </div>
               <div>
                 <span className="panel-key">model</span>
-                {escapeHtml(agent.model || '-')}
+                {agent.model || '-'}
               </div>
             </div>
           </div>
@@ -164,7 +162,7 @@ export function AgentPanel({ agent, showMetadata, onClose }: AgentPanelProps) {
                 const time = new Date(ev.ts).toLocaleTimeString();
                 return (
                   <div key={i}>
-                    [{escapeHtml(time)}] {escapeHtml(truncate(ev.summary, 120))}
+                    [{time}] {truncate(ev.summary, 120)}
                   </div>
                 );
               })

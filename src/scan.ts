@@ -864,6 +864,24 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       }
       endProfile(refreshTimer, { count: refreshList.length });
     }
+    if (includeActivity && codexWrapperProcs.length > 0) {
+      const jsonlCandidates = Array.from(
+        new Set([
+          ...codexWrapperProcs.map((proc) => proc.pid),
+          ...codexVendorChildren.map((proc) => proc.pid),
+        ])
+      );
+      if (jsonlCandidates.length > 0) {
+        const jsonlTimer = startProfile("jsonl", "fast");
+        try {
+          jsonlByPid = await getJsonlForPids(jsonlCandidates);
+          processCache.jsonlByPid = jsonlByPid;
+        } catch {
+          // ignore refresh failures
+        }
+        endProfile(jsonlTimer, { count: jsonlByPid.size });
+      }
+    }
   }
   if (!shouldUseProcessCache) {
     const usageTimer = startProfile("pidusage");
@@ -1030,6 +1048,10 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     string,
     Awaited<ReturnType<typeof getOpenCodeSessionActivity>>
   >();
+  const opencodeStatusFreshMs = Math.max(
+    2500,
+    resolveMs(process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS, 2500)
+  );
   const getCachedOpenCodeSessionActivity = async (sessionId: string) => {
     const cached = opencodeMessageActivityCache.get(sessionId);
     if (cached) return cached;
@@ -1047,18 +1069,36 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const tasks: Promise<void>[] = [];
     for (const [dir, sessions] of opencodeAllSessionsByDir.entries()) {
       const tuiCount = opencodeTuiByDir.get(dir)?.length ?? 0;
-      if (tuiCount <= 1) continue;
-      const candidates = sessions.slice(0, Math.max(tuiCount, 2));
+      if (tuiCount === 0) continue;
+      const minCandidates = Math.max(tuiCount, 2);
       tasks.push(
         (async () => {
           const activeIds: string[] = [];
-          for (const session of candidates) {
+          let checked = 0;
+          for (const session of sessions) {
+            if (checked >= minCandidates && activeIds.length >= tuiCount) break;
             const id = getOpenCodeSessionId(session);
-            if (!id) continue;
+            if (!id) {
+              checked += 1;
+              continue;
+            }
+            const statusActivity = getOpenCodeActivityBySession(id);
+            const statusValue = statusActivity?.lastStatus?.toLowerCase();
+            const statusAt = statusActivity?.lastStatusAt;
+            const statusFresh =
+              typeof statusAt === "number" && now - statusAt <= opencodeStatusFreshMs;
+            if (statusValue && statusFresh) {
+              if (statusValue !== "idle") {
+                activeIds.push(id);
+              }
+              checked += 1;
+              continue;
+            }
             const activity = await getCachedOpenCodeSessionActivity(id);
             if (activity.ok && activity.inFlight) {
               activeIds.push(id);
             }
+            checked += 1;
           }
           if (activeIds.length > 0) {
             opencodeActiveSessionIdsByDir.set(dir, activeIds);
@@ -1105,7 +1145,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const seenIds = new Set<string>();
   const codexHoldMs = resolveMs(
     process.env.CONSENSUS_CODEX_ACTIVE_HOLD_MS,
-    3000
+    0
   );
   const codexEventIdleMs = resolveMs(
     process.env.CONSENSUS_CODEX_EVENT_IDLE_MS,
@@ -1122,6 +1162,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     sessionId?: string;
     session?: SessionFile;
     jsonlPaths?: string[];
+    reuseBlocked?: boolean;
   };
   const codexContexts: CodexContext[] = [];
   const usedSessionPaths = new Set<string>();
@@ -1206,28 +1247,48 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
     const directJsonl = jsonlByPid.get(proc.pid) || [];
     const childJsonl = childJsonlByPid.get(proc.pid) || [];
+    const jsonlPaths = Array.from(
+      new Set([...directJsonl, ...childJsonl].map(normalizeSessionPath).filter(Boolean))
+    ) as string[];
     const mappedJsonl = pickNewestJsonl([...directJsonl, ...childJsonl], jsonlMtimes);
-    let session =
-      mappedJsonl
-        ? { path: mappedJsonl, mtimeMs: jsonlMtimes.get(mappedJsonl) ?? now }
-        : undefined;
+    const startMsForCwd =
+      typeof startMs === "number" && now - startMs < 5 * 60_000 ? startMs : undefined;
+    const cwdSession = cwdRaw
+      ? await findSessionByCwd(sessions, cwdRaw, startMsForCwd, usedSessionPaths)
+      : undefined;
+    const mappedSession = mappedJsonl
+      ? { path: mappedJsonl, mtimeMs: jsonlMtimes.get(mappedJsonl) ?? now }
+      : undefined;
+    let session = mappedSession;
     session =
       (sessionId && sessions.find((item) => item.path.includes(sessionId))) ||
       (sessionId ? await findSessionById(codexHome, sessionId) : undefined) ||
-      cachedSession ||
-      session;
+      session ||
+      cwdSession ||
+      cachedSession;
+    if (cwdSession && mappedSession) {
+      const mappedMtime = mappedSession.mtimeMs ?? 0;
+      const cwdMtime = cwdSession.mtimeMs ?? 0;
+      if (cwdMtime > mappedMtime + 1000) {
+        session = cwdSession;
+      }
+    }
     const hasExplicitSession = !!sessionId || !!mappedJsonl;
     const allowReuse = hasExplicitSession || /\bresume\b/i.test(cmdRaw);
     const initialSessionPath = normalizeSessionPath(session?.path);
+    let reuseBlocked = false;
     if (initialSessionPath && usedSessionPaths.has(initialSessionPath) && !allowReuse) {
-      const alternate = await findSessionByCwd(sessions, cwdRaw, startMs);
+      const alternate = cwdSession;
       const alternatePath = normalizeSessionPath(alternate?.path);
       if (alternate && alternatePath && alternatePath !== initialSessionPath) {
         session = alternate;
+      } else {
+        reuseBlocked = true;
       }
     }
-    if (!session && cwdRaw) {
-      session = await findSessionByCwd(sessions, cwdRaw, startMs);
+    if (!session) {
+      session = cwdSession;
+      reuseBlocked = false;
     }
     if (!session && process.platform === "win32") {
       session = pickSessionByStartMs(
@@ -1250,21 +1311,37 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       cwdRaw,
       sessionId,
       session,
+      jsonlPaths,
+      reuseBlocked,
     });
   }
 
   const tailTargets = new Set<string>();
   const cachedTails = new Map<string, Awaited<ReturnType<typeof updateTail>>>();
+  const tailOptionsByPath = new Map<string, { keepStale?: boolean }>();
   if (includeActivity) {
     if (dirtySessions) {
       for (const dirtyPath of dirtySessions) {
-        tailTargets.add(path.resolve(dirtyPath));
+        const resolved = path.resolve(dirtyPath);
+        tailTargets.add(resolved);
+        if (!tailOptionsByPath.has(resolved)) {
+          tailOptionsByPath.set(resolved, { keepStale: false });
+        }
       }
     }
     for (const ctx of codexContexts) {
       const sessionPath = normalizeSessionPath(ctx.session?.path);
       if (!sessionPath) continue;
       tailTargets.add(sessionPath);
+      tailOptionsByPath.set(sessionPath, { keepStale: true });
+      if (ctx.jsonlPaths?.length) {
+        for (const jsonlPath of ctx.jsonlPaths) {
+          tailTargets.add(jsonlPath);
+          if (!tailOptionsByPath.has(jsonlPath)) {
+            tailOptionsByPath.set(jsonlPath, { keepStale: true });
+          }
+        }
+      }
     }
   }
   const tailsTimer = startProfile("tails");
@@ -1272,7 +1349,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     includeActivity
       ? await Promise.all(
           Array.from(tailTargets).map(async (sessionPath) => {
-            const tail = await updateTail(sessionPath);
+            const tail = await updateTail(sessionPath, tailOptionsByPath.get(sessionPath));
             return [sessionPath, tail] as const;
           })
         )
@@ -1283,7 +1360,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     ...tailEntries,
   ]);
   for (const ctx of codexContexts) {
-    const { proc, cpu, mem, startMs, cmdRaw, cwdRaw, session, sessionId } = ctx;
+    const { proc, cpu, mem, startMs, cmdRaw, cwdRaw, session, sessionId, reuseBlocked } = ctx;
     let doing: string | undefined;
     let events: AgentSnapshot["events"];
     let model: string | undefined;
@@ -1294,7 +1371,29 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     let lastActivityAt: number | undefined;
     let inFlight = false;
 
-    const sessionPath = normalizeSessionPath(session?.path);
+    const pickBestJsonl = (paths?: string[]): string | undefined => {
+      if (!paths || paths.length === 0) return undefined;
+      let bestPath: string | undefined;
+      let bestScore = -1;
+      let bestActivity = -1;
+      for (const candidate of paths) {
+        const tail = includeActivity ? tailsByPath.get(candidate) : getTailState(candidate);
+        const summary = tail ? summarizeTail(tail) : undefined;
+        const inFlightScore = summary?.inFlight ? 1 : 0;
+        const activity = summary?.lastActivityAt ?? summary?.lastEventAt ?? 0;
+        const score = inFlightScore * 10 + (activity > 0 ? 1 : 0);
+        if (score > bestScore || (score === bestScore && activity > bestActivity)) {
+          bestScore = score;
+          bestActivity = activity;
+          bestPath = candidate;
+        }
+      }
+      if (bestPath) return bestPath;
+      const fallback = pickNewestJsonl(paths, jsonlMtimes);
+      return normalizeSessionPath(fallback);
+    };
+    const sessionPath =
+      pickBestJsonl(ctx.jsonlPaths) || normalizeSessionPath(session?.path);
     
     // Get thread state from event store (webhook-based events)
     let threadId: string | undefined;
@@ -1316,6 +1415,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     let tailEventAt: number | undefined;
     let tailInFlightSignalAt: number | undefined;
     let tailIngestAt: number | undefined;
+    let tailEndAt: number | undefined;
+    let tailReviewMode = false;
+    let tailOpenCallCount = 0;
 
     if (sessionPath) {
       const tail = includeActivity ? tailsByPath.get(sessionPath) : getTailState(sessionPath);
@@ -1332,6 +1434,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         tailEventAt = tailSummary.lastEventAt;
         tailInFlightSignalAt = tailSummary.lastInFlightSignalAt;
         tailIngestAt = tailSummary.lastIngestAt;
+        tailEndAt = tailSummary.lastEndAt;
+        tailReviewMode = !!tailSummary.reviewMode;
+        tailOpenCallCount = tailSummary.openCallCount ?? 0;
       }
     }
 
@@ -1368,7 +1473,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const repoRoot = cwdRaw ? findRepoRoot(cwdRaw) : null;
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
 
-    const sessionIdentity = sessionPath ? `codex:${sessionPath}` : `pid:${proc.pid}`;
+    const redactedSessionPath = sessionPath ? redactText(sessionPath) || sessionPath : undefined;
+    const sessionIdentity =
+      redactedSessionPath && !reuseBlocked
+        ? `codex:${redactedSessionPath}`
+        : `pid:${proc.pid}`;
     if (sessionPath) {
       pidSessionCache.set(proc.pid, { path: sessionPath, lastSeenAt: now, startMs });
     }
@@ -1391,13 +1500,24 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       state = "idle";
       reason = "no_hook";
     } else {
+      const tailAllowsNotifyEnd = tailOpenCallCount === 0 && !tailReviewMode;
+      const notifyEndAt = !eventInFlight && eventActivityAt ? eventActivityAt : undefined;
+      const notifyEndIsFresh =
+        typeof notifyEndAt === "number" &&
+        (typeof tailActivityAtCandidate !== "number" || notifyEndAt >= tailActivityAtCandidate);
+      const notifyShouldEnd = tailAllowsNotifyEnd && notifyEndIsFresh && !tailEndAt;
+      if (notifyShouldEnd) {
+        inFlight = false;
+      }
+      const explicitEndAt = tailEndAt ?? (notifyShouldEnd ? notifyEndAt : undefined);
+      const effectiveHoldMs = explicitEndAt ? 0 : codexHoldMs;
       const effectiveIdleMs = inFlight ? 0 : codexEventIdleMs;
       const eventState = deriveCodexEventState({
         inFlight,
         lastActivityAt: activityAt,
         hasError,
         now,
-        holdMs: codexHoldMs,
+        holdMs: effectiveHoldMs,
         idleMs: effectiveIdleMs,
       });
       state = eventState.state;
@@ -1460,7 +1580,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       mem,
       state,
       doing: redactText(doing) || doing,
-      sessionPath: sessionPath ? redactText(sessionPath) || sessionPath : undefined,
+      sessionPath: redactedSessionPath,
       repo: repoName,
       cwd,
       model,
@@ -1584,14 +1704,6 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         session?.createdAt ||
         session?.created
     );
-    const statusRaw = typeof session?.status === "string" ? session.status : undefined;
-    const status = statusRaw?.toLowerCase();
-    const statusIsError = !!status && /error|failed|failure/.test(status);
-    const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
-    const statusIsActive = !!status && /running|active|processing/.test(status);
-    let hasError = statusIsError;
-    const model = typeof session?.model === "string" ? session.model : undefined;
-
     let doing: string | undefined = isServer ? "opencode server" : sessionTitle;
     let summary: WorkSummary | undefined;
     let events: AgentSnapshot["events"];
@@ -1599,6 +1711,26 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       !isServer
         ? getOpenCodeActivityBySession(sessionId) || getOpenCodeActivityByPid(proc.pid)
         : null;
+    const statusAuthority = eventActivity?.lastStatus;
+    const statusAuthorityAt = eventActivity?.lastStatusAt;
+    const statusAuthorityFresh =
+      typeof statusAuthorityAt === "number" &&
+      now - statusAuthorityAt <= opencodeStatusFreshMs;
+    const statusAuthorityLower =
+      statusAuthorityFresh && typeof statusAuthority === "string"
+        ? statusAuthority.toLowerCase()
+        : undefined;
+    const statusAuthorityIsIdle = statusAuthorityLower === "idle";
+    const statusAuthorityIsBusy =
+      !!statusAuthorityLower && statusAuthorityLower !== "idle";
+
+    const statusRaw = typeof session?.status === "string" ? session.status : undefined;
+    const status = statusAuthorityLower ?? statusRaw?.toLowerCase();
+    const statusIsError = !!status && /error|failed|failure/.test(status);
+    const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
+    const statusIsActive = !!status && /running|active|processing|busy|retry/.test(status);
+    let hasError = statusIsError;
+    const model = typeof session?.model === "string" ? session.model : undefined;
     const includeOpenCode = shouldIncludeOpenCodeProcess({
       kind,
       opencodeApiAvailable,
@@ -1615,6 +1747,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     let lastEventAt: number | undefined;
     let lastActivityAt: number | undefined;
     let inFlight = eventActivity?.inFlight;
+    let messageActivityOk = false;
     if (eventActivity) {
       events = eventActivity.events;
       summary = eventActivity.summary || summary;
@@ -1634,14 +1767,21 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       if (eventActivity.hasError) hasError = true;
       if (eventActivity.inFlight) inFlight = true;
       if (eventActivity.summary?.current) doing = eventActivity.summary.current;
+      if (statusAuthorityIsIdle) {
+        inFlight = false;
+      } else if (statusAuthorityIsBusy) {
+        inFlight = true;
+      }
     }
-    // For TUI sessions, ALWAYS poll message API for activity since SSE doesn't reliably emit TUI events.
-    // Message API is the authoritative source for TUI inFlight state - it overrides SSE's potentially stale state.
+    // For TUI sessions, poll message API for activity; session.status (if present) is authoritative.
     if (!isServer && sessionId && opencodeApiAvailable) {
       const msgActivity = await getCachedOpenCodeSessionActivity(sessionId);
       if (msgActivity.ok) {
-        // Message API is authoritative for TUI - use its inFlight value directly
-        inFlight = msgActivity.inFlight;
+        messageActivityOk = true;
+        if (!statusAuthorityLower || !statusAuthorityIsIdle) {
+          // Message API is authoritative for TUI when no session status is known.
+          inFlight = msgActivity.inFlight;
+        }
         if (typeof msgActivity.lastActivityAt === "number") {
           lastActivityAt = lastActivityAt
             ? Math.max(lastActivityAt, msgActivity.lastActivityAt)
@@ -1691,9 +1831,10 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       typeof startMs === "number" && now - startMs <= opencodeHoldMs;
     const previousActiveAt = opencodeStartedRecently ? now : cached?.lastActiveAt;
     // For TUI sessions with message API data, don't decay inFlight - the API is authoritative.
-    // Only use inFlightIdleMs decay for server processes or TUIs without direct API data.
-    // Pass -1 to explicitly disable decay (undefined falls back to defaults).
-    const useInFlightIdleMs = isServer || !sessionId || !opencodeApiAvailable ? opencodeInFlightIdleMs : -1;
+    const useInFlightIdleMs =
+      isServer || !sessionId || !opencodeApiAvailable || !messageActivityOk
+        ? opencodeInFlightIdleMs
+        : -1;
     const activity = deriveOpenCodeState({
       hasError,
       lastEventAt,
@@ -1710,6 +1851,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     });
     let state = activity.state;
     let reason = activity.reason || "unknown";
+    const activityLastActiveAt = activity.lastActiveAt ?? cached?.lastActiveAt;
     logOpencode(`pid=${proc.pid} sessionId=${sessionId ?? "none"} inFlight=${inFlight} state=${state} reason=${reason} lastActivityAt=${lastActivityAt ?? "?"} source=${selection.source}`);
     if (
       activity.state === "active" &&
@@ -1725,11 +1867,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       typeof lastActivityAt === "number" ||
       typeof inFlight === "boolean";
     const activityAt = typeof lastActivityAt === "number" ? lastActivityAt : undefined;
-    if (!opencodeApiAvailable && !hasSignal && !activity.lastActiveAt) {
+    if (!opencodeApiAvailable && !hasSignal && !activityLastActiveAt) {
       state = "idle";
       reason = "api_unavailable";
     }
-    if (!hasSignal && !activity.lastActiveAt) {
+    if (!hasSignal && !activityLastActiveAt) {
       state = "idle";
       reason = "no_signal";
     }
@@ -1744,7 +1886,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       );
     }
     activityCache.set(id, {
-      lastActiveAt: activity.lastActiveAt,
+      lastActiveAt: activityLastActiveAt,
       lastSeenAt: now,
       lastState: state,
       lastReason: reason,

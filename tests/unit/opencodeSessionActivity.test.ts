@@ -91,9 +91,9 @@ function parseMessageActivity(messages: OpenCodeMessage[]): ActivityResult {
 
   // Session is in flight if:
   // 1. Assistant message has no completed timestamp, OR
-  // 2. There's a pending/running tool call, OR
-  // 3. There's a part still in progress
-  const inFlight = !hasCompleted || hasPendingTool || hasIncompletePart;
+  // 2. There's a pending/running tool call
+  // Incomplete parts only matter when the message is not completed.
+  const inFlight = hasPendingTool || !hasCompleted;
 
   return { inFlight, lastActivityAt: latestActivityAt };
 }
@@ -259,6 +259,19 @@ test("returns inFlight=true when part has start but no end time", () => {
   assert.equal(result.inFlight, true, "Should be in flight due to incomplete part");
 });
 
+test("returns inFlight=false when message completed but parts lack end", () => {
+  const messages: OpenCodeMessage[] = [
+    {
+      info: { id: "msg_1", role: "assistant", time: { created: 2000, completed: 3000 } },
+      parts: [
+        { id: "prt_1", type: "reasoning", time: { start: 2001 } },
+      ],
+    },
+  ];
+  const result = parseMessageActivity(messages);
+  assert.equal(result.inFlight, false, "Completed message should end in-flight");
+});
+
 test("returns inFlight=false when all parts have end times", () => {
   const messages: OpenCodeMessage[] = [
     {
@@ -273,7 +286,7 @@ test("returns inFlight=false when all parts have end times", () => {
   assert.equal(result.inFlight, false, "Should be idle when all parts completed");
 });
 
-test("returns inFlight=true when message completed but part still in progress", () => {
+test("returns inFlight=false when message completed but part still in progress", () => {
   const messages: OpenCodeMessage[] = [
     {
       info: { id: "msg_1", role: "assistant", time: { created: 2000, completed: 3000 } },
@@ -284,7 +297,7 @@ test("returns inFlight=true when message completed but part still in progress", 
     },
   ];
   const result = parseMessageActivity(messages);
-  assert.equal(result.inFlight, true, "Incomplete part should override completed timestamp");
+  assert.equal(result.inFlight, false, "Completed message should end in-flight");
 });
 
 // =============================================================================
