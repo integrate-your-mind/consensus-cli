@@ -4,6 +4,9 @@ import http from "node:http";
 import { getOpenCodeSessionActivity } from "../../src/opencodeApi.js";
 import { deriveOpenCodeState } from "../../src/opencodeState.ts";
 
+const originalStale = process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS;
+process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS = "0";
+
 // Helper to create a mock HTTP server that returns specified messages
 function createMockServer(
   responseData: unknown,
@@ -181,6 +184,34 @@ test("getOpenCodeSessionActivity returns inFlight=true for incomplete part (no e
     });
     assert.equal(result.ok, true);
     assert.equal(result.inFlight, true, "Should be in flight for incomplete part");
+  } finally {
+    await mock.close();
+  }
+});
+
+test("getOpenCodeSessionActivity returns inFlight=false when message completed but parts incomplete", async () => {
+  const now = Date.now();
+  const messages = [
+    {
+      info: {
+        id: "msg_1",
+        sessionID: "ses_test",
+        role: "assistant",
+        time: { created: now - 2000, completed: now - 1000 },
+      },
+      parts: [
+        { id: "prt_1", type: "reasoning", time: { start: now - 1500 } },
+      ],
+    },
+  ];
+  const mock = await createMockServer(messages);
+  try {
+    const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
+      silent: true,
+      timeoutMs: 5000,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.inFlight, false, "Completed message should end in-flight");
   } finally {
     await mock.close();
   }
@@ -387,5 +418,13 @@ test("getOpenCodeSessionActivity handles completed message with completed tools"
     assert.equal(result.inFlight, false, "Should be idle when message and all tools completed");
   } finally {
     await mock.close();
+  }
+});
+
+process.on("exit", () => {
+  if (originalStale === undefined) {
+    delete process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS;
+  } else {
+    process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS = originalStale;
   }
 });

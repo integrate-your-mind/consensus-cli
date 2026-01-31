@@ -2,7 +2,7 @@ import type { AgentState } from "./types.js";
 import type { ActivityHoldResult } from "./activity.js";
 import { deriveStateWithHold } from "./activity.js";
 
-const DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS = 15000;
+const DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS = 2500;
 
 export interface OpenCodeStateInput {
   hasError: boolean;
