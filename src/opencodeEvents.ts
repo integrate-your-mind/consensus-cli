@@ -24,6 +24,7 @@ const DELTA_EVENT_RE =
   /(response\.((output_text|function_call_arguments|content_part|text)\.delta)|message\.part\.updated)/i;
 // OpenCode session status values that indicate busy
 const BUSY_STATUS_RE = /^(busy|running|generating|processing)$/i;
+const IDLE_STATUS_RE = /^(idle|paused|stopped)$/i;
 
 interface ActivityState {
   events: EventSummary[];
@@ -496,7 +497,7 @@ function handleRawEvent(raw: any): void {
     if (typeof status === "string" && status.trim()) {
       state.lastStatus = status;
       state.lastStatusAt = now;
-      if (status.toLowerCase() === "idle") {
+      if (IDLE_STATUS_RE.test(status)) {
         state.inFlight = false;
         state.lastInFlightSignalAt = undefined;
       } else {
@@ -544,7 +545,7 @@ function handleRawEvent(raw: any): void {
     if (typeof status === "string" && status.trim()) {
       state.lastStatus = status;
       state.lastStatusAt = now;
-      if (status.toLowerCase() === "idle") {
+      if (IDLE_STATUS_RE.test(status)) {
         state.inFlight = false;
         state.lastInFlightSignalAt = undefined;
       } else {

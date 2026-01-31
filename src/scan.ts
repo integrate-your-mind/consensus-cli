@@ -1642,9 +1642,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       statusAuthorityFresh && typeof statusAuthority === "string"
         ? statusAuthority.toLowerCase()
         : undefined;
-    const statusAuthorityIsIdle = statusAuthorityLower === "idle";
-    const statusAuthorityIsBusy =
-      !!statusAuthorityLower && statusAuthorityLower !== "idle";
+    const statusAuthorityIsIdle =
+      !!statusAuthorityLower && /idle|stopped|paused/.test(statusAuthorityLower);
+    const statusAuthorityIsBusy = !!statusAuthorityLower && !statusAuthorityIsIdle;
 
     const statusRaw = typeof session?.status === "string" ? session.status : undefined;
     const status = statusAuthorityLower ?? statusRaw?.toLowerCase();
