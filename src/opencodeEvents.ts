@@ -7,7 +7,7 @@ const STALE_TTL_MS = 30 * 60 * 1000;
 const RECONNECT_MIN_MS = 10_000;
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
 const INFLIGHT_TIMEOUT_MS = Number(
-  process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS || 15000
+  process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS || 2500
 );
 const ACTIVITY_KINDS = new Set<string>(["command", "edit", "message", "prompt", "tool"]);
 // Meta events that don't indicate real activity

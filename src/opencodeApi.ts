@@ -36,7 +36,7 @@ function shouldWarn(options?: OpenCodeApiOptions): boolean {
   return options?.silent ? false : true;
 }
 
-const DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS = 15000;
+const DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS = 2500;
 
 export async function getOpenCodeSessions(
   host: string = "localhost",

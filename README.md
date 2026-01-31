@@ -83,7 +83,7 @@ consensus dev server running on http://127.0.0.1:8787
 - `CONSENSUS_OPENCODE_EVENTS`: set to `0` to disable OpenCode event stream.
 - `CONSENSUS_OPENCODE_HOME`: override OpenCode storage (default `~/.local/share/opencode`).
 - `CONSENSUS_OPENCODE_EVENT_ACTIVE_MS`: OpenCode active window after last event in ms (default `0`).
-- `CONSENSUS_OPENCODE_ACTIVE_HOLD_MS`: OpenCode hold window in ms (default `0`).
+- `CONSENSUS_OPENCODE_ACTIVE_HOLD_MS`: OpenCode hold window in ms (default `3000`).
 - `CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS`: OpenCode in-flight idle timeout in ms (defaults to `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`).
 - `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`: OpenCode hard in-flight timeout in ms (default `2500`).
 - `CONSENSUS_OPENCODE_INFLIGHT_STALE_MS`: OpenCode stale in-flight cutoff in ms (default `0`).

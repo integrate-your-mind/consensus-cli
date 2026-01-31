@@ -87,7 +87,7 @@ All configuration is via environment variables.
   - Default: `0`
   - OpenCode event window before dropping to idle.
 - `CONSENSUS_OPENCODE_ACTIVE_HOLD_MS`
-  - Default: `0`
+  - Default: `3000`
   - OpenCode hold window after activity.
 - `CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS`
   - Default: `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`

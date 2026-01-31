@@ -1517,7 +1517,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   );
   const opencodeHoldMs = resolveMs(
     process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS,
-    0
+    3000
   );
   const opencodeStrictEnv = process.env.CONSENSUS_OPENCODE_STRICT_INFLIGHT;
   const opencodeStrictInFlight =
@@ -1669,6 +1669,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     let lastEventAt: number | undefined;
     let lastActivityAt: number | undefined;
     let inFlight = eventActivity?.inFlight;
+    let messageActivityOk = false;
     if (eventActivity) {
       events = eventActivity.events;
       summary = eventActivity.summary || summary;
@@ -1698,6 +1699,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     if (!isServer && sessionId && opencodeApiAvailable) {
       const msgActivity = await getCachedOpenCodeSessionActivity(sessionId);
       if (msgActivity.ok) {
+        messageActivityOk = true;
         if (!statusAuthorityLower || !statusAuthorityIsIdle) {
           // Message API is authoritative for TUI when no session status is known.
           inFlight = msgActivity.inFlight;
@@ -1750,8 +1752,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const opencodeStartedRecently =
       typeof startMs === "number" && now - startMs <= opencodeHoldMs;
     const previousActiveAt = opencodeStartedRecently ? now : cached?.lastActiveAt;
-    // Use inFlightIdleMs to avoid lingering in-flight states when activity stops.
-    const useInFlightIdleMs = opencodeInFlightIdleMs;
+    // For TUI sessions with message API data, don't decay inFlight - the API is authoritative.
+    const useInFlightIdleMs =
+      isServer || !sessionId || !opencodeApiAvailable || !messageActivityOk
+        ? opencodeInFlightIdleMs
+        : -1;
     const activity = deriveOpenCodeState({
       hasError,
       lastEventAt,
@@ -1768,6 +1773,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     });
     let state = activity.state;
     let reason = activity.reason || "unknown";
+    const activityLastActiveAt = activity.lastActiveAt ?? cached?.lastActiveAt;
     logOpencode(`pid=${proc.pid} sessionId=${sessionId ?? "none"} inFlight=${inFlight} state=${state} reason=${reason} lastActivityAt=${lastActivityAt ?? "?"} source=${selection.source}`);
     if (
       activity.state === "active" &&
@@ -1783,11 +1789,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       typeof lastActivityAt === "number" ||
       typeof inFlight === "boolean";
     const activityAt = typeof lastActivityAt === "number" ? lastActivityAt : undefined;
-    if (!opencodeApiAvailable && !hasSignal && !activity.lastActiveAt) {
+    if (!opencodeApiAvailable && !hasSignal && !activityLastActiveAt) {
       state = "idle";
       reason = "api_unavailable";
     }
-    if (!hasSignal && !activity.lastActiveAt) {
+    if (!hasSignal && !activityLastActiveAt) {
       state = "idle";
       reason = "no_signal";
     }
@@ -1802,7 +1808,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       );
     }
     activityCache.set(id, {
-      lastActiveAt: activity.lastActiveAt,
+      lastActiveAt: activityLastActiveAt,
       lastSeenAt: now,
       lastState: state,
       lastReason: reason,

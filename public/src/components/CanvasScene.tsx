@@ -13,7 +13,7 @@ interface CanvasSceneProps {
   onSelect: (agent: AgentSnapshot | null) => void;
   onMouseDown: (e: React.MouseEvent) => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
-  onWheel: (e: WheelEvent) => void;
+  onCanvasWheel: (e: WheelEvent) => void;
 }
 
 export function CanvasScene({
@@ -24,7 +24,7 @@ export function CanvasScene({
   onSelect,
   onMouseDown,
   onKeyDown,
-  onWheel,
+  onCanvasWheel,
 }: CanvasSceneProps) {
   const layoutRef = useRef(createLayoutState());
   const spawnTimesRef = useRef<Map<string, number>>(new Map());
@@ -95,12 +95,12 @@ export function CanvasScene({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const handleWheel = (e: WheelEvent) => onWheel(e);
+    const handleWheel = (e: WheelEvent) => onCanvasWheel(e);
     canvas.addEventListener('wheel', handleWheel, { passive: false });
     return () => {
       canvas.removeEventListener('wheel', handleWheel);
     };
-  }, [canvasRef, onWheel]);
+  }, [canvasRef, onCanvasWheel]);
 
   const handleClick = useCallback((e: React.MouseEvent) => {
     // First try hovered state, otherwise calculate from click position
