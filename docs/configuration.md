@@ -93,8 +93,11 @@ All configuration is via environment variables.
   - Default: `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`
   - OpenCode in-flight idle timeout in ms before dropping to idle if no activity is observed.
 - `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`
-  - Default: `15000`
+  - Default: `2500`
   - Hard timeout (ms) used to clear OpenCode in-flight when no fresh events are observed.
+- `CONSENSUS_OPENCODE_INFLIGHT_STALE_MS`
+  - Default: `0`
+  - Treat OpenCode in-flight signals older than this as stale to avoid ghost sessions.
 - `CONSENSUS_PROCESS_MATCH`
   - Default: unset
   - Regex to match process name or command line.
@@ -114,7 +117,7 @@ All configuration is via environment variables.
   - Default: `750`
   - Treat recent Codex JSONL file mtime as activity within this window (bridges log write lag).
 - `CONSENSUS_CODEX_ACTIVE_HOLD_MS`
-  - Default: `3000`
+  - Default: `0`
   - Codex hold window after activity.
 - `CONSENSUS_CODEX_INFLIGHT_GRACE_MS`
   - Default: `750`
@@ -126,10 +129,10 @@ All configuration is via environment variables.
   - Default: `30000`
   - Idle timeout to clear Codex in-flight when activity is stale. Set to `0` to disable.
 - `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`
-  - Default: `3000`
+  - Default: `2500`
   - Hard timeout to clear Codex in-flight if no recent signals and file is not fresh.
 - `CONSENSUS_CODEX_FILE_FRESH_MS`
-  - Default: `10000`
+  - Default: `2500`
   - Treat recent Codex JSONL file mtime within this window as fresh and keep in-flight on.
 - `CONSENSUS_CODEX_CPU_SUSTAIN_MS`
   - Default: `500`
@@ -141,7 +144,7 @@ All configuration is via environment variables.
   - Default: `120000`
   - Treat Codex JSONL files older than this as stale to prevent stale sessions from staying active.
 - `CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS`
-  - Default: `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`
+  - Default: `max(CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS, 2500)`
   - Ignore Codex events older than this when setting in-flight signals (prevents stale sessions after restart).
 - `CONSENSUS_PROCESS_CACHE_MS`
   - Default: `1000`

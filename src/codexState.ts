@@ -3,7 +3,7 @@ import { deriveStateWithHold } from "./activity.js";
 
 const DEFAULT_CODEX_CPU_SUSTAIN_MS = 500;
 const DEFAULT_CODEX_INFLIGHT_IDLE_MS = 30_000;
-const DEFAULT_CODEX_HOLD_MS = 3000;
+const DEFAULT_CODEX_HOLD_MS = 0;
 
 export interface CodexStateInput {
   cpu: number;

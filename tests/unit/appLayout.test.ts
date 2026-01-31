@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { groupKeyForAgent, keyForAgent, labelFor } from "../../public/src/lib/format.ts";
-import { createLayoutState, updateLayout } from "../../public/src/lib/layout.ts";
+import {
+  createLayoutState,
+  updateLayout,
+  debugCellRangeForBounds,
+  validateSpatialIndex,
+} from "../../public/src/lib/layout.ts";
 
 test("keeps unique layout keys for same repo with different pids", async () => {
   const agentA = { repo: "alpha", id: "101", pid: 101 };
@@ -75,4 +80,28 @@ test("group anchor remains stable for same repo", async () => {
   const agentB = { id: "112", pid: 112, repo: "alpha", mem: 75_000_000, state: "active" };
   updateLayout(state, [agentA as any, agentB as any]);
   assert.deepEqual(state.groupAnchors.get("alpha"), anchor);
+});
+
+test("cellRangeForBounds handles negative and boundary edges", async () => {
+  const base = debugCellRangeForBounds({ left: 0, right: 96, top: 0, bottom: 48 });
+  assert.deepEqual(base, { minCx: 0, maxCx: 0, minCy: 0, maxCy: 0 });
+
+  const negative = debugCellRangeForBounds({ left: -96, right: 0, top: -48, bottom: 0 });
+  assert.deepEqual(negative, { minCx: -1, maxCx: -1, minCy: -1, maxCy: -1 });
+
+  const crossing = debugCellRangeForBounds({ left: -1, right: 96, top: -1, bottom: 48 });
+  assert.deepEqual(crossing, { minCx: -1, maxCx: 0, minCy: -1, maxCy: 0 });
+});
+
+test("spatial index remains consistent across add/remove", async () => {
+  const state = createLayoutState();
+  const agentA = { id: "201", pid: 201, repo: "alpha", mem: 80_000_000, state: "active" };
+  const agentB = { id: "202", pid: 202, repo: "alpha", mem: 70_000_000, state: "active" };
+  const agentC = { id: "203", pid: 203, repo: "beta", mem: 60_000_000, state: "active" };
+
+  updateLayout(state, [agentA as any, agentB as any, agentC as any]);
+  validateSpatialIndex(state.spatial);
+
+  updateLayout(state, [agentA as any, agentC as any]);
+  validateSpatialIndex(state.spatial);
 });
