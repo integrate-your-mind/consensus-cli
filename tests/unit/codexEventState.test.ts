@@ -30,6 +30,32 @@ test("codex event state: hold after recent activity", () => {
   assert.equal(result.reason, "event_hold");
 });
 
+test("codex event state: hold expires after in-flight ends", () => {
+  const now = Date.now();
+  const holdMs = 2000;
+  const lastActivityAt = now;
+  const active = deriveCodexEventState({
+    inFlight: false,
+    lastActivityAt,
+    hasError: false,
+    now: now + holdMs - 1,
+    holdMs,
+    idleMs: 20000,
+  });
+  const idle = deriveCodexEventState({
+    inFlight: false,
+    lastActivityAt,
+    hasError: false,
+    now: now + holdMs + 1,
+    holdMs,
+    idleMs: 20000,
+  });
+  assert.equal(active.state, "active");
+  assert.equal(active.reason, "event_hold");
+  assert.equal(idle.state, "idle");
+  assert.equal(idle.reason, "event_idle");
+});
+
 test("codex event state: idle after hold window", () => {
   const now = Date.now();
   const result = deriveCodexEventState({

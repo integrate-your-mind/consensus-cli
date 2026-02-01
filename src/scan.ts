@@ -1271,7 +1271,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const seenIds = new Set<string>();
   const codexHoldMs = resolveMs(
     process.env.CONSENSUS_CODEX_ACTIVE_HOLD_MS,
-    0
+    2000
   );
   const codexEventIdleMs = resolveMs(
     process.env.CONSENSUS_CODEX_EVENT_IDLE_MS,

@@ -92,7 +92,7 @@ consensus dev server running on http://127.0.0.1:8787
 - `CONSENSUS_UI_PORT`: dev UI port for Vite when running `npm run dev` (default `5173`).
 - `CONSENSUS_DEBUG_OPENCODE`: set to `1` to log OpenCode server discovery.
 - `CONSENSUS_CODEX_EVENT_ACTIVE_MS`: Codex active window after last event in ms (default `30000`).
-- `CONSENSUS_CODEX_ACTIVE_HOLD_MS`: Codex hold window in ms (default `0`).
+- `CONSENSUS_CODEX_ACTIVE_HOLD_MS`: Codex hold window in ms (default `2000`, set to `0` to disable).
 - `CONSENSUS_CODEX_INFLIGHT_IDLE_MS`: Codex in-flight idle timeout in ms (default `30000`, set to `0` to disable).
 - `CONSENSUS_CODEX_CPU_SUSTAIN_MS`: sustained CPU window before Codex becomes active without logs (default `500`).
 - `CONSENSUS_CODEX_CPU_SPIKE`: Codex CPU spike threshold for immediate activation (default derived).

@@ -117,8 +117,8 @@ All configuration is via environment variables.
   - Default: `750`
   - Treat recent Codex JSONL file mtime as activity within this window (bridges log write lag).
 - `CONSENSUS_CODEX_ACTIVE_HOLD_MS`
-  - Default: `0`
-  - Codex hold window after activity.
+  - Default: `2000`
+  - Codex hold window after activity. Set to `0` to disable (immediate transitions may flicker).
 - `CONSENSUS_CODEX_INFLIGHT_GRACE_MS`
   - Default: `750`
   - Codex in-flight grace window after the last in-flight signal (prevents brief idle flicker).
