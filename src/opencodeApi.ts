@@ -30,10 +30,87 @@ export interface OpenCodeSessionResult {
 export interface OpenCodeApiOptions {
   timeoutMs?: number;
   silent?: boolean;
+  signal?: AbortSignal;
 }
 
 function shouldWarn(options?: OpenCodeApiOptions): boolean {
   return options?.silent ? false : true;
+}
+
+interface AbortContext {
+  signal: AbortSignal;
+  cleanup: () => void;
+  isTimedOut: () => boolean;
+  isParentAborted: () => boolean;
+}
+
+function createAbortContext(
+  parentSignal: AbortSignal | undefined,
+  timeoutMs: number
+): AbortContext {
+  const controller = new AbortController();
+  let timedOut = false;
+  let parentAborted = false;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let onParentAbort: (() => void) | undefined;
+
+  const abort = (reason?: unknown) => {
+    if (controller.signal.aborted) return;
+    try {
+      controller.abort(reason);
+    } catch {
+      controller.abort();
+    }
+  };
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      parentAborted = true;
+      abort(parentSignal.reason);
+    } else {
+      onParentAbort = () => {
+        parentAborted = true;
+        abort(parentSignal.reason);
+      };
+      parentSignal.addEventListener("abort", onParentAbort, { once: true });
+    }
+  }
+
+  if (controller.signal.aborted) {
+    return {
+      signal: controller.signal,
+      cleanup: () => {
+        if (parentSignal && onParentAbort) {
+          parentSignal.removeEventListener("abort", onParentAbort);
+        }
+      },
+      isTimedOut: () => timedOut,
+      isParentAborted: () => parentAborted,
+    };
+  }
+
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      abort();
+    }, timeoutMs);
+  }
+
+  const cleanup = () => {
+    if (timeoutId) clearTimeout(timeoutId);
+    if (parentSignal && onParentAbort) {
+      parentSignal.removeEventListener("abort", onParentAbort);
+    }
+  };
+
+  controller.signal.addEventListener("abort", cleanup, { once: true });
+
+  return {
+    signal: controller.signal,
+    cleanup,
+    isTimedOut: () => timedOut,
+    isParentAborted: () => parentAborted,
+  };
 }
 
 const DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS = 2500;
@@ -43,9 +120,8 @@ export async function getOpenCodeSessions(
   port: number = 4096,
   options?: OpenCodeApiOptions
 ): Promise<OpenCodeSessionResult> {
-  const controller = new AbortController();
   const timeoutMs = options?.timeoutMs ?? 5000;
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const abortContext = createAbortContext(options?.signal, timeoutMs);
   const warn = shouldWarn(options);
 
   try {
@@ -54,10 +130,8 @@ export async function getOpenCodeSessions(
         Accept: "application/json",
         "User-Agent": "consensus-scanner",
       },
-      signal: controller.signal,
+      signal: abortContext.signal,
     });
-
-    clearTimeout(timeoutId);
 
     if (!response.ok) {
       if (warn) {
@@ -84,9 +158,16 @@ export async function getOpenCodeSessions(
     }
     return { ok: true, sessions: [], reachable: true };
   } catch (error) {
-    clearTimeout(timeoutId);
-    if (warn) {
+    const timedOut = abortContext.isTimedOut();
+    const parentAborted = abortContext.isParentAborted();
+    if (warn && !timedOut && !parentAborted) {
       console.warn("Failed to fetch OpenCode sessions:", error);
+    }
+    if (timedOut) {
+      return { ok: false, sessions: [], error: "timeout", reachable: false };
+    }
+    if (parentAborted) {
+      return { ok: false, sessions: [], error: "aborted", reachable: false };
     }
     const errorCode =
       typeof (error as any)?.cause?.code === "string"
@@ -95,6 +176,8 @@ export async function getOpenCodeSessions(
           ? (error as any).code
           : undefined;
     return { ok: false, sessions: [], error: errorCode, reachable: false };
+  } finally {
+    abortContext.cleanup();
   }
 }
 
@@ -104,9 +187,8 @@ export async function getOpenCodeSession(
   port: number = 4096,
   options?: OpenCodeApiOptions
 ): Promise<OpenCodeSession | null> {
-  const controller = new AbortController();
   const timeoutMs = options?.timeoutMs ?? 5000;
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const abortContext = createAbortContext(options?.signal, timeoutMs);
   const warn = shouldWarn(options);
 
   try {
@@ -115,10 +197,8 @@ export async function getOpenCodeSession(
         Accept: "application/json",
         "User-Agent": "consensus-scanner",
       },
-      signal: controller.signal,
+      signal: abortContext.signal,
     });
-
-    clearTimeout(timeoutId);
 
     if (!response.ok) {
       if (warn) {
@@ -131,11 +211,14 @@ export async function getOpenCodeSession(
 
     return await response.json();
   } catch (error) {
-    clearTimeout(timeoutId);
-    if (warn) {
+    const timedOut = abortContext.isTimedOut();
+    const parentAborted = abortContext.isParentAborted();
+    if (warn && !timedOut && !parentAborted) {
       console.warn(`Failed to fetch OpenCode session ${sessionId}:`, error);
     }
     return null;
+  } finally {
+    abortContext.cleanup();
   }
 }
 
@@ -194,9 +277,8 @@ export async function getOpenCodeSessionActivity(
     staleMsRaw !== undefined && staleMsRaw !== ""
       ? Number(staleMsRaw)
       : 0;
-  const controller = new AbortController();
   const timeoutMs = options?.timeoutMs ?? 3000;
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const abortContext = createAbortContext(options?.signal, timeoutMs);
   const warn = shouldWarn(options);
 
   try {
@@ -205,10 +287,8 @@ export async function getOpenCodeSessionActivity(
         Accept: "application/json",
         "User-Agent": "consensus-scanner",
       },
-      signal: controller.signal,
+      signal: abortContext.signal,
     });
-
-    clearTimeout(timeoutId);
 
     if (!response.ok) {
       return { ok: false, inFlight: false, error: `status_${response.status}` };
@@ -344,10 +424,19 @@ export async function getOpenCodeSessionActivity(
       lastActivityAt: latestActivityAt,
     };
   } catch (error) {
-    clearTimeout(timeoutId);
-    if (warn) {
+    const timedOut = abortContext.isTimedOut();
+    const parentAborted = abortContext.isParentAborted();
+    if (warn && !timedOut && !parentAborted) {
       console.warn(`Failed to fetch OpenCode session activity ${sessionId}:`, error);
     }
+    if (timedOut) {
+      return { ok: false, inFlight: false, error: "timeout" };
+    }
+    if (parentAborted) {
+      return { ok: false, inFlight: false, error: "aborted" };
+    }
     return { ok: false, inFlight: false, error: "fetch_error" };
+  } finally {
+    abortContext.cleanup();
   }
 }

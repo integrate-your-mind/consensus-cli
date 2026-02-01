@@ -45,8 +45,6 @@
   "dependencies": {
     "@effect/opentelemetry": "^0.61.0",
     "@effect/platform": "^0.94.2",
-    "react": "^18.3.0",
-    "react-dom": "^18.3.0",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/exporter-metrics-otlp-http": "^0.211.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.211.0",
@@ -62,6 +60,8 @@
     "express": "^4.19.2",
     "pidusage": "^3.0.2",
     "ps-list": "^8.1.1",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
     "ws": "^8.17.0"
   },
   "devDependencies": {

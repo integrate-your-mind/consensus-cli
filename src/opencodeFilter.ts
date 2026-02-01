@@ -7,7 +7,12 @@ export interface OpenCodeIncludeInput {
 
 export function shouldIncludeOpenCodeProcess(input: OpenCodeIncludeInput): boolean {
   if (input.kind === "opencode-server") return true;
-  if (input.kind === "opencode-tui" || input.kind === "opencode-cli") return true;
+  if (input.kind === "opencode-session") {
+    return input.hasEventActivity;
+  }
+  if (input.kind === "opencode-tui" || input.kind === "opencode-cli") {
+    return true;
+  }
   if (input.opencodeApiAvailable) {
     return input.hasSession || input.hasEventActivity;
   }

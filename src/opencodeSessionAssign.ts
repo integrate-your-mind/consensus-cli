@@ -61,6 +61,19 @@ export const getOpenCodeSessionPid = (session: unknown): number | undefined => {
   );
 };
 
+export const getOpenCodeSessionParentId = (session: unknown): string | undefined => {
+  if (!session || typeof session !== "object") return undefined;
+  const target = session as { parentID?: unknown; parentId?: unknown; parent_id?: unknown };
+  const raw = target.parentID ?? target.parentId ?? target.parent_id;
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed ? trimmed : undefined;
+};
+
+export const isOpenCodeChildSession = (session: unknown): boolean => {
+  return typeof getOpenCodeSessionParentId(session) === "string";
+};
+
 export const markOpenCodeSessionUsed = (
   used: UsedSessionMap,
   sessionId: string,
@@ -93,14 +106,16 @@ export const pickOpenCodeSessionByDir = <T extends OpenCodeSessionLike>({
   const activeIds = activeSessionIdsByDir.get(dir);
   if (activeIds) {
     for (const id of activeIds) {
-      if (!markOpenCodeSessionUsed(usedSessionIds, id, pid)) continue;
       const activeSession = sessionsById.get(id);
+      if (activeSession && isOpenCodeChildSession(activeSession)) continue;
+      if (!markOpenCodeSessionUsed(usedSessionIds, id, pid)) continue;
       if (activeSession) return activeSession;
       // If API no longer lists this session, keep id reserved to avoid collisions.
       return undefined;
     }
   }
   for (const session of sessions) {
+    if (isOpenCodeChildSession(session)) continue;
     const id = getOpenCodeSessionId(session);
     if (!id) continue;
     if (!markOpenCodeSessionUsed(usedSessionIds, id, pid)) continue;
@@ -129,16 +144,26 @@ export const selectOpenCodeSessionForTui = <T extends OpenCodeSessionLike>({
   usedSessionIds: UsedSessionMap;
 }): { session?: T; sessionId?: string; source: "pid" | "cache" | "dir" | "none" } => {
   const sessionByPidId = getOpenCodeSessionId(sessionByPid);
-  if (sessionByPidId && markOpenCodeSessionUsed(usedSessionIds, sessionByPidId, pid)) {
+  if (
+    sessionByPidId &&
+    !isOpenCodeChildSession(sessionByPid) &&
+    markOpenCodeSessionUsed(usedSessionIds, sessionByPidId, pid)
+  ) {
     return { session: sessionByPid, sessionId: sessionByPidId, source: "pid" };
   }
 
-  if (cachedSessionId && markOpenCodeSessionUsed(usedSessionIds, cachedSessionId, pid)) {
-    return {
-      session: sessionsById.get(cachedSessionId),
-      sessionId: cachedSessionId,
-      source: "cache",
-    };
+  if (cachedSessionId) {
+    const cachedSession = sessionsById.get(cachedSessionId);
+    if (
+      !isOpenCodeChildSession(cachedSession) &&
+      markOpenCodeSessionUsed(usedSessionIds, cachedSessionId, pid)
+    ) {
+      return {
+        session: cachedSession,
+        sessionId: cachedSessionId,
+        source: "cache",
+      };
+    }
   }
 
   const byDir = pickOpenCodeSessionByDir({

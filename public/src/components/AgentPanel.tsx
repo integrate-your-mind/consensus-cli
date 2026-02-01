@@ -58,8 +58,14 @@ export function AgentPanel({ agent, showMetadata, onClose }: AgentPanelProps) {
             </div>
             <div>
               <span className="panel-key">pid</span>
-              {agent.pid}
+              {typeof agent.pid === 'number' ? agent.pid : '—'}
             </div>
+            {!agent.pid && agent.sessionPath && (
+              <div>
+                <span className="panel-key">session</span>
+                {agent.sessionPath.replace(/^opencode:/, '')}
+              </div>
+            )}
             <div>
               <span className="panel-key">kind</span>
               {agent.kind}

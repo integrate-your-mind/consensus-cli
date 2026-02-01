@@ -80,6 +80,55 @@ const pidSessionCache = new Map<
   number,
   { path: string; lastSeenAt: number; startMs?: number }
 >();
+
+const opencodePrefetchFailures = new Map<
+  string,
+  { count: number; firstAt: number; cooldownUntil?: number }
+>();
+const OPENCODE_PREFETCH_FAILURE_WINDOW_MS = 10_000;
+const OPENCODE_PREFETCH_FAILURE_THRESHOLD = 3;
+const OPENCODE_PREFETCH_COOLDOWN_MS = 30_000;
+
+// Track subagent observation times for hold mechanism
+const subagentSeen = new Map<
+  string,
+  { lastAt?: number; observedAt?: number }
+>();
+
+function getOpencodePrefetchKey(host: string, port: number): string {
+  return `${host}:${port}`;
+}
+
+function shouldSkipOpenCodePrefetch(key: string, now: number): boolean {
+  const entry = opencodePrefetchFailures.get(key);
+  if (!entry) return false;
+  if (typeof entry.cooldownUntil === "number" && now < entry.cooldownUntil) {
+    return true;
+  }
+  if (typeof entry.cooldownUntil === "number" && now >= entry.cooldownUntil) {
+    opencodePrefetchFailures.delete(key);
+  }
+  return false;
+}
+
+function recordOpenCodePrefetchFailure(key: string, now: number): void {
+  const entry = opencodePrefetchFailures.get(key);
+  if (!entry || now - entry.firstAt > OPENCODE_PREFETCH_FAILURE_WINDOW_MS) {
+    opencodePrefetchFailures.set(key, { count: 1, firstAt: now });
+    return;
+  }
+  entry.count += 1;
+  if (entry.count >= OPENCODE_PREFETCH_FAILURE_THRESHOLD) {
+    entry.cooldownUntil = now + OPENCODE_PREFETCH_COOLDOWN_MS;
+  }
+  opencodePrefetchFailures.set(key, entry);
+}
+
+function recordOpenCodePrefetchSuccess(key: string): void {
+  if (opencodePrefetchFailures.has(key)) {
+    opencodePrefetchFailures.delete(key);
+  }
+}
 const opencodeServerLogged = new Set<number>();
 const opencodeSessionByPidCache = new Map<
   number,
@@ -146,10 +195,18 @@ function consumeDirtySessions(): Set<string> {
   return dirty;
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error("Scan cancelled");
+  error.name = "AbortError";
+  throw error;
+}
+
 type ScanMode = "fast" | "full";
 export interface ScanOptions {
   mode?: ScanMode;
   includeActivity?: boolean;
+  signal?: AbortSignal;
 }
 
 type PsProcess = Awaited<ReturnType<typeof psList>>[number];
@@ -409,6 +466,22 @@ function parseTimestamp(value?: string | number): number | undefined {
     if (!Number.isNaN(parsed)) return parsed;
   }
   return undefined;
+}
+
+function toMs(value: unknown): number | undefined {
+  if (typeof value === "number" || typeof value === "string") {
+    return parseTimestamp(value);
+  }
+  return undefined;
+}
+
+function maxMs(...values: Array<number | undefined>): number | undefined {
+  let max: number | undefined;
+  for (const value of values) {
+    if (typeof value !== "number" || !Number.isFinite(value)) continue;
+    if (max === undefined || value > max) max = value;
+  }
+  return max;
 }
 
 function deriveTitle(
@@ -683,6 +756,8 @@ function findRepoRoot(cwd: string): string | null {
 export async function scanCodexProcesses(options: ScanOptions = {}): Promise<SnapshotPayload> {
   const now = Date.now();
   const mode: ScanMode = options.mode ?? "full";
+  const signal = options.signal;
+  throwIfAborted(signal);
   const includeActivity = options.includeActivity !== false;
   const scanTimer = startProfile("total", mode);
   const dirtySessions = includeActivity && mode === "fast" ? consumeDirtySessions() : null;
@@ -914,6 +989,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       ? getOpenCodeSessions(opencodeHost, opencodePort, {
           silent: true,
           timeoutMs,
+          signal,
         }).then((result) => {
           opencodeSessionCache = result;
           opencodeSessionCacheAt = now;
@@ -922,12 +998,14 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       : Promise.resolve(opencodeSessionCache);
 
   const opencodeResultRaw = await opencodeResultPromise;
+  throwIfAborted(signal);
   endProfile(opencodeTimer, { ok: opencodeResultRaw?.ok ? 1 : 0 });
   const opencodeResult = opencodeResultRaw ?? {
     ok: false,
     sessions: [],
     reachable: false,
   };
+  throwIfAborted(signal);
   await ensureOpenCodeServer(opencodeHost, opencodePort, opencodeResult, opencodeProcs.length > 0);
   if (opencodeProcs.length > 0 || opencodeResult.ok) {
     ensureOpenCodeEventStream(opencodeHost, opencodePort);
@@ -1004,63 +1082,141 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     2500,
     resolveMs(process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS, 2500)
   );
-  const getCachedOpenCodeSessionActivity = async (sessionId: string) => {
+  const opencodePrefetchKey = getOpencodePrefetchKey(opencodeHost, opencodePort);
+  const getCachedOpenCodeSessionActivity = async (
+    sessionId: string,
+    options: { signal?: AbortSignal; timeoutMs?: number; cache?: boolean } = {}
+  ) => {
     const cached = opencodeMessageActivityCache.get(sessionId);
     if (cached) return cached;
     const result = await getOpenCodeSessionActivity(
       sessionId,
       opencodeHost,
       opencodePort,
-      { silent: true, timeoutMs: 2000 }
+      { silent: true, timeoutMs: options.timeoutMs ?? 2000, signal: options.signal }
     );
-    opencodeMessageActivityCache.set(sessionId, result);
+    if (options.cache !== false && result.error !== "aborted" && result.error !== "timeout") {
+      opencodeMessageActivityCache.set(sessionId, result);
+    }
     return result;
   };
   const opencodeActiveSessionIdsByDir = new Map<string, string[]>();
-  const prefetchActiveSessionsByDir = async () => {
-    const tasks: Promise<void>[] = [];
-    for (const [dir, sessions] of opencodeAllSessionsByDir.entries()) {
-      const tuiCount = opencodeTuiByDir.get(dir)?.length ?? 0;
-      if (tuiCount === 0) continue;
-      const minCandidates = Math.max(tuiCount, 2);
-      tasks.push(
-        (async () => {
-          const activeIds: string[] = [];
-          let checked = 0;
-          for (const session of sessions) {
-            if (checked >= minCandidates && activeIds.length >= tuiCount) break;
-            const id = getOpenCodeSessionId(session);
-            if (!id) {
-              checked += 1;
-              continue;
-            }
-            const statusActivity = getOpenCodeActivityBySession(id);
-            const statusValue = statusActivity?.lastStatus?.toLowerCase();
-            const statusAt = statusActivity?.lastStatusAt;
-            const statusFresh =
-              typeof statusAt === "number" && now - statusAt <= opencodeStatusFreshMs;
-            if (statusValue && statusFresh) {
-              if (statusValue !== "idle") {
-                activeIds.push(id);
+  const prefetchActiveSessionsByDir = async (signal?: AbortSignal) => {
+    if (mode === "fast") return;
+    if (!opencodeApiAvailable) return;
+    if (signal?.aborted) return;
+    if (shouldSkipOpenCodePrefetch(opencodePrefetchKey, now)) return;
+
+    const prefetchBudgetMs = 2500;
+    if (!Number.isFinite(prefetchBudgetMs) || prefetchBudgetMs <= 0) return;
+    const prefetchCallTimeoutMs = Math.min(750, prefetchBudgetMs);
+    const prefetchDeadline = Date.now() + prefetchBudgetMs;
+
+    const entries = Array.from(opencodeAllSessionsByDir.entries());
+    if (entries.length === 0) return;
+
+    const prefetchController = new AbortController();
+    let prefetchTimeoutId: ReturnType<typeof setTimeout> | undefined;
+    let onScanAbort: (() => void) | undefined;
+
+    const abortPrefetch = (reason?: unknown) => {
+      if (prefetchController.signal.aborted) return;
+      try {
+        prefetchController.abort(reason);
+      } catch {
+        prefetchController.abort();
+      }
+    };
+
+    if (signal) {
+      if (signal.aborted) {
+        abortPrefetch(signal.reason);
+      } else {
+        onScanAbort = () => abortPrefetch(signal.reason);
+        signal.addEventListener("abort", onScanAbort, { once: true });
+      }
+    }
+    prefetchTimeoutId = setTimeout(() => abortPrefetch(), prefetchBudgetMs);
+
+    const prefetchSignal = prefetchController.signal;
+    const hasBudget = () => !prefetchSignal.aborted && Date.now() < prefetchDeadline;
+
+    const prefetchEffect = Effect.forEach(
+      entries,
+      ([dir, sessions]) =>
+        Effect.tryPromise({
+          try: async () => {
+            if (!hasBudget()) return;
+            const tuiCount = opencodeTuiByDir.get(dir)?.length ?? 0;
+            if (tuiCount === 0) return;
+
+            const minCandidates = Math.max(tuiCount, 2);
+            const hardCap = 10;
+            const absoluteCap = 20;
+            const cappedLimit = minCandidates > hardCap ? absoluteCap : hardCap;
+            const maxCandidates = Math.min(sessions.length, cappedLimit);
+            if (maxCandidates <= 0) return;
+
+            const activeIds: string[] = [];
+            let checked = 0;
+            const candidates = sessions.slice(0, maxCandidates);
+
+            for (const session of candidates) {
+              if (!hasBudget()) return;
+              if (checked >= minCandidates && activeIds.length >= tuiCount) break;
+              const id = getOpenCodeSessionId(session);
+              if (!id) {
+                checked += 1;
+                continue;
+              }
+              const statusActivity = getOpenCodeActivityBySession(id);
+              const statusValue = statusActivity?.lastStatus?.toLowerCase();
+              const statusAt = statusActivity?.lastStatusAt;
+              const statusFresh =
+                typeof statusAt === "number" && now - statusAt <= opencodeStatusFreshMs;
+              if (statusValue && statusFresh) {
+                if (!/idle|stopped|paused/.test(statusValue)) {
+                  activeIds.push(id);
+                }
+                checked += 1;
+                continue;
+              }
+              const activity = await getCachedOpenCodeSessionActivity(id, {
+                signal: prefetchSignal,
+                timeoutMs: prefetchCallTimeoutMs,
+                cache: false,
+              });
+              if (activity.ok) {
+                recordOpenCodePrefetchSuccess(opencodePrefetchKey);
+                if (activity.inFlight) {
+                  activeIds.push(id);
+                }
+              } else if (activity.error !== "aborted" && activity.error !== "timeout") {
+                recordOpenCodePrefetchFailure(opencodePrefetchKey, Date.now());
               }
               checked += 1;
-              continue;
             }
-            const activity = await getCachedOpenCodeSessionActivity(id);
-            if (activity.ok && activity.inFlight) {
-              activeIds.push(id);
+
+            if (activeIds.length > 0) {
+              opencodeActiveSessionIdsByDir.set(dir, activeIds);
             }
-            checked += 1;
-          }
-          if (activeIds.length > 0) {
-            opencodeActiveSessionIdsByDir.set(dir, activeIds);
-          }
-        })()
-      );
+          },
+          catch: () => undefined,
+        }).pipe(Effect.catchAll(() => Effect.void)),
+      { concurrency: 5 }
+    ).pipe(Effect.asVoid);
+
+    try {
+      await runPromise(prefetchEffect);
+    } finally {
+      if (prefetchTimeoutId) clearTimeout(prefetchTimeoutId);
+      if (signal && onScanAbort) {
+        signal.removeEventListener("abort", onScanAbort);
+      }
     }
-    await Promise.all(tasks);
   };
-  await prefetchActiveSessionsByDir();
+  await prefetchActiveSessionsByDir(signal);
+  throwIfAborted(signal);
   const cacheMatchesHome =
     sessionCache.home === codexHome && sessionCache.sessions.length > 0;
   let sessions: SessionFile[] = [];
@@ -1529,7 +1685,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       ? resolveMs(process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS, 0)
       : undefined;
   const usedOpenCodeSessionIds = new Map<string, number>();
+  const assignedOpenCodeSessionIds = new Set<string>();
   for (const proc of opencodeProcs) {
+    if (signal?.aborted) break;
     const stats = usage[proc.pid] || ({} as pidusage.Status);
     const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
     const mem = typeof stats.memory === "number" ? stats.memory : 0;
@@ -1601,6 +1759,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
     if (sessionId) {
       opencodeSessionByPidCache.set(proc.pid, { sessionId, lastSeenAt: now });
+      if (opencodeSessionsById.has(sessionId)) {
+        assignedOpenCodeSessionIds.add(sessionId);
+      }
     }
     const sessionTitle = normalizeTitle(
       !isServer ? session?.title || session?.name || storageSession?.title : undefined
@@ -1697,11 +1858,13 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
     // For TUI sessions, poll message API for activity; session.status (if present) is authoritative.
     if (!isServer && sessionId && opencodeApiAvailable) {
-      const msgActivity = await getCachedOpenCodeSessionActivity(sessionId);
+      const msgActivity = await getCachedOpenCodeSessionActivity(sessionId, { signal });
       if (msgActivity.ok) {
         messageActivityOk = true;
-        if (!statusAuthorityLower || !statusAuthorityIsIdle) {
-          // Message API is authoritative for TUI when no session status is known.
+        const msgHasSignal =
+          msgActivity.inFlight || typeof msgActivity.lastActivityAt === "number";
+        if (msgHasSignal && (!statusAuthorityLower || !statusAuthorityIsIdle)) {
+          // Message API is authoritative when it reports activity.
           inFlight = msgActivity.inFlight;
         }
         if (typeof msgActivity.lastActivityAt === "number") {
@@ -1847,6 +2010,281 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     });
   }
 
+  const debugSubagents = process.env.CONSENSUS_DEBUG_OPENCODE_SUBAGENTS === "1";
+  const opencodeSubagentWindowMs = resolveMs(
+    process.env.CONSENSUS_OPENCODE_STALE_SUBAGENT_MS ||
+      process.env.CONSENSUS_OPENCODE_STALE_ACTIVE_MS,
+    300_000
+  );
+  const opencodeSubagentHoldMs = resolveMs(
+    process.env.CONSENSUS_OPENCODE_SUBAGENT_HOLD_MS,
+    120_000
+  );
+  if (opencodeApiAvailable && assignedOpenCodeSessionIds.size > 0) {
+    const subagentCandidates: Array<{
+      session: OpenCodeSession;
+      sessionId: string;
+      parentId: string;
+      eventActivity: ReturnType<typeof getOpenCodeActivityBySession> | null;
+      messageActivity: Awaited<ReturnType<typeof getOpenCodeSessionActivity>> | null;
+      activityAt: number;
+      inFlight: boolean;
+    }> = [];
+    for (const session of opencodeSessions) {
+      const sessionId = getOpenCodeSessionId(session);
+      if (!sessionId) continue;
+      const parentId = typeof (session as { parentID?: string }).parentID === "string"
+        ? (session as { parentID?: string }).parentID
+        : undefined;
+      if (!parentId) continue;
+      if (!assignedOpenCodeSessionIds.has(parentId)) continue;
+      if (assignedOpenCodeSessionIds.has(sessionId)) continue;
+
+      const eventActivity = getOpenCodeActivityBySession(sessionId);
+      const messageActivity =
+        opencodeMessageActivityCache.get(sessionId) ||
+        (await getCachedOpenCodeSessionActivity(sessionId, {
+          signal,
+          timeoutMs: 750,
+          cache: true,
+        }));
+      const sessionUpdatedAt = opencodeSessionTimestamp(session);
+      const activityAt = maxMs(
+        toMs(eventActivity?.lastActivityAt),
+        toMs(messageActivity?.lastActivityAt),
+        sessionUpdatedAt
+      );
+      const inFlight =
+        eventActivity?.inFlight === true || messageActivity?.inFlight === true;
+      const hasEventActivity =
+        typeof activityAt === "number" &&
+        Number.isFinite(opencodeSubagentWindowMs) &&
+        opencodeSubagentWindowMs > 0 &&
+        now - activityAt <= opencodeSubagentWindowMs;
+
+      // Observation hold: track when we see activity timestamps increase
+      const entry = subagentSeen.get(sessionId);
+      if (!entry) {
+        // First sight: store lastAt, and set observedAt only if within remote window
+        const newEntry: { lastAt?: number; observedAt?: number } = {
+          lastAt: activityAt,
+        };
+        if (
+          typeof activityAt === "number" &&
+          now - activityAt <= opencodeSubagentWindowMs
+        ) {
+          newEntry.observedAt = now;
+        }
+        subagentSeen.set(sessionId, newEntry);
+      } else if (
+        typeof activityAt === "number" &&
+        (typeof entry.lastAt !== "number" || activityAt > entry.lastAt)
+      ) {
+        // Timestamp increased: update and refresh observedAt
+        entry.lastAt = activityAt;
+        entry.observedAt = now;
+      } else if (inFlight) {
+        // Currently in flight: refresh observedAt
+        entry.observedAt = now;
+      }
+
+      const observed = subagentSeen.get(sessionId);
+      const hasRecentObserved =
+        typeof observed?.observedAt === "number" &&
+        now - observed.observedAt <= opencodeSubagentHoldMs;
+
+      if (!inFlight && !hasEventActivity && !hasRecentObserved) {
+        if (debugSubagents) {
+          const ageMs =
+            typeof activityAt === "number" ? Math.max(0, now - activityAt) : undefined;
+          const obsAgeMs =
+            typeof observed?.observedAt === "number"
+              ? now - observed.observedAt
+              : undefined;
+          const remoteSkewMs = ageMs;
+          console.log(
+            `[consensus][subagent-drop] ${sessionId} ` +
+              `inFlight=${inFlight} ` +
+              `hasEventActivity=${hasEventActivity} ` +
+              `hasRecentObserved=${hasRecentObserved} ` +
+              `sseAt=${String(eventActivity?.lastActivityAt)} ` +
+              `msgAt=${String(messageActivity?.lastActivityAt)} ` +
+              `updatedAt=${String(sessionUpdatedAt)} ` +
+              `effectiveAt=${String(activityAt)} ` +
+              `ageMs=${String(ageMs)} ` +
+              `remoteSkewMs=${String(remoteSkewMs)} ` +
+              `observedAt=${String(observed?.observedAt)} ` +
+              `obsAgeMs=${String(obsAgeMs)} ` +
+              `windowMs=${opencodeSubagentWindowMs} ` +
+              `holdMs=${opencodeSubagentHoldMs}`
+          );
+        }
+        continue;
+      }
+      if (debugSubagents) {
+        console.log(
+          `[consensus][subagent-keep] ${sessionId} ` +
+            `inFlight=${inFlight} ` +
+            `hasEventActivity=${hasEventActivity} ` +
+            `hasRecentObserved=${hasRecentObserved} ` +
+            `effectiveAt=${String(activityAt)} ` +
+            `windowMs=${opencodeSubagentWindowMs} ` +
+            `holdMs=${opencodeSubagentHoldMs}`
+        );
+      }
+
+      subagentCandidates.push({
+        session,
+        sessionId,
+        parentId,
+        eventActivity,
+        messageActivity,
+        activityAt: activityAt ?? (inFlight ? now : 0),
+        inFlight,
+      });
+    }
+
+    if (subagentCandidates.length) {
+      subagentCandidates.sort((a, b) => b.activityAt - a.activityAt);
+      const capped = subagentCandidates.slice(0, 20);
+      for (const candidate of capped) {
+        const { session, sessionId, parentId, eventActivity, messageActivity, inFlight } = candidate;
+
+        const sessionIdentity = `opencode:${sessionId}`;
+        const id = `session:${sessionId}`;
+        const cached = activityCache.get(id);
+        const statusRaw = typeof (session as { status?: string }).status === "string"
+          ? (session as { status?: string }).status
+          : undefined;
+        const status = eventActivity?.lastStatus ?? statusRaw?.toLowerCase();
+        const statusIsError = !!status && /error|failed|failure/.test(status);
+        const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
+        const statusIsActive = !!status && /running|active|processing|busy|retry/.test(status);
+        const sessionUpdatedAt = opencodeSessionTimestamp(session);
+        const lastActivityAt = maxMs(
+          toMs(eventActivity?.lastActivityAt),
+          toMs(messageActivity?.lastActivityAt),
+          sessionUpdatedAt
+        );
+        const lastEventAt = eventActivity?.lastEventAt;
+        const hasError = !!eventActivity?.hasError || statusIsError;
+
+        const activity = deriveOpenCodeState({
+          hasError,
+          lastEventAt,
+          lastActivityAt,
+          inFlight,
+          status,
+          now,
+          previousActiveAt: cached?.lastActiveAt,
+          eventWindowMs: opencodeEventWindowMs,
+          holdMs: opencodeHoldMs,
+          inFlightIdleMs: opencodeInFlightIdleMs,
+          strictInFlight: opencodeStrictInFlight,
+        });
+        let state = activity.state;
+        let reason = activity.reason || "session";
+        const activityLastActiveAt = activity.lastActiveAt ?? cached?.lastActiveAt;
+        if (
+          activity.state === "active" &&
+          activity.reason === "hold" &&
+          typeof activity.lastActiveAt === "number" &&
+          opencodeHoldMs > 0
+        ) {
+          bumpNextTickAt(activity.lastActiveAt + opencodeHoldMs);
+        }
+
+        const hasSignal =
+          statusIsIdle ||
+          statusIsActive ||
+          statusIsError ||
+          typeof lastActivityAt === "number" ||
+          typeof inFlight === "boolean";
+        if (!hasSignal && !activityLastActiveAt) {
+          state = "idle";
+          reason = "no_signal";
+        }
+
+        if (cached?.lastState && cached.lastState !== state) {
+          metricEffects.push(recordActivityTransition("opencode", cached.lastState, state, reason));
+          trackTransition("opencode", cached.lastState, state, reason);
+        }
+
+        activityCache.set(id, {
+          lastActiveAt: activityLastActiveAt,
+          lastSeenAt: now,
+          lastState: state,
+          lastReason: reason,
+          startMs: sessionUpdatedAt || undefined,
+        });
+        seenIds.add(id);
+
+        const sessionTitle = normalizeTitle(
+          (session as { title?: string; name?: string }).title ||
+            (session as { title?: string; name?: string }).name
+        );
+        const sessionCwd =
+          (session as { directory?: string; cwd?: string }).directory ||
+          (session as { directory?: string; cwd?: string }).cwd;
+        const cwd = redactText(sessionCwd) || sessionCwd;
+        const repoRoot = sessionCwd ? findRepoRoot(sessionCwd) : null;
+        const repoName = repoRoot ? path.basename(repoRoot) : undefined;
+        const summary = eventActivity?.summary;
+        const events = eventActivity?.events;
+        const cmd = `opencode session ${sessionId}`;
+        const cmdShort = shortenCmd(cmd);
+        const doing = summary?.current || sessionTitle;
+
+        agents.push({
+          identity: sessionIdentity,
+          id,
+          pid: undefined,
+          sessionId,
+          parentSessionId: parentId,
+          startedAt: sessionUpdatedAt ? Math.floor(sessionUpdatedAt / 1000) : undefined,
+          lastEventAt,
+          lastActivityAt,
+          activityReason: reason,
+          title: sessionTitle,
+          cmd,
+          cmdShort,
+          kind: "opencode-session",
+          cpu: 0,
+          mem: 0,
+          state,
+          doing: redactText(doing) || doing,
+          sessionPath: `opencode:${sessionId}`,
+          repo: repoName,
+          cwd,
+          model:
+            typeof (session as { model?: string }).model === "string"
+              ? (session as { model?: string }).model
+              : undefined,
+          summary: summary ? sanitizeSummary(summary) : undefined,
+          events,
+        });
+      }
+    }
+
+    // Prune old subagent seen entries (1 hour retention)
+    for (const [id, entry] of subagentSeen) {
+      if (entry.observedAt && now - entry.observedAt > 3_600_000) {
+        subagentSeen.delete(id);
+        continue;
+      }
+      if (!entry.observedAt) {
+        if (typeof entry.lastAt === "number" && now - entry.lastAt > 3_600_000) {
+          subagentSeen.delete(id);
+          continue;
+        }
+        if (entry.lastAt === undefined) {
+          subagentSeen.delete(id);
+        }
+      }
+    }
+  }
+
+  throwIfAborted(signal);
   for (const proc of claudeProcs) {
     const stats = usage[proc.pid] || ({} as pidusage.Status);
     const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
