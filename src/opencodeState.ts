@@ -17,6 +17,8 @@ export interface OpenCodeStateInput {
   holdMs?: number;
   inFlightIdleMs?: number;
   strictInFlight?: boolean;
+  /** If true, event activity is present and hold should be refreshed even if timestamp hasn't increased */
+  hasEventActivity?: boolean;
 }
 
 export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResult {
@@ -61,6 +63,11 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
   const hasNewActivity =
     recentActivity &&
     (typeof previousActiveAt !== "number" || activityAt > previousActiveAt);
+
+  // Fix A.2: Refresh hold when hasEventActivity is true, even if timestamp hasn't increased.
+  // This ensures subagents with ongoing event activity maintain their hold.
+  const shouldRefreshHold = hasNewActivity || (input.hasEventActivity && recentActivity);
+
   if (
     inFlight &&
     typeof inFlightIdleMs === "number" &&
@@ -69,10 +76,15 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
   ) {
     inFlight = false;
   }
+
+  // Fix A.1: When inFlight=true but activityAt is missing, pass now as the event time
+  // to set lastActiveAt. This prevents immediate drop on first sight.
+  const effectiveEventAt = shouldRefreshHold ? activityAt : (inFlight && typeof activityAt !== "number" ? now : undefined);
+
   const activity = deriveStateWithHold({
     cpu: 0,
     hasError: input.hasError,
-    lastEventAt: hasNewActivity ? activityAt : undefined,
+    lastEventAt: effectiveEventAt,
     inFlight,
     previousActiveAt,
     now,
@@ -83,6 +95,13 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
 
   let state: AgentState = activity.state;
   let reason = activity.reason;
+
+  // When inFlight=true and no activity timestamp, ensure lastActiveAt is set to now
+  let lastActiveAt = activity.lastActiveAt;
+  if (inFlight && typeof lastActiveAt !== "number") {
+    lastActiveAt = now;
+  }
+
   if (statusIsError) {
     state = "error";
     reason = "status_error";
@@ -90,15 +109,15 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
     state = "idle";
     reason = "status_idle";
   } else if (statusIsActive && state !== "active") {
-    if (!activity.lastActiveAt) {
+    if (!lastActiveAt) {
       state = "idle";
       reason = "status_active_no_signal";
     }
   }
 
   if (state === "idle") {
-    return { state, lastActiveAt: activity.lastActiveAt, reason };
+    return { state, lastActiveAt, reason };
   }
 
-  return { state, lastActiveAt: activity.lastActiveAt, reason };
+  return { state, lastActiveAt, reason };
 }

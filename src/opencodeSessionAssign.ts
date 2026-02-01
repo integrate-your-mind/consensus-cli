@@ -21,6 +21,10 @@ export type OpenCodeSessionLike = {
   created?: unknown;
   status?: unknown;
   model?: unknown;
+  // Parent session fields - indicates this is a child/subagent session
+  parentID?: string;
+  parentId?: string;
+  parent_id?: string;
 };
 
 type UsedSessionMap = Map<string, number>;
@@ -48,16 +52,27 @@ export const getOpenCodeSessionId = (session: unknown): string | undefined => {
   return trimmed ? trimmed : undefined;
 };
 
+/**
+ * Check if a session is a child/subagent session by looking for parent session markers.
+ * Subagent sessions have a parent session ID and should not be assigned to TUI processes.
+ */
+export const isOpenCodeChildSession = (session: unknown): boolean => {
+  if (!session || typeof session !== "object") return false;
+  const target = session as OpenCodeSessionLike;
+  const parentId = target.parentID || target.parentId || target.parent_id;
+  return typeof parentId === "string" && parentId.trim().length > 0;
+};
+
 export const getOpenCodeSessionPid = (session: unknown): number | undefined => {
   if (!session || typeof session !== "object") return undefined;
   const target = session as OpenCodeSessionLike;
   return coerceNumber(
     target.pid ??
-      target.processId ??
-      target.processID ??
-      target.process?.pid ??
-      target.process?.processId ??
-      target.process?.processID
+    target.processId ??
+    target.processID ??
+    target.process?.pid ??
+    target.process?.processId ??
+    target.process?.processID
   );
 };
 
@@ -93,14 +108,18 @@ export const pickOpenCodeSessionByDir = <T extends OpenCodeSessionLike>({
   const activeIds = activeSessionIdsByDir.get(dir);
   if (activeIds) {
     for (const id of activeIds) {
-      if (!markOpenCodeSessionUsed(usedSessionIds, id, pid)) continue;
+      // Skip child sessions in activeIds
       const activeSession = sessionsById.get(id);
+      if (activeSession && isOpenCodeChildSession(activeSession)) continue;
+      if (!markOpenCodeSessionUsed(usedSessionIds, id, pid)) continue;
       if (activeSession) return activeSession;
       // If API no longer lists this session, keep id reserved to avoid collisions.
       return undefined;
     }
   }
   for (const session of sessions) {
+    // Skip child/subagent sessions
+    if (isOpenCodeChildSession(session)) continue;
     const id = getOpenCodeSessionId(session);
     if (!id) continue;
     if (!markOpenCodeSessionUsed(usedSessionIds, id, pid)) continue;
@@ -129,16 +148,23 @@ export const selectOpenCodeSessionForTui = <T extends OpenCodeSessionLike>({
   usedSessionIds: UsedSessionMap;
 }): { session?: T; sessionId?: string; source: "pid" | "cache" | "dir" | "none" } => {
   const sessionByPidId = getOpenCodeSessionId(sessionByPid);
-  if (sessionByPidId && markOpenCodeSessionUsed(usedSessionIds, sessionByPidId, pid)) {
+  // Skip child/subagent sessions - they should not be assigned to TUI processes
+  if (sessionByPidId && !isOpenCodeChildSession(sessionByPid) && markOpenCodeSessionUsed(usedSessionIds, sessionByPidId, pid)) {
     return { session: sessionByPid, sessionId: sessionByPidId, source: "pid" };
   }
 
   if (cachedSessionId && markOpenCodeSessionUsed(usedSessionIds, cachedSessionId, pid)) {
-    return {
-      session: sessionsById.get(cachedSessionId),
-      sessionId: cachedSessionId,
-      source: "cache",
-    };
+    // Check if cached session is a child session - if so, skip it
+    const cachedSession = sessionsById.get(cachedSessionId);
+    if (cachedSession && isOpenCodeChildSession(cachedSession)) {
+      // Cached session is a child - don't use it, fall through to dir-based lookup
+    } else {
+      return {
+        session: cachedSession,
+        sessionId: cachedSessionId,
+        source: "cache",
+      };
+    }
   }
 
   const byDir = pickOpenCodeSessionByDir({

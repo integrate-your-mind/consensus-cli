@@ -41,6 +41,7 @@ import {
   getOpenCodeSessionPid,
   markOpenCodeSessionUsed,
   selectOpenCodeSessionForTui,
+  isOpenCodeChildSession,
 } from "./opencodeSessionAssign.js";
 import { getOpenCodeSessionForDirectory } from "./opencodeStorage.js";
 import { deriveOpenCodeState } from "./opencodeState.js";
@@ -127,8 +128,8 @@ function endProfile(
   if (duration < profileThresholdMs) return;
   const parts = data
     ? Object.entries(data)
-        .filter(([, value]) => value !== undefined)
-        .map(([key, value]) => `${key}=${value}`)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => `${key}=${value}`)
     : [];
   const suffix = parts.length ? ` ${parts.join(" ")}` : "";
   const label = handle.extra ? `${handle.label} ${handle.extra}` : handle.label;
@@ -912,13 +913,13 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const opencodeResultPromise =
     shouldFetchOpenCode
       ? getOpenCodeSessions(opencodeHost, opencodePort, {
-          silent: true,
-          timeoutMs,
-        }).then((result) => {
-          opencodeSessionCache = result;
-          opencodeSessionCacheAt = now;
-          return result;
-        })
+        silent: true,
+        timeoutMs,
+      }).then((result) => {
+        opencodeSessionCache = result;
+        opencodeSessionCacheAt = now;
+        return result;
+      })
       : Promise.resolve(opencodeSessionCache);
 
   const opencodeResultRaw = await opencodeResultPromise;
@@ -943,13 +944,13 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     return (
       parseTimestamp(
         session.lastActivity ||
-          session.lastActivityAt ||
-          session.time?.updated ||
-          session.updatedAt ||
-          session.updated ||
-          session.time?.created ||
-          session.createdAt ||
-          session.created
+        session.lastActivityAt ||
+        session.time?.updated ||
+        session.updatedAt ||
+        session.updated ||
+        session.time?.created ||
+        session.createdAt ||
+        session.created
       ) ?? 0
     );
   };
@@ -1270,11 +1271,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const tailEntries: Array<[string, Awaited<ReturnType<typeof updateTail>>]> =
     includeActivity
       ? await Promise.all(
-          Array.from(tailTargets).map(async (sessionPath) => {
-            const tail = await updateTail(sessionPath, tailOptionsByPath.get(sessionPath));
-            return [sessionPath, tail] as const;
-          })
-        )
+        Array.from(tailTargets).map(async (sessionPath) => {
+          const tail = await updateTail(sessionPath, tailOptionsByPath.get(sessionPath));
+          return [sessionPath, tail] as const;
+        })
+      )
       : [];
   endProfile(tailsTimer, { updated: tailTargets.size, cached: cachedTails.size });
   const tailsByPath = new Map<string, Awaited<ReturnType<typeof updateTail>>>([
@@ -1316,7 +1317,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     };
     const sessionPath =
       pickBestJsonl(ctx.jsonlPaths) || normalizeSessionPath(session?.path);
-    
+
     // Get thread state from event store (webhook-based events)
     let threadId: string | undefined;
     let threadState = undefined;
@@ -1327,7 +1328,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         threadState = codexEventStore.getThreadState(threadId);
       }
     }
-    
+
     // Event store provides authoritative inFlight + lastActivityAt if available
     const eventInFlight = threadState?.inFlight ?? false;
     const eventActivityAt = threadState?.lastActivityAt;
@@ -1464,9 +1465,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       trackTransition("codex", prevState, state, reason);
       logActivityDecision(
         `codex state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
-          `inFlight=${inFlight ? 1 : 0} ` +
-          `lastActivity=${activityAt ?? "?"} ` +
-          `eventStore=${hasNotify ? "yes" : "no"}`
+        `inFlight=${inFlight ? 1 : 0} ` +
+        `lastActivity=${activityAt ?? "?"} ` +
+        `eventStore=${hasNotify ? "yes" : "no"}`
       );
     }
     // Don't track CPU for Codex - we're event-driven now
@@ -1567,15 +1568,15 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const sessionByPid = isServer ? undefined : opencodeSessionsByPid.get(proc.pid);
     const selection = !isServer
       ? selectOpenCodeSessionForTui({
-          pid: proc.pid,
-          dir: kind === "opencode-tui" ? cwdMatch : undefined,
-          sessionByPid,
-          cachedSessionId,
-          sessionsById: opencodeSessionsById,
-          sessionsByDir: opencodeAllSessionsByDir,
-          activeSessionIdsByDir: opencodeActiveSessionIdsByDir,
-          usedSessionIds: usedOpenCodeSessionIds,
-        })
+        pid: proc.pid,
+        dir: kind === "opencode-tui" ? cwdMatch : undefined,
+        sessionByPid,
+        cachedSessionId,
+        sessionsById: opencodeSessionsById,
+        sessionsByDir: opencodeAllSessionsByDir,
+        activeSessionIdsByDir: opencodeActiveSessionIdsByDir,
+        usedSessionIds: usedOpenCodeSessionIds,
+      })
       : { session: undefined, sessionId: undefined, source: "none" as const };
     const session = selection.session;
     let sessionId = selection.sessionId;
@@ -1583,7 +1584,8 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       !isServer && !session && cwdMatch
         ? await getOpenCodeSessionForDirectory(cwdMatch)
         : undefined;
-    if (!isServer && !sessionId && storageSession) {
+    // Filter out child/subagent sessions from storage fallback
+    if (!isServer && !sessionId && storageSession && !isOpenCodeChildSession(storageSession)) {
       const storageSessionId = getOpenCodeSessionId(storageSession);
       if (storageSessionId) {
         if (markOpenCodeSessionUsed(usedOpenCodeSessionIds, storageSessionId, proc.pid)) {
@@ -1594,8 +1596,12 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     if (!isServer && !sessionId) {
       const extractedId = extractOpenCodeSessionId(cmdRaw);
       if (extractedId) {
-        if (markOpenCodeSessionUsed(usedOpenCodeSessionIds, extractedId, proc.pid)) {
-          sessionId = extractedId;
+        // Check if extracted session ID points to a child session
+        const extractedSession = opencodeSessionsById.get(extractedId);
+        if (!extractedSession || !isOpenCodeChildSession(extractedSession)) {
+          if (markOpenCodeSessionUsed(usedOpenCodeSessionIds, extractedId, proc.pid)) {
+            sessionId = extractedId;
+          }
         }
       }
     }
@@ -1614,17 +1620,17 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
 
     const apiUpdatedAt = parseTimestamp(
       session?.lastActivity ||
-        session?.lastActivityAt ||
-        storageSession?.time?.updated ||
-        session?.time?.updated ||
-        session?.updatedAt ||
-        session?.updated
+      session?.lastActivityAt ||
+      storageSession?.time?.updated ||
+      session?.time?.updated ||
+      session?.updatedAt ||
+      session?.updated
     );
     const apiCreatedAt = parseTimestamp(
       storageSession?.time?.created ||
-        session?.time?.created ||
-        session?.createdAt ||
-        session?.created
+      session?.time?.created ||
+      session?.createdAt ||
+      session?.created
     );
     let doing: string | undefined = isServer ? "opencode server" : sessionTitle;
     let summary: WorkSummary | undefined;
@@ -1770,6 +1776,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       holdMs: opencodeHoldMs,
       inFlightIdleMs: useInFlightIdleMs,
       strictInFlight: opencodeStrictInFlight,
+      hasEventActivity: !!eventActivity,
     });
     let state = activity.state;
     let reason = activity.reason || "unknown";
@@ -1803,8 +1810,8 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       trackTransition("opencode", prevState, state, reason);
       logActivityDecision(
         `opencode state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
-          `cpu=${cpu.toFixed(2)} inFlight=${inFlight ? 1 : 0} ` +
-          `lastActivity=${lastActivityAt ?? "?"} status=${status ?? "?"}`
+        `cpu=${cpu.toFixed(2)} inFlight=${inFlight ? 1 : 0} ` +
+        `lastActivity=${lastActivityAt ?? "?"} status=${status ?? "?"}`
       );
     }
     activityCache.set(id, {
@@ -1914,7 +1921,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       trackTransition("claude", prevState, state, reason);
       logActivityDecision(
         `claude state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
-          `inFlight=${eventInFlight ? 1 : 0} lastEvent=${eventActivityAt ?? "?"}`
+        `inFlight=${eventInFlight ? 1 : 0} lastEvent=${eventActivityAt ?? "?"}`
       );
     }
     activityCache.set(id, {
@@ -2015,10 +2022,10 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const activityMeta =
     hasCounts || hasTransitions || typeof nextTickAt === "number"
       ? {
-          ...(hasCounts ? { counts: activityCountMeta } : {}),
-          ...(hasTransitions ? { transitions: activityTransitionMeta } : {}),
-          ...(typeof nextTickAt === "number" ? { nextTickAt } : {}),
-        }
+        ...(hasCounts ? { counts: activityCountMeta } : {}),
+        ...(hasTransitions ? { transitions: activityTransitionMeta } : {}),
+        ...(typeof nextTickAt === "number" ? { nextTickAt } : {}),
+      }
       : undefined;
   const meta = {
     opencode: {
