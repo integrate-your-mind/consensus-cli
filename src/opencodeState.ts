@@ -33,7 +33,7 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
     return { state, lastActiveAt: input.inFlight ? now : undefined, reason };
   }
   const holdMs =
-    input.holdMs ?? Number(process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS || 3000);
+    input.holdMs ?? Number(process.env.CONSENSUS_OPENCODE_SUBAGENT_HOLD_MS || process.env.CONSENSUS_OPENCODE_ACTIVE_HOLD_MS || 3000);
   const envInFlightIdle = process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS;
   const envInFlightTimeout = process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS;
   let inFlightIdleMs: number | undefined =
@@ -51,7 +51,7 @@ export function deriveOpenCodeState(input: OpenCodeStateInput): ActivityHoldResu
     inFlightIdleMs = undefined;
   }
   const eventWindowMs =
-    input.eventWindowMs ?? Number(process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS || 1000);
+    input.eventWindowMs ?? Number(process.env.CONSENSUS_OPENCODE_STALE_SUBAGENT_MS || process.env.CONSENSUS_OPENCODE_EVENT_ACTIVE_MS || 1000);
   const activityAt =
     typeof input.lastActivityAt === "number" ? input.lastActivityAt : undefined;
   const previousActiveAt = input.previousActiveAt;
