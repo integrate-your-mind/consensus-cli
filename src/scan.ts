@@ -35,6 +35,7 @@ import {
   ensureOpenCodeEventStream,
   getOpenCodeActivityByPid,
   getOpenCodeActivityBySession,
+  getOpenCodeSessionIds,
 } from "./opencodeEvents.js";
 import {
   getOpenCodeSessionId,
@@ -85,6 +86,7 @@ const opencodeSessionByPidCache = new Map<
   number,
   { sessionId: string; lastSeenAt: number }
 >();
+const subagentSeen = new Map<string, { lastAt?: number; observedAt?: number }>();
 const START_MS_EPSILON_MS = 1000;
 
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
@@ -127,8 +129,8 @@ function endProfile(
   if (duration < profileThresholdMs) return;
   const parts = data
     ? Object.entries(data)
-        .filter(([, value]) => value !== undefined)
-        .map(([key, value]) => `${key}=${value}`)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => `${key}=${value}`)
     : [];
   const suffix = parts.length ? ` ${parts.join(" ")}` : "";
   const label = handle.extra ? `${handle.label} ${handle.extra}` : handle.label;
@@ -912,13 +914,13 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const opencodeResultPromise =
     shouldFetchOpenCode
       ? getOpenCodeSessions(opencodeHost, opencodePort, {
-          silent: true,
-          timeoutMs,
-        }).then((result) => {
-          opencodeSessionCache = result;
-          opencodeSessionCacheAt = now;
-          return result;
-        })
+        silent: true,
+        timeoutMs,
+      }).then((result) => {
+        opencodeSessionCache = result;
+        opencodeSessionCacheAt = now;
+        return result;
+      })
       : Promise.resolve(opencodeSessionCache);
 
   const opencodeResultRaw = await opencodeResultPromise;
@@ -943,13 +945,13 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     return (
       parseTimestamp(
         session.lastActivity ||
-          session.lastActivityAt ||
-          session.time?.updated ||
-          session.updatedAt ||
-          session.updated ||
-          session.time?.created ||
-          session.createdAt ||
-          session.created
+        session.lastActivityAt ||
+        session.time?.updated ||
+        session.updatedAt ||
+        session.updated ||
+        session.time?.created ||
+        session.createdAt ||
+        session.created
       ) ?? 0
     );
   };
@@ -1270,11 +1272,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const tailEntries: Array<[string, Awaited<ReturnType<typeof updateTail>>]> =
     includeActivity
       ? await Promise.all(
-          Array.from(tailTargets).map(async (sessionPath) => {
-            const tail = await updateTail(sessionPath, tailOptionsByPath.get(sessionPath));
-            return [sessionPath, tail] as const;
-          })
-        )
+        Array.from(tailTargets).map(async (sessionPath) => {
+          const tail = await updateTail(sessionPath, tailOptionsByPath.get(sessionPath));
+          return [sessionPath, tail] as const;
+        })
+      )
       : [];
   endProfile(tailsTimer, { updated: tailTargets.size, cached: cachedTails.size });
   const tailsByPath = new Map<string, Awaited<ReturnType<typeof updateTail>>>([
@@ -1316,7 +1318,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     };
     const sessionPath =
       pickBestJsonl(ctx.jsonlPaths) || normalizeSessionPath(session?.path);
-    
+
     // Get thread state from event store (webhook-based events)
     let threadId: string | undefined;
     let threadState = undefined;
@@ -1327,7 +1329,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         threadState = codexEventStore.getThreadState(threadId);
       }
     }
-    
+
     // Event store provides authoritative inFlight + lastActivityAt if available
     const eventInFlight = threadState?.inFlight ?? false;
     const eventActivityAt = threadState?.lastActivityAt;
@@ -1464,9 +1466,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       trackTransition("codex", prevState, state, reason);
       logActivityDecision(
         `codex state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
-          `inFlight=${inFlight ? 1 : 0} ` +
-          `lastActivity=${activityAt ?? "?"} ` +
-          `eventStore=${hasNotify ? "yes" : "no"}`
+        `inFlight=${inFlight ? 1 : 0} ` +
+        `lastActivity=${activityAt ?? "?"} ` +
+        `eventStore=${hasNotify ? "yes" : "no"}`
       );
     }
     // Don't track CPU for Codex - we're event-driven now
@@ -1567,15 +1569,15 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const sessionByPid = isServer ? undefined : opencodeSessionsByPid.get(proc.pid);
     const selection = !isServer
       ? selectOpenCodeSessionForTui({
-          pid: proc.pid,
-          dir: kind === "opencode-tui" ? cwdMatch : undefined,
-          sessionByPid,
-          cachedSessionId,
-          sessionsById: opencodeSessionsById,
-          sessionsByDir: opencodeAllSessionsByDir,
-          activeSessionIdsByDir: opencodeActiveSessionIdsByDir,
-          usedSessionIds: usedOpenCodeSessionIds,
-        })
+        pid: proc.pid,
+        dir: kind === "opencode-tui" ? cwdMatch : undefined,
+        sessionByPid,
+        cachedSessionId,
+        sessionsById: opencodeSessionsById,
+        sessionsByDir: opencodeAllSessionsByDir,
+        activeSessionIdsByDir: opencodeActiveSessionIdsByDir,
+        usedSessionIds: usedOpenCodeSessionIds,
+      })
       : { session: undefined, sessionId: undefined, source: "none" as const };
     const session = selection.session;
     let sessionId = selection.sessionId;
@@ -1614,17 +1616,17 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
 
     const apiUpdatedAt = parseTimestamp(
       session?.lastActivity ||
-        session?.lastActivityAt ||
-        storageSession?.time?.updated ||
-        session?.time?.updated ||
-        session?.updatedAt ||
-        session?.updated
+      session?.lastActivityAt ||
+      storageSession?.time?.updated ||
+      session?.time?.updated ||
+      session?.updatedAt ||
+      session?.updated
     );
     const apiCreatedAt = parseTimestamp(
       storageSession?.time?.created ||
-        session?.time?.created ||
-        session?.createdAt ||
-        session?.created
+      session?.time?.created ||
+      session?.createdAt ||
+      session?.created
     );
     let doing: string | undefined = isServer ? "opencode server" : sessionTitle;
     let summary: WorkSummary | undefined;
@@ -1803,8 +1805,8 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       trackTransition("opencode", prevState, state, reason);
       logActivityDecision(
         `opencode state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
-          `cpu=${cpu.toFixed(2)} inFlight=${inFlight ? 1 : 0} ` +
-          `lastActivity=${lastActivityAt ?? "?"} status=${status ?? "?"}`
+        `cpu=${cpu.toFixed(2)} inFlight=${inFlight ? 1 : 0} ` +
+        `lastActivity=${lastActivityAt ?? "?"} status=${status ?? "?"}`
       );
     }
     activityCache.set(id, {
@@ -1844,6 +1846,143 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       model,
       summary: safeSummary,
       events,
+    });
+  }
+
+  const opencodeSubagentHoldMs = resolveMs(
+    process.env.CONSENSUS_OPENCODE_SUBAGENT_HOLD_MS,
+    120_000
+  );
+  const opencodeSubagentWindowMs = 300_000; // 5 minute default remote window
+
+  const allOpenCodeSessionIds = getOpenCodeSessionIds();
+  for (const sessionId of allOpenCodeSessionIds) {
+    if (usedOpenCodeSessionIds.has(sessionId)) continue;
+
+    const eventActivity = getOpenCodeActivityBySession(sessionId);
+    if (!eventActivity) continue;
+
+    let lastActivityAt: number | undefined;
+    let lastEventAt: number | undefined;
+    let inFlight = eventActivity.inFlight || false;
+    let hasError = eventActivity.hasError || false;
+    let doing: string | undefined = eventActivity.summary?.current;
+
+    // Check message API for activity
+    if (opencodeApiAvailable) {
+      const msgActivity = await getCachedOpenCodeSessionActivity(sessionId);
+      if (msgActivity.ok && !msgActivity.error) {
+        if (msgActivity.inFlight) inFlight = true;
+        if (typeof msgActivity.lastActivityAt === "number") {
+          lastActivityAt = msgActivity.lastActivityAt;
+        }
+      }
+    }
+
+    if (typeof eventActivity.lastActivityAt === "number") {
+      lastActivityAt = lastActivityAt
+        ? Math.max(lastActivityAt, eventActivity.lastActivityAt)
+        : eventActivity.lastActivityAt;
+    }
+    if (typeof eventActivity.lastEventAt === "number") {
+      lastEventAt = eventActivity.lastEventAt;
+      lastActivityAt = lastActivityAt
+        ? Math.max(lastActivityAt, eventActivity.lastEventAt)
+        : eventActivity.lastEventAt; // Fallback to event time
+    }
+
+    const activityAt = lastActivityAt;
+
+    // Update observation state
+    let entry = subagentSeen.get(sessionId);
+    if (!entry) {
+      entry = {};
+      subagentSeen.set(sessionId, entry);
+      if (typeof activityAt === "number") {
+        entry.lastAt = activityAt;
+        // On first sight, only hold if it's already recent by remote standards.
+        if (now - activityAt <= opencodeSubagentWindowMs) {
+          entry.observedAt = now;
+        }
+      }
+    } else {
+      // Refresh hold if activity increased
+      if (
+        typeof activityAt === "number" &&
+        (!entry.lastAt || activityAt > entry.lastAt)
+      ) {
+        entry.lastAt = activityAt;
+        entry.observedAt = now;
+      }
+      // Also refresh if currently in-flight
+      if (inFlight) {
+        entry.observedAt = now;
+      }
+    }
+
+    // Filter logic
+    const hasEventActivity =
+      typeof activityAt === "number" && now - activityAt <= opencodeSubagentWindowMs;
+    const hasRecentObserved =
+      typeof entry.observedAt === "number" && now - entry.observedAt <= opencodeSubagentHoldMs;
+
+    const shouldKeep = inFlight || hasEventActivity || hasRecentObserved;
+
+    if (!shouldKeep) {
+      if (debugOpencode) {
+        process.stdout.write(
+          `[consensus][subagent-drop] ${sessionId}\n` +
+          `inFlight=${inFlight}\n` +
+          `lastActivityAt=${activityAt}\n` +
+          `now=${now}\n` +
+          `observedAt=${entry.observedAt}\n` +
+          `holdMs=${opencodeSubagentHoldMs}\n` +
+          `hasRecentObserved=${hasRecentObserved}\n`
+        );
+      }
+      continue;
+    }
+
+    // Add to agents list
+    const id = `subagent:${sessionId}`;
+    const sessionIdentity = `opencode:${sessionId}`;
+
+    const activity = deriveOpenCodeState({
+      hasError,
+      lastEventAt,
+      lastActivityAt: activityAt,
+      inFlight,
+      status: undefined,
+      isServer: false,
+      previousActiveAt: undefined,
+      now,
+      eventWindowMs: opencodeEventWindowMs,
+      holdMs: opencodeHoldMs,
+      inFlightIdleMs: undefined,
+      strictInFlight: opencodeStrictInFlight,
+    });
+
+    agents.push({
+      identity: sessionIdentity,
+      id,
+      pid: 0,
+      startedAt: undefined,
+      lastEventAt,
+      lastActivityAt: activityAt,
+      activityReason: activity.reason || "subagent_hold",
+      title: eventActivity.summary?.current || "Subagent",
+      cmd: "",
+      cmdShort: "subagent",
+      kind: "opencode-cli",
+      cpu: 0,
+      mem: 0,
+      state: activity.state,
+      doing: doing,
+      sessionPath: `opencode:${sessionId}`,
+      repo: undefined,
+      cwd: undefined,
+      summary: eventActivity.summary,
+      events: eventActivity.events,
     });
   }
 
@@ -1914,7 +2053,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       trackTransition("claude", prevState, state, reason);
       logActivityDecision(
         `claude state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
-          `inFlight=${eventInFlight ? 1 : 0} lastEvent=${eventActivityAt ?? "?"}`
+        `inFlight=${eventInFlight ? 1 : 0} lastEvent=${eventActivityAt ?? "?"}`
       );
     }
     activityCache.set(id, {
@@ -2010,15 +2149,26 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
   }
 
+  // Prune subagent observations
+  for (const [id, entry] of subagentSeen.entries()) {
+    if (entry.observedAt && now - entry.observedAt > 3_600_000) {
+      // Expire after 1 hour of no observation update
+      subagentSeen.delete(id);
+    } else if (!entry.observedAt && !entry.lastAt) {
+      // Junk entry
+      subagentSeen.delete(id);
+    }
+  }
+
   const hasCounts = Object.keys(activityCountMeta).length > 0;
   const hasTransitions = Object.keys(activityTransitionMeta).length > 0;
   const activityMeta =
     hasCounts || hasTransitions || typeof nextTickAt === "number"
       ? {
-          ...(hasCounts ? { counts: activityCountMeta } : {}),
-          ...(hasTransitions ? { transitions: activityTransitionMeta } : {}),
-          ...(typeof nextTickAt === "number" ? { nextTickAt } : {}),
-        }
+        ...(hasCounts ? { counts: activityCountMeta } : {}),
+        ...(hasTransitions ? { transitions: activityTransitionMeta } : {}),
+        ...(typeof nextTickAt === "number" ? { nextTickAt } : {}),
+      }
       : undefined;
   const meta = {
     opencode: {

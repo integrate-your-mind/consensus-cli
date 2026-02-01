@@ -717,3 +717,7 @@ export function getOpenCodeActivityByPid(
       lastStatusAt: state.lastStatusAt,
     };
   }
+
+export function getOpenCodeSessionIds(): string[] {
+  return Array.from(sessionActivity.keys());
+}
