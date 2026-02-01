@@ -7,7 +7,7 @@ import chokidar from "chokidar";
 import type { FSWatcher } from "chokidar";
 import { WebSocketServer, WebSocket } from "ws";
 import { fileURLToPath } from "url";
-import { Effect, Fiber } from "effect";
+import { Effect, Exit, Fiber } from "effect";
 import { scanCodexProcesses, markSessionDirty } from "./scan.js";
 import { resolveCodexHome } from "./codexLogs.js";
 import { onOpenCodeEvent, stopOpenCodeEventStream } from "./opencodeEvents.js";
@@ -617,7 +617,7 @@ async function tick(): Promise<void> {
       .pipe(
         Effect.andThen(
           Effect.tryPromise({
-            try: () => scanCodexProcesses({ mode, includeActivity }),
+            try: (signal) => scanCodexProcesses({ mode, includeActivity, signal }),
             catch: (err) => err as Error,
           }).pipe(Effect.timeout(`${scanTimeoutMs} millis`))
         )
@@ -655,8 +655,12 @@ async function tick(): Promise<void> {
         )
       );
 
-    const snapshot = await runPromise(scanEffect);
-    if (snapshot) emitSnapshot(snapshot);
+    const fiber = runFork(scanEffect);
+    const exit = await runPromise(fiber.await);
+    if (Exit.isSuccess(exit)) {
+      const snapshot = exit.value;
+      if (snapshot) emitSnapshot(snapshot);
+    }
   } catch (err) {
     // Keep server alive on scan errors.
     logRuntimeError("scan crashed", err);

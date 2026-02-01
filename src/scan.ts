@@ -38,6 +38,7 @@ import {
 } from "./opencodeEvents.js";
 import {
   getOpenCodeSessionId,
+  getOpenCodeSessionParentId,
   getOpenCodeSessionPid,
   markOpenCodeSessionUsed,
   selectOpenCodeSessionForTui,
@@ -80,6 +81,55 @@ const pidSessionCache = new Map<
   number,
   { path: string; lastSeenAt: number; startMs?: number }
 >();
+
+const opencodePrefetchFailures = new Map<
+  string,
+  { count: number; firstAt: number; cooldownUntil?: number }
+>();
+const OPENCODE_PREFETCH_FAILURE_WINDOW_MS = 10_000;
+const OPENCODE_PREFETCH_FAILURE_THRESHOLD = 3;
+const OPENCODE_PREFETCH_COOLDOWN_MS = 30_000;
+
+// Track subagent observation times for hold mechanism
+const subagentSeen = new Map<
+  string,
+  { lastRemoteAt?: number; observedAt?: number; lastSeenAt: number }
+>();
+
+function getOpencodePrefetchKey(host: string, port: number): string {
+  return `${host}:${port}`;
+}
+
+function shouldSkipOpenCodePrefetch(key: string, now: number): boolean {
+  const entry = opencodePrefetchFailures.get(key);
+  if (!entry) return false;
+  if (typeof entry.cooldownUntil === "number" && now < entry.cooldownUntil) {
+    return true;
+  }
+  if (typeof entry.cooldownUntil === "number" && now >= entry.cooldownUntil) {
+    opencodePrefetchFailures.delete(key);
+  }
+  return false;
+}
+
+function recordOpenCodePrefetchFailure(key: string, now: number): void {
+  const entry = opencodePrefetchFailures.get(key);
+  if (!entry || now - entry.firstAt > OPENCODE_PREFETCH_FAILURE_WINDOW_MS) {
+    opencodePrefetchFailures.set(key, { count: 1, firstAt: now });
+    return;
+  }
+  entry.count += 1;
+  if (entry.count >= OPENCODE_PREFETCH_FAILURE_THRESHOLD) {
+    entry.cooldownUntil = now + OPENCODE_PREFETCH_COOLDOWN_MS;
+  }
+  opencodePrefetchFailures.set(key, entry);
+}
+
+function recordOpenCodePrefetchSuccess(key: string): void {
+  if (opencodePrefetchFailures.has(key)) {
+    opencodePrefetchFailures.delete(key);
+  }
+}
 const opencodeServerLogged = new Set<number>();
 const opencodeSessionByPidCache = new Map<
   number,
@@ -146,10 +196,18 @@ function consumeDirtySessions(): Set<string> {
   return dirty;
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error("Scan cancelled");
+  error.name = "AbortError";
+  throw error;
+}
+
 type ScanMode = "fast" | "full";
 export interface ScanOptions {
   mode?: ScanMode;
   includeActivity?: boolean;
+  signal?: AbortSignal;
 }
 
 type PsProcess = Awaited<ReturnType<typeof psList>>[number];
@@ -409,6 +467,22 @@ function parseTimestamp(value?: string | number): number | undefined {
     if (!Number.isNaN(parsed)) return parsed;
   }
   return undefined;
+}
+
+function toMs(value: unknown): number | undefined {
+  if (typeof value === "number" || typeof value === "string") {
+    return parseTimestamp(value);
+  }
+  return undefined;
+}
+
+function maxMs(...values: Array<number | undefined>): number | undefined {
+  let max: number | undefined;
+  for (const value of values) {
+    if (typeof value !== "number" || !Number.isFinite(value)) continue;
+    if (max === undefined || value > max) max = value;
+  }
+  return max;
 }
 
 function deriveTitle(
@@ -683,6 +757,8 @@ function findRepoRoot(cwd: string): string | null {
 export async function scanCodexProcesses(options: ScanOptions = {}): Promise<SnapshotPayload> {
   const now = Date.now();
   const mode: ScanMode = options.mode ?? "full";
+  const signal = options.signal;
+  throwIfAborted(signal);
   const includeActivity = options.includeActivity !== false;
   const scanTimer = startProfile("total", mode);
   const dirtySessions = includeActivity && mode === "fast" ? consumeDirtySessions() : null;
@@ -816,6 +892,24 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       }
       endProfile(refreshTimer, { count: refreshList.length });
     }
+    if (includeActivity && codexWrapperProcs.length > 0) {
+      const jsonlCandidates = Array.from(
+        new Set([
+          ...codexWrapperProcs.map((proc) => proc.pid),
+          ...codexVendorChildren.map((proc) => proc.pid),
+        ])
+      );
+      if (jsonlCandidates.length > 0) {
+        const jsonlTimer = startProfile("jsonl", "fast");
+        try {
+          jsonlByPid = await getJsonlForPids(jsonlCandidates);
+          processCache.jsonlByPid = jsonlByPid;
+        } catch {
+          // ignore refresh failures
+        }
+        endProfile(jsonlTimer, { count: jsonlByPid.size });
+      }
+    }
   }
   if (!shouldUseProcessCache) {
     const usageTimer = startProfile("pidusage");
@@ -896,6 +990,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       ? getOpenCodeSessions(opencodeHost, opencodePort, {
           silent: true,
           timeoutMs,
+          signal,
         }).then((result) => {
           opencodeSessionCache = result;
           opencodeSessionCacheAt = now;
@@ -904,12 +999,14 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       : Promise.resolve(opencodeSessionCache);
 
   const opencodeResultRaw = await opencodeResultPromise;
+  throwIfAborted(signal);
   endProfile(opencodeTimer, { ok: opencodeResultRaw?.ok ? 1 : 0 });
   const opencodeResult = opencodeResultRaw ?? {
     ok: false,
     sessions: [],
     reachable: false,
   };
+  throwIfAborted(signal);
   await ensureOpenCodeServer(opencodeHost, opencodePort, opencodeResult, opencodeProcs.length > 0);
   if (opencodeProcs.length > 0 || opencodeResult.ok) {
     ensureOpenCodeEventStream(opencodeHost, opencodePort);
@@ -919,6 +1016,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   type OpenCodeSession = (typeof opencodeSessions)[number];
   const opencodeSessionsByPid = new Map<number, OpenCodeSession>();
   const opencodeSessionsById = new Map<string, OpenCodeSession>();
+  const opencodeChildSessionIds = new Set<string>();
   // Track ALL recent sessions per directory for activity polling (not just the latest)
   const opencodeAllSessionsByDir = new Map<string, OpenCodeSession[]>();
   const opencodeSessionTimestamp = (session: OpenCodeSession): number => {
@@ -953,12 +1051,28 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const sessionId = getOpenCodeSessionId(session);
     if (sessionId) {
       opencodeSessionsById.set(sessionId, session);
+      if (getOpenCodeSessionParentId(session)) {
+        opencodeChildSessionIds.add(sessionId);
+      }
     }
     if (typeof session.directory === "string") {
       addSessionToDir(session.directory, session);
     }
     if (typeof session.cwd === "string") {
       addSessionToDir(session.cwd, session);
+    }
+  }
+  if (opencodeApiAvailable && subagentSeen.size > 0) {
+    for (const sessionId of subagentSeen.keys()) {
+      const session = opencodeSessionsById.get(sessionId);
+      if (!session) {
+        subagentSeen.delete(sessionId);
+        continue;
+      }
+      const parentId = getOpenCodeSessionParentId(session);
+      if (!parentId || !opencodeSessionsById.has(parentId)) {
+        subagentSeen.delete(sessionId);
+      }
     }
   }
   for (const sessions of opencodeAllSessionsByDir.values()) {
@@ -982,45 +1096,145 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     string,
     Awaited<ReturnType<typeof getOpenCodeSessionActivity>>
   >();
-  const getCachedOpenCodeSessionActivity = async (sessionId: string) => {
+  const opencodeStatusFreshMs = Math.max(
+    2500,
+    resolveMs(process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS, 2500)
+  );
+  const opencodePrefetchKey = getOpencodePrefetchKey(opencodeHost, opencodePort);
+  const getCachedOpenCodeSessionActivity = async (
+    sessionId: string,
+    options: { signal?: AbortSignal; timeoutMs?: number; cache?: boolean } = {}
+  ) => {
     const cached = opencodeMessageActivityCache.get(sessionId);
     if (cached) return cached;
     const result = await getOpenCodeSessionActivity(
       sessionId,
       opencodeHost,
       opencodePort,
-      { silent: true, timeoutMs: 2000 }
+      { silent: true, timeoutMs: options.timeoutMs ?? 2000, signal: options.signal }
     );
-    opencodeMessageActivityCache.set(sessionId, result);
+    if (options.cache !== false && result.error !== "aborted" && result.error !== "timeout") {
+      opencodeMessageActivityCache.set(sessionId, result);
+    }
     return result;
   };
   const opencodeActiveSessionIdsByDir = new Map<string, string[]>();
-  const prefetchActiveSessionsByDir = async () => {
-    const tasks: Promise<void>[] = [];
-    for (const [dir, sessions] of opencodeAllSessionsByDir.entries()) {
-      const tuiCount = opencodeTuiByDir.get(dir)?.length ?? 0;
-      if (tuiCount <= 1) continue;
-      const candidates = sessions.slice(0, Math.max(tuiCount, 2));
-      tasks.push(
-        (async () => {
-          const activeIds: string[] = [];
-          for (const session of candidates) {
-            const id = getOpenCodeSessionId(session);
-            if (!id) continue;
-            const activity = await getCachedOpenCodeSessionActivity(id);
-            if (activity.ok && activity.inFlight) {
-              activeIds.push(id);
-            }
-          }
-          if (activeIds.length > 0) {
-            opencodeActiveSessionIdsByDir.set(dir, activeIds);
-          }
-        })()
-      );
+  const prefetchActiveSessionsByDir = async (signal?: AbortSignal) => {
+    if (mode === "fast") return;
+    if (!opencodeApiAvailable) return;
+    if (signal?.aborted) return;
+    if (shouldSkipOpenCodePrefetch(opencodePrefetchKey, now)) return;
+
+    const prefetchBudgetMs = 2500;
+    if (!Number.isFinite(prefetchBudgetMs) || prefetchBudgetMs <= 0) return;
+    const prefetchCallTimeoutMs = Math.min(750, prefetchBudgetMs);
+    const prefetchDeadline = Date.now() + prefetchBudgetMs;
+
+    const entries = Array.from(opencodeAllSessionsByDir.entries());
+    if (entries.length === 0) return;
+
+    const prefetchController = new AbortController();
+    let prefetchTimeoutId: ReturnType<typeof setTimeout> | undefined;
+    let onScanAbort: (() => void) | undefined;
+
+    const abortPrefetch = (reason?: unknown) => {
+      if (prefetchController.signal.aborted) return;
+      try {
+        prefetchController.abort(reason);
+      } catch {
+        prefetchController.abort();
+      }
+    };
+
+    if (signal) {
+      if (signal.aborted) {
+        abortPrefetch(signal.reason);
+      } else {
+        onScanAbort = () => abortPrefetch(signal.reason);
+        signal.addEventListener("abort", onScanAbort, { once: true });
+      }
     }
-    await Promise.all(tasks);
+    prefetchTimeoutId = setTimeout(() => abortPrefetch(), prefetchBudgetMs);
+
+    const prefetchSignal = prefetchController.signal;
+    const hasBudget = () => !prefetchSignal.aborted && Date.now() < prefetchDeadline;
+
+    const prefetchEffect = Effect.forEach(
+      entries,
+      ([dir, sessions]) =>
+        Effect.tryPromise({
+          try: async () => {
+            if (!hasBudget()) return;
+            const tuiCount = opencodeTuiByDir.get(dir)?.length ?? 0;
+            if (tuiCount === 0) return;
+
+            const minCandidates = Math.max(tuiCount, 2);
+            const hardCap = 10;
+            const absoluteCap = 20;
+            const cappedLimit = minCandidates > hardCap ? absoluteCap : hardCap;
+            const maxCandidates = Math.min(sessions.length, cappedLimit);
+            if (maxCandidates <= 0) return;
+
+            const activeIds: string[] = [];
+            let checked = 0;
+            const candidates = sessions.slice(0, maxCandidates);
+
+            for (const session of candidates) {
+              if (!hasBudget()) return;
+              if (checked >= minCandidates && activeIds.length >= tuiCount) break;
+              const id = getOpenCodeSessionId(session);
+              if (!id) {
+                checked += 1;
+                continue;
+              }
+              const statusActivity = getOpenCodeActivityBySession(id);
+              const statusValue = statusActivity?.lastStatus?.toLowerCase();
+              const statusAt = statusActivity?.lastStatusAt;
+              const statusFresh =
+                typeof statusAt === "number" && now - statusAt <= opencodeStatusFreshMs;
+              if (statusValue && statusFresh) {
+                if (!/idle|stopped|paused/.test(statusValue)) {
+                  activeIds.push(id);
+                }
+                checked += 1;
+                continue;
+              }
+              const activity = await getCachedOpenCodeSessionActivity(id, {
+                signal: prefetchSignal,
+                timeoutMs: prefetchCallTimeoutMs,
+                cache: false,
+              });
+              if (activity.ok) {
+                recordOpenCodePrefetchSuccess(opencodePrefetchKey);
+                if (activity.inFlight) {
+                  activeIds.push(id);
+                }
+              } else if (activity.error !== "aborted" && activity.error !== "timeout") {
+                recordOpenCodePrefetchFailure(opencodePrefetchKey, Date.now());
+              }
+              checked += 1;
+            }
+
+            if (activeIds.length > 0) {
+              opencodeActiveSessionIdsByDir.set(dir, activeIds);
+            }
+          },
+          catch: () => undefined,
+        }).pipe(Effect.catchAll(() => Effect.void)),
+      { concurrency: 5 }
+    ).pipe(Effect.asVoid);
+
+    try {
+      await runPromise(prefetchEffect);
+    } finally {
+      if (prefetchTimeoutId) clearTimeout(prefetchTimeoutId);
+      if (signal && onScanAbort) {
+        signal.removeEventListener("abort", onScanAbort);
+      }
+    }
   };
-  await prefetchActiveSessionsByDir();
+  await prefetchActiveSessionsByDir(signal);
+  throwIfAborted(signal);
   const cacheMatchesHome =
     sessionCache.home === codexHome && sessionCache.sessions.length > 0;
   let sessions: SessionFile[] = [];
@@ -1057,7 +1271,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const seenIds = new Set<string>();
   const codexHoldMs = resolveMs(
     process.env.CONSENSUS_CODEX_ACTIVE_HOLD_MS,
-    3000
+    2000
   );
   const codexEventIdleMs = resolveMs(
     process.env.CONSENSUS_CODEX_EVENT_IDLE_MS,
@@ -1074,6 +1288,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     sessionId?: string;
     session?: SessionFile;
     jsonlPaths?: string[];
+    reuseBlocked?: boolean;
   };
   const codexContexts: CodexContext[] = [];
   const usedSessionPaths = new Set<string>();
@@ -1136,28 +1351,48 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
     const directJsonl = jsonlByPid.get(proc.pid) || [];
     const childJsonl = childJsonlByPid.get(proc.pid) || [];
+    const jsonlPaths = Array.from(
+      new Set([...directJsonl, ...childJsonl].map(normalizeSessionPath).filter(Boolean))
+    ) as string[];
     const mappedJsonl = pickNewestJsonl([...directJsonl, ...childJsonl], jsonlMtimes);
-    let session =
-      mappedJsonl
-        ? { path: mappedJsonl, mtimeMs: jsonlMtimes.get(mappedJsonl) ?? now }
-        : undefined;
+    const startMsForCwd =
+      typeof startMs === "number" && now - startMs < 5 * 60_000 ? startMs : undefined;
+    const cwdSession = cwdRaw
+      ? await findSessionByCwd(sessions, cwdRaw, startMsForCwd, usedSessionPaths)
+      : undefined;
+    const mappedSession = mappedJsonl
+      ? { path: mappedJsonl, mtimeMs: jsonlMtimes.get(mappedJsonl) ?? now }
+      : undefined;
+    let session = mappedSession;
     session =
       (sessionId && sessions.find((item) => item.path.includes(sessionId))) ||
       (sessionId ? await findSessionById(codexHome, sessionId) : undefined) ||
-      cachedSession ||
-      session;
+      session ||
+      cwdSession ||
+      cachedSession;
+    if (cwdSession && mappedSession) {
+      const mappedMtime = mappedSession.mtimeMs ?? 0;
+      const cwdMtime = cwdSession.mtimeMs ?? 0;
+      if (cwdMtime > mappedMtime + 1000) {
+        session = cwdSession;
+      }
+    }
     const hasExplicitSession = !!sessionId || !!mappedJsonl;
     const allowReuse = hasExplicitSession || /\bresume\b/i.test(cmdRaw);
     const initialSessionPath = normalizeSessionPath(session?.path);
+    let reuseBlocked = false;
     if (initialSessionPath && usedSessionPaths.has(initialSessionPath) && !allowReuse) {
-      const alternate = await findSessionByCwd(sessions, cwdRaw, startMs);
+      const alternate = cwdSession;
       const alternatePath = normalizeSessionPath(alternate?.path);
       if (alternate && alternatePath && alternatePath !== initialSessionPath) {
         session = alternate;
+      } else {
+        reuseBlocked = true;
       }
     }
-    if (!session && cwdRaw) {
-      session = await findSessionByCwd(sessions, cwdRaw, startMs);
+    if (!session) {
+      session = cwdSession;
+      reuseBlocked = false;
     }
     const sessionPath = normalizeSessionPath(session?.path);
     if (sessionPath) {
@@ -1172,21 +1407,37 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       cwdRaw,
       sessionId,
       session,
+      jsonlPaths,
+      reuseBlocked,
     });
   }
 
   const tailTargets = new Set<string>();
   const cachedTails = new Map<string, Awaited<ReturnType<typeof updateTail>>>();
+  const tailOptionsByPath = new Map<string, { keepStale?: boolean }>();
   if (includeActivity) {
     if (dirtySessions) {
       for (const dirtyPath of dirtySessions) {
-        tailTargets.add(path.resolve(dirtyPath));
+        const resolved = path.resolve(dirtyPath);
+        tailTargets.add(resolved);
+        if (!tailOptionsByPath.has(resolved)) {
+          tailOptionsByPath.set(resolved, { keepStale: false });
+        }
       }
     }
     for (const ctx of codexContexts) {
       const sessionPath = normalizeSessionPath(ctx.session?.path);
       if (!sessionPath) continue;
       tailTargets.add(sessionPath);
+      tailOptionsByPath.set(sessionPath, { keepStale: true });
+      if (ctx.jsonlPaths?.length) {
+        for (const jsonlPath of ctx.jsonlPaths) {
+          tailTargets.add(jsonlPath);
+          if (!tailOptionsByPath.has(jsonlPath)) {
+            tailOptionsByPath.set(jsonlPath, { keepStale: true });
+          }
+        }
+      }
     }
   }
   const tailsTimer = startProfile("tails");
@@ -1194,7 +1445,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     includeActivity
       ? await Promise.all(
           Array.from(tailTargets).map(async (sessionPath) => {
-            const tail = await updateTail(sessionPath);
+            const tail = await updateTail(sessionPath, tailOptionsByPath.get(sessionPath));
             return [sessionPath, tail] as const;
           })
         )
@@ -1205,7 +1456,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     ...tailEntries,
   ]);
   for (const ctx of codexContexts) {
-    const { proc, cpu, mem, startMs, cmdRaw, cwdRaw, session, sessionId } = ctx;
+    const { proc, cpu, mem, startMs, cmdRaw, cwdRaw, session, sessionId, reuseBlocked } = ctx;
     let doing: string | undefined;
     let events: AgentSnapshot["events"];
     let model: string | undefined;
@@ -1216,7 +1467,29 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     let lastActivityAt: number | undefined;
     let inFlight = false;
 
-    const sessionPath = normalizeSessionPath(session?.path);
+    const pickBestJsonl = (paths?: string[]): string | undefined => {
+      if (!paths || paths.length === 0) return undefined;
+      let bestPath: string | undefined;
+      let bestScore = -1;
+      let bestActivity = -1;
+      for (const candidate of paths) {
+        const tail = includeActivity ? tailsByPath.get(candidate) : getTailState(candidate);
+        const summary = tail ? summarizeTail(tail) : undefined;
+        const inFlightScore = summary?.inFlight ? 1 : 0;
+        const activity = summary?.lastActivityAt ?? summary?.lastEventAt ?? 0;
+        const score = inFlightScore * 10 + (activity > 0 ? 1 : 0);
+        if (score > bestScore || (score === bestScore && activity > bestActivity)) {
+          bestScore = score;
+          bestActivity = activity;
+          bestPath = candidate;
+        }
+      }
+      if (bestPath) return bestPath;
+      const fallback = pickNewestJsonl(paths, jsonlMtimes);
+      return normalizeSessionPath(fallback);
+    };
+    const sessionPath =
+      pickBestJsonl(ctx.jsonlPaths) || normalizeSessionPath(session?.path);
     
     // Get thread state from event store (webhook-based events)
     let threadId: string | undefined;
@@ -1238,6 +1511,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     let tailEventAt: number | undefined;
     let tailInFlightSignalAt: number | undefined;
     let tailIngestAt: number | undefined;
+    let tailEndAt: number | undefined;
+    let tailReviewMode = false;
+    let tailOpenCallCount = 0;
 
     if (sessionPath) {
       const tail = includeActivity ? tailsByPath.get(sessionPath) : getTailState(sessionPath);
@@ -1254,6 +1530,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         tailEventAt = tailSummary.lastEventAt;
         tailInFlightSignalAt = tailSummary.lastInFlightSignalAt;
         tailIngestAt = tailSummary.lastIngestAt;
+        tailEndAt = tailSummary.lastEndAt;
+        tailReviewMode = !!tailSummary.reviewMode;
+        tailOpenCallCount = tailSummary.openCallCount ?? 0;
       }
     }
 
@@ -1290,7 +1569,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const repoRoot = cwdRaw ? findRepoRoot(cwdRaw) : null;
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
 
-    const sessionIdentity = sessionPath ? `codex:${sessionPath}` : `pid:${proc.pid}`;
+    const redactedSessionPath = sessionPath ? redactText(sessionPath) || sessionPath : undefined;
+    const sessionIdentity =
+      redactedSessionPath && !reuseBlocked
+        ? `codex:${redactedSessionPath}`
+        : `pid:${proc.pid}`;
     if (sessionPath) {
       pidSessionCache.set(proc.pid, { path: sessionPath, lastSeenAt: now, startMs });
     }
@@ -1313,13 +1596,24 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       state = "idle";
       reason = "no_hook";
     } else {
+      const tailAllowsNotifyEnd = tailOpenCallCount === 0 && !tailReviewMode;
+      const notifyEndAt = !eventInFlight && eventActivityAt ? eventActivityAt : undefined;
+      const notifyEndIsFresh =
+        typeof notifyEndAt === "number" &&
+        (typeof tailActivityAtCandidate !== "number" || notifyEndAt >= tailActivityAtCandidate);
+      const notifyShouldEnd = tailAllowsNotifyEnd && notifyEndIsFresh && !tailEndAt;
+      if (notifyShouldEnd) {
+        inFlight = false;
+      }
+      const explicitEndAt = tailEndAt ?? (notifyShouldEnd ? notifyEndAt : undefined);
+      const effectiveHoldMs = explicitEndAt ? 0 : codexHoldMs;
       const effectiveIdleMs = inFlight ? 0 : codexEventIdleMs;
       const eventState = deriveCodexEventState({
         inFlight,
         lastActivityAt: activityAt,
         hasError,
         now,
-        holdMs: codexHoldMs,
+        holdMs: effectiveHoldMs,
         idleMs: effectiveIdleMs,
       });
       state = eventState.state;
@@ -1382,7 +1676,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       mem,
       state,
       doing: redactText(doing) || doing,
-      sessionPath: sessionPath ? redactText(sessionPath) || sessionPath : undefined,
+      sessionPath: redactedSessionPath,
       repo: repoName,
       cwd,
       model,
@@ -1409,7 +1703,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       ? resolveMs(process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS, 0)
       : undefined;
   const usedOpenCodeSessionIds = new Map<string, number>();
+  const assignedOpenCodeSessionIds = new Set<string>();
   for (const proc of opencodeProcs) {
+    if (signal?.aborted) break;
     const stats = usage[proc.pid] || ({} as pidusage.Status);
     const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;
     const mem = typeof stats.memory === "number" ? stats.memory : 0;
@@ -1429,6 +1725,10 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     if (isLspRun) continue;
     const isServer = kind === "opencode-server";
     let cachedSessionId = opencodeSessionByPidCache.get(proc.pid)?.sessionId;
+    if (cachedSessionId && opencodeChildSessionIds.has(cachedSessionId)) {
+      cachedSessionId = undefined;
+      opencodeSessionByPidCache.delete(proc.pid);
+    }
     const cwdMatch = cwds.get(proc.pid);
     // Check if cached session is still active; if not and there are active sessions available,
     // invalidate the cache to allow reassignment to an active session.
@@ -1455,6 +1755,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
           sessionsByDir: opencodeAllSessionsByDir,
           activeSessionIdsByDir: opencodeActiveSessionIdsByDir,
           usedSessionIds: usedOpenCodeSessionIds,
+          childSessionIds: opencodeChildSessionIds,
         })
       : { session: undefined, sessionId: undefined, source: "none" as const };
     const session = selection.session;
@@ -1465,7 +1766,12 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         : undefined;
     if (!isServer && !sessionId && storageSession) {
       const storageSessionId = getOpenCodeSessionId(storageSession);
-      if (storageSessionId) {
+      const storageParentId = getOpenCodeSessionParentId(storageSession);
+      if (
+        storageSessionId &&
+        !storageParentId &&
+        !opencodeChildSessionIds.has(storageSessionId)
+      ) {
         if (markOpenCodeSessionUsed(usedOpenCodeSessionIds, storageSessionId, proc.pid)) {
           sessionId = storageSessionId;
         }
@@ -1473,7 +1779,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
     if (!isServer && !sessionId) {
       const extractedId = extractOpenCodeSessionId(cmdRaw);
-      if (extractedId) {
+      if (extractedId && !opencodeChildSessionIds.has(extractedId)) {
         if (markOpenCodeSessionUsed(usedOpenCodeSessionIds, extractedId, proc.pid)) {
           sessionId = extractedId;
         }
@@ -1481,6 +1787,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
     if (sessionId) {
       opencodeSessionByPidCache.set(proc.pid, { sessionId, lastSeenAt: now });
+      if (opencodeSessionsById.has(sessionId)) {
+        assignedOpenCodeSessionIds.add(sessionId);
+      }
     }
     const sessionTitle = normalizeTitle(
       !isServer ? session?.title || session?.name || storageSession?.title : undefined
@@ -1506,14 +1815,6 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         session?.createdAt ||
         session?.created
     );
-    const statusRaw = typeof session?.status === "string" ? session.status : undefined;
-    const status = statusRaw?.toLowerCase();
-    const statusIsError = !!status && /error|failed|failure/.test(status);
-    const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
-    const statusIsActive = !!status && /running|active|processing/.test(status);
-    let hasError = statusIsError;
-    const model = typeof session?.model === "string" ? session.model : undefined;
-
     let doing: string | undefined = isServer ? "opencode server" : sessionTitle;
     let summary: WorkSummary | undefined;
     let events: AgentSnapshot["events"];
@@ -1521,6 +1822,26 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       !isServer
         ? getOpenCodeActivityBySession(sessionId) || getOpenCodeActivityByPid(proc.pid)
         : null;
+    const statusAuthority = eventActivity?.lastStatus;
+    const statusAuthorityAt = eventActivity?.lastStatusAt;
+    const statusAuthorityFresh =
+      typeof statusAuthorityAt === "number" &&
+      now - statusAuthorityAt <= opencodeStatusFreshMs;
+    const statusAuthorityLower =
+      statusAuthorityFresh && typeof statusAuthority === "string"
+        ? statusAuthority.toLowerCase()
+        : undefined;
+    const statusAuthorityIsIdle =
+      !!statusAuthorityLower && /idle|stopped|paused/.test(statusAuthorityLower);
+    const statusAuthorityIsBusy = !!statusAuthorityLower && !statusAuthorityIsIdle;
+
+    const statusRaw = typeof session?.status === "string" ? session.status : undefined;
+    const status = statusAuthorityLower ?? statusRaw?.toLowerCase();
+    const statusIsError = !!status && /error|failed|failure/.test(status);
+    const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
+    const statusIsActive = !!status && /running|active|processing|busy|retry/.test(status);
+    let hasError = statusIsError;
+    const model = typeof session?.model === "string" ? session.model : undefined;
     const includeOpenCode = shouldIncludeOpenCodeProcess({
       kind,
       opencodeApiAvailable,
@@ -1537,6 +1858,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     let lastEventAt: number | undefined;
     let lastActivityAt: number | undefined;
     let inFlight = eventActivity?.inFlight;
+    let messageActivityOk = false;
     if (eventActivity) {
       events = eventActivity.events;
       summary = eventActivity.summary || summary;
@@ -1556,14 +1878,23 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       if (eventActivity.hasError) hasError = true;
       if (eventActivity.inFlight) inFlight = true;
       if (eventActivity.summary?.current) doing = eventActivity.summary.current;
+      if (statusAuthorityIsIdle) {
+        inFlight = false;
+      } else if (statusAuthorityIsBusy) {
+        inFlight = true;
+      }
     }
-    // For TUI sessions, ALWAYS poll message API for activity since SSE doesn't reliably emit TUI events.
-    // Message API is the authoritative source for TUI inFlight state - it overrides SSE's potentially stale state.
+    // For TUI sessions, poll message API for activity; session.status (if present) is authoritative.
     if (!isServer && sessionId && opencodeApiAvailable) {
-      const msgActivity = await getCachedOpenCodeSessionActivity(sessionId);
+      const msgActivity = await getCachedOpenCodeSessionActivity(sessionId, { signal });
       if (msgActivity.ok) {
-        // Message API is authoritative for TUI - use its inFlight value directly
-        inFlight = msgActivity.inFlight;
+        messageActivityOk = true;
+        const msgHasSignal =
+          msgActivity.inFlight || typeof msgActivity.lastActivityAt === "number";
+        if (msgHasSignal && (!statusAuthorityLower || !statusAuthorityIsIdle)) {
+          // Message API is authoritative when it reports activity.
+          inFlight = msgActivity.inFlight;
+        }
         if (typeof msgActivity.lastActivityAt === "number") {
           lastActivityAt = lastActivityAt
             ? Math.max(lastActivityAt, msgActivity.lastActivityAt)
@@ -1613,9 +1944,10 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       typeof startMs === "number" && now - startMs <= opencodeHoldMs;
     const previousActiveAt = opencodeStartedRecently ? now : cached?.lastActiveAt;
     // For TUI sessions with message API data, don't decay inFlight - the API is authoritative.
-    // Only use inFlightIdleMs decay for server processes or TUIs without direct API data.
-    // Pass -1 to explicitly disable decay (undefined falls back to defaults).
-    const useInFlightIdleMs = isServer || !sessionId || !opencodeApiAvailable ? opencodeInFlightIdleMs : -1;
+    const useInFlightIdleMs =
+      isServer || !sessionId || !opencodeApiAvailable || !messageActivityOk
+        ? opencodeInFlightIdleMs
+        : -1;
     const activity = deriveOpenCodeState({
       hasError,
       lastEventAt,
@@ -1632,6 +1964,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     });
     let state = activity.state;
     let reason = activity.reason || "unknown";
+    const activityLastActiveAt = activity.lastActiveAt ?? cached?.lastActiveAt;
     logOpencode(`pid=${proc.pid} sessionId=${sessionId ?? "none"} inFlight=${inFlight} state=${state} reason=${reason} lastActivityAt=${lastActivityAt ?? "?"} source=${selection.source}`);
     if (
       activity.state === "active" &&
@@ -1647,11 +1980,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       typeof lastActivityAt === "number" ||
       typeof inFlight === "boolean";
     const activityAt = typeof lastActivityAt === "number" ? lastActivityAt : undefined;
-    if (!opencodeApiAvailable && !hasSignal && !activity.lastActiveAt) {
+    if (!opencodeApiAvailable && !hasSignal && !activityLastActiveAt) {
       state = "idle";
       reason = "api_unavailable";
     }
-    if (!hasSignal && !activity.lastActiveAt) {
+    if (!hasSignal && !activityLastActiveAt) {
       state = "idle";
       reason = "no_signal";
     }
@@ -1666,7 +1999,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       );
     }
     activityCache.set(id, {
-      lastActiveAt: activity.lastActiveAt,
+      lastActiveAt: activityLastActiveAt,
       lastSeenAt: now,
       lastState: state,
       lastReason: reason,
@@ -1705,6 +2038,266 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     });
   }
 
+  const debugSubagents = process.env.CONSENSUS_DEBUG_OPENCODE_SUBAGENTS === "1";
+  const opencodeSubagentWindowMs = resolveMs(
+    process.env.CONSENSUS_OPENCODE_STALE_SUBAGENT_MS ||
+      process.env.CONSENSUS_OPENCODE_STALE_ACTIVE_MS,
+    300_000
+  );
+  const opencodeSubagentHoldMs = resolveMs(
+    process.env.CONSENSUS_OPENCODE_SUBAGENT_HOLD_MS,
+    120_000
+  );
+  if (opencodeApiAvailable && assignedOpenCodeSessionIds.size > 0) {
+    const subagentCandidates: Array<{
+      session: OpenCodeSession;
+      sessionId: string;
+      parentId: string;
+      eventActivity: ReturnType<typeof getOpenCodeActivityBySession> | null;
+      messageActivity: Awaited<ReturnType<typeof getOpenCodeSessionActivity>> | null;
+      activityAt: number;
+      inFlight: boolean;
+    }> = [];
+    for (const session of opencodeSessions) {
+      const sessionId = getOpenCodeSessionId(session);
+      if (!sessionId) continue;
+      const parentId = getOpenCodeSessionParentId(session);
+      if (!parentId) continue;
+      if (!assignedOpenCodeSessionIds.has(parentId)) continue;
+      if (assignedOpenCodeSessionIds.has(sessionId)) continue;
+
+      const eventActivity = getOpenCodeActivityBySession(sessionId);
+      const messageActivity =
+        opencodeMessageActivityCache.get(sessionId) ||
+        (await getCachedOpenCodeSessionActivity(sessionId, {
+          signal,
+          timeoutMs: 750,
+          cache: true,
+        }));
+      const sessionUpdatedAt = opencodeSessionTimestamp(session);
+      const remoteAt = maxMs(
+        toMs(eventActivity?.lastActivityAt),
+        toMs(messageActivity?.lastActivityAt)
+      );
+      const fallbackAt = typeof remoteAt === "number" ? undefined : sessionUpdatedAt;
+      const inFlight =
+        eventActivity?.inFlight === true || messageActivity?.inFlight === true;
+      const hasRemoteFresh =
+        typeof remoteAt === "number" &&
+        Number.isFinite(opencodeSubagentWindowMs) &&
+        opencodeSubagentWindowMs > 0 &&
+        now - remoteAt <= opencodeSubagentWindowMs;
+      const hasFallbackFresh =
+        typeof fallbackAt === "number" &&
+        Number.isFinite(opencodeSubagentWindowMs) &&
+        opencodeSubagentWindowMs > 0 &&
+        now - fallbackAt <= opencodeSubagentWindowMs;
+      const hasEventActivity = hasRemoteFresh || hasFallbackFresh;
+      const effectiveAt = typeof remoteAt === "number" ? remoteAt : fallbackAt;
+      const activityAt =
+        typeof effectiveAt === "number" ? effectiveAt : inFlight ? now : 0;
+
+      // Observation hold: track when we see activity timestamps increase
+      const prev = subagentSeen.get(sessionId);
+      let observedAt = prev?.observedAt;
+      const remoteIncreased =
+        typeof remoteAt === "number" && remoteAt > (prev?.lastRemoteAt ?? -Infinity);
+      if (!prev) {
+        if (inFlight || hasEventActivity) observedAt = now;
+      } else {
+        if (inFlight || hasEventActivity || remoteIncreased) observedAt = now;
+      }
+      subagentSeen.set(sessionId, {
+        lastRemoteAt: typeof remoteAt === "number" ? remoteAt : prev?.lastRemoteAt,
+        observedAt,
+        lastSeenAt: now,
+      });
+
+      const hasRecentObserved =
+        typeof observedAt === "number" && now - observedAt <= opencodeSubagentHoldMs;
+
+      if (!inFlight && !hasEventActivity && !hasRecentObserved) {
+        if (debugSubagents) {
+          const ageMs =
+            typeof effectiveAt === "number" ? Math.max(0, now - effectiveAt) : undefined;
+          const obsAgeMs =
+            typeof observedAt === "number" ? now - observedAt : undefined;
+          const remoteSkewMs = ageMs;
+          console.log(
+            `[consensus][subagent-drop] ${sessionId} ` +
+              `inFlight=${inFlight} ` +
+              `hasEventActivity=${hasEventActivity} ` +
+              `hasRecentObserved=${hasRecentObserved} ` +
+              `sseAt=${String(eventActivity?.lastActivityAt)} ` +
+              `msgAt=${String(messageActivity?.lastActivityAt)} ` +
+              `updatedAt=${String(sessionUpdatedAt)} ` +
+              `remoteAt=${String(remoteAt)} ` +
+              `effectiveAt=${String(effectiveAt)} ` +
+              `ageMs=${String(ageMs)} ` +
+              `remoteSkewMs=${String(remoteSkewMs)} ` +
+              `observedAt=${String(observedAt)} ` +
+              `obsAgeMs=${String(obsAgeMs)} ` +
+              `windowMs=${opencodeSubagentWindowMs} ` +
+              `holdMs=${opencodeSubagentHoldMs}`
+          );
+        }
+        continue;
+      }
+      if (debugSubagents) {
+        console.log(
+          `[consensus][subagent-keep] ${sessionId} ` +
+            `inFlight=${inFlight} ` +
+            `hasEventActivity=${hasEventActivity} ` +
+            `hasRecentObserved=${hasRecentObserved} ` +
+            `effectiveAt=${String(effectiveAt)} ` +
+            `windowMs=${opencodeSubagentWindowMs} ` +
+            `holdMs=${opencodeSubagentHoldMs}`
+        );
+      }
+
+      subagentCandidates.push({
+        session,
+        sessionId,
+        parentId,
+        eventActivity,
+        messageActivity,
+        activityAt: activityAt ?? (inFlight ? now : 0),
+        inFlight,
+      });
+    }
+
+    if (subagentCandidates.length) {
+      subagentCandidates.sort((a, b) => b.activityAt - a.activityAt);
+      const capped = subagentCandidates.slice(0, 20);
+      for (const candidate of capped) {
+        const { session, sessionId, parentId, eventActivity, messageActivity, inFlight } = candidate;
+
+        const sessionIdentity = `opencode:${sessionId}`;
+        const id = `session:${sessionId}`;
+        const cached = activityCache.get(id);
+        const statusRaw = typeof (session as { status?: string }).status === "string"
+          ? (session as { status?: string }).status
+          : undefined;
+        const status = eventActivity?.lastStatus ?? statusRaw?.toLowerCase();
+        const statusIsError = !!status && /error|failed|failure/.test(status);
+        const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
+        const statusIsActive = !!status && /running|active|processing|busy|retry/.test(status);
+        const sessionUpdatedAt = opencodeSessionTimestamp(session);
+        const lastActivityAt = maxMs(
+          toMs(eventActivity?.lastActivityAt),
+          toMs(messageActivity?.lastActivityAt),
+          sessionUpdatedAt
+        );
+        const lastEventAt = eventActivity?.lastEventAt;
+        const hasError = !!eventActivity?.hasError || statusIsError;
+
+        const activity = deriveOpenCodeState({
+          hasError,
+          lastEventAt,
+          lastActivityAt,
+          inFlight,
+          status,
+          now,
+          previousActiveAt: cached?.lastActiveAt,
+          eventWindowMs: opencodeEventWindowMs,
+          holdMs: opencodeHoldMs,
+          inFlightIdleMs: opencodeInFlightIdleMs,
+          strictInFlight: opencodeStrictInFlight,
+        });
+        let state = activity.state;
+        let reason = activity.reason || "session";
+        const activityLastActiveAt = activity.lastActiveAt ?? cached?.lastActiveAt;
+        if (
+          activity.state === "active" &&
+          activity.reason === "hold" &&
+          typeof activity.lastActiveAt === "number" &&
+          opencodeHoldMs > 0
+        ) {
+          bumpNextTickAt(activity.lastActiveAt + opencodeHoldMs);
+        }
+
+        const hasSignal =
+          statusIsIdle ||
+          statusIsActive ||
+          statusIsError ||
+          typeof lastActivityAt === "number" ||
+          typeof inFlight === "boolean";
+        if (!hasSignal && !activityLastActiveAt) {
+          state = "idle";
+          reason = "no_signal";
+        }
+
+        if (cached?.lastState && cached.lastState !== state) {
+          metricEffects.push(recordActivityTransition("opencode", cached.lastState, state, reason));
+          trackTransition("opencode", cached.lastState, state, reason);
+        }
+
+        activityCache.set(id, {
+          lastActiveAt: activityLastActiveAt,
+          lastSeenAt: now,
+          lastState: state,
+          lastReason: reason,
+          startMs: sessionUpdatedAt || undefined,
+        });
+        seenIds.add(id);
+
+        const sessionTitle = normalizeTitle(
+          (session as { title?: string; name?: string }).title ||
+            (session as { title?: string; name?: string }).name
+        );
+        const sessionCwd =
+          (session as { directory?: string; cwd?: string }).directory ||
+          (session as { directory?: string; cwd?: string }).cwd;
+        const cwd = redactText(sessionCwd) || sessionCwd;
+        const repoRoot = sessionCwd ? findRepoRoot(sessionCwd) : null;
+        const repoName = repoRoot ? path.basename(repoRoot) : undefined;
+        const summary = eventActivity?.summary;
+        const events = eventActivity?.events;
+        const cmd = `opencode session ${sessionId}`;
+        const cmdShort = shortenCmd(cmd);
+        const doing = summary?.current || sessionTitle;
+
+        agents.push({
+          identity: sessionIdentity,
+          id,
+          pid: undefined,
+          sessionId,
+          parentSessionId: parentId,
+          startedAt: sessionUpdatedAt ? Math.floor(sessionUpdatedAt / 1000) : undefined,
+          lastEventAt,
+          lastActivityAt,
+          activityReason: reason,
+          title: sessionTitle,
+          cmd,
+          cmdShort,
+          kind: "opencode-session",
+          cpu: 0,
+          mem: 0,
+          state,
+          doing: redactText(doing) || doing,
+          sessionPath: `opencode:${sessionId}`,
+          repo: repoName,
+          cwd,
+          model:
+            typeof (session as { model?: string }).model === "string"
+              ? (session as { model?: string }).model
+              : undefined,
+          summary: summary ? sanitizeSummary(summary) : undefined,
+          events,
+        });
+      }
+    }
+
+  }
+
+  // Prune old subagent seen entries (1 hour retention)
+  for (const [id, entry] of subagentSeen) {
+    if (typeof entry.lastSeenAt !== "number" || now - entry.lastSeenAt > 3_600_000) {
+      subagentSeen.delete(id);
+    }
+  }
+
+  throwIfAborted(signal);
   for (const proc of claudeProcs) {
     const stats = usage[proc.pid] || ({} as pidusage.Status);
     const cpu = typeof stats.cpu === "number" ? stats.cpu : 0;

@@ -16,9 +16,11 @@ export interface AgentEvent {
 }
 
 export interface AgentSnapshot {
-  identity: string;
+  identity?: string;
   id: string;
-  pid: number;
+  pid?: number;
+  sessionId?: string;
+  parentSessionId?: string;
   cmd?: string;
   cmdShort?: string;
   kind: string;
