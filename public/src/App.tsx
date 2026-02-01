@@ -1,103 +1,65 @@
-import { useMemo, useCallback } from 'react';
-import { useWebSocket } from './hooks/useWebSocket';
-import { useViewState } from './hooks/useViewState';
-import { useSearch } from './hooks/useSearch';
-import { useSelection } from './hooks/useSelection';
-import { HUD } from './components/HUD';
-import { CanvasScene } from './components/CanvasScene';
-import { AgentLane } from './components/AgentLane';
-import { AgentPanel } from './components/AgentPanel';
-import { isServerKind } from './lib/palette';
-import { initMockBridge } from './lib/mockBridge';
+/// <reference types="vite/client" />
+import { useEffect, useState } from 'react';
+import { GrowthBook, GrowthBookProvider, useFeature } from '@growthbook/growthbook-react';
+import { Toaster } from 'sonner';
+import { CanvasApp } from './CanvasApp';
+import { VariationEight, VariationNine } from './variations';
+import { VariationSelector } from './components/VariationSelector';
 
-// Parse URL params
-const query = new URLSearchParams(window.location.search);
-const mockMode = query.get('mock') === '1';
-const wsOverrideRaw = query.get('ws');
-const wsOverrideDecoded = wsOverrideRaw ? decodeURIComponent(wsOverrideRaw) : null;
+// Initialize GrowthBook instance
+const growthbook = new GrowthBook({
+    apiHost: import.meta.env.VITE_GROWTHBOOK_API_HOST || "https://cdn.growthbook.io",
+    clientKey: import.meta.env.VITE_GROWTHBOOK_CLIENT_KEY || "sdk-key",
+    enableDevMode: import.meta.env.DEV,
+    trackingCallback: (experiment, result) => {
+        // TODO: Implement tracking
+        console.log("Experiment Viewed:", {
+            experimentId: experiment.key,
+            variationId: result.key,
+        });
+    },
+});
 
-let wsOverride: string | null = null;
-if (wsOverrideDecoded) {
-  if (wsOverrideDecoded.startsWith('ws://') || wsOverrideDecoded.startsWith('wss://')) {
-    wsOverride = wsOverrideDecoded;
-  } else if (wsOverrideDecoded.startsWith('http://') || wsOverrideDecoded.startsWith('https://')) {
-    wsOverride = wsOverrideDecoded.replace(/^http/, 'ws');
-  }
+function AppContent() {
+    const landingDesign = useFeature("landing_design_v1");
+    // Default to control (CanvasApp) if flag is off or not 'liquid'/'sketch'
+    // But strictly, if flag is missing, we might want control.
+    // The feature value should match the variation keys.
+
+    const [devOverride, setDevOverride] = useState<string | null>(null);
+
+    const variation = devOverride || landingDesign.value || 'control';
+
+    // In a real edge-assigned setup with hydration, content might be ready immediately.
+    // Here we rely on the SDK.
+
+    return (
+        <>
+            {variation === 'liquid' && <VariationEight />}
+            {variation === 'sketch' && <VariationNine />}
+            {variation === 'control' && <CanvasApp />}
+
+            {/* Fallback if something unexpected happens */}
+            {variation !== 'liquid' && variation !== 'sketch' && variation !== 'control' && <CanvasApp />}
+
+            <VariationSelector
+                currentVariation={variation as string}
+                onSelect={setDevOverride}
+            />
+            <Toaster />
+        </>
+    );
 }
 
-if (mockMode) {
-  initMockBridge();
+export default function App() {
+    useEffect(() => {
+        // Load features from API (or hydration)
+        growthbook.loadFeatures({ autoRefresh: true });
+    }, []);
+
+    return (
+        <GrowthBookProvider growthbook={growthbook}>
+            <AppContent />
+        </GrowthBookProvider>
+    );
 }
-
-if (wsOverrideRaw || mockMode) {
-  (window as any).__consensusDebug = {
-    wsOverride,
-    wsOverrideRaw,
-    search: window.location.search,
-  };
-}
-
-const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-const wsUrl = wsOverride || `${wsProtocol}://${window.location.host}/ws`;
-
-function App() {
-  const { status, agents, meta } = useWebSocket(wsUrl, { mockMode });
-  const [view, , , viewHandlers] = useViewState();
-  const { query: searchQuery, setQuery, matches, filteredAgents } = useSearch(agents);
-  const { selected, selectedId, select, deselect } = useSelection(agents);
-
-  const agentCount = useMemo(() => {
-    return filteredAgents.filter((a) => !isServerKind(a.kind)).length;
-  }, [filteredAgents]);
-
-  const serverCount = useMemo(() => {
-    return filteredAgents.filter((a) => isServerKind(a.kind)).length;
-  }, [filteredAgents]);
-
-  const displayAgents = useMemo(() => {
-    if (!searchQuery.trim()) return agents;
-    return filteredAgents;
-  }, [agents, filteredAgents, searchQuery]);
-
-  const handleSearchChange = useCallback((value: string) => {
-    setQuery(value);
-  }, [setQuery]);
-
-  return (
-    <main id="main">
-      <CanvasScene
-        agents={displayAgents}
-        view={view}
-        selected={selected}
-        searchMatches={matches}
-        onSelect={select}
-        onMouseDown={viewHandlers.onMouseDown}
-        onKeyDown={viewHandlers.onKeyDown}
-        onCanvasWheel={viewHandlers.onCanvasWheel}
-      />
-      
-      <HUD
-        status={status}
-        agentCount={agentCount}
-        serverCount={serverCount}
-        meta={meta}
-      />
-      
-      <AgentLane
-        agents={displayAgents}
-        selectedId={selectedId}
-        searchQuery={searchQuery}
-        onSelect={select}
-        onSearchChange={handleSearchChange}
-      />
-      
-      <AgentPanel
-        agent={selected}
-        showMetadata={searchQuery.trim().length > 0}
-        onClose={deselect}
-      />
-    </main>
-  );
-}
-
-export default App;
