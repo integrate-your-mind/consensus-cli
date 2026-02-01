@@ -61,6 +61,15 @@ export const getOpenCodeSessionPid = (session: unknown): number | undefined => {
   );
 };
 
+export const isOpenCodeChildSession = (session: unknown): boolean => {
+  if (!session || typeof session !== "object") return false;
+  // Check for any parent indicator
+  if ("parentId" in session && session.parentId) return true;
+  if ("parentID" in session && session.parentID) return true;
+  if ("parent_id" in session && session.parent_id) return true;
+  return false;
+};
+
 export const markOpenCodeSessionUsed = (
   used: UsedSessionMap,
   sessionId: string,
