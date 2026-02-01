@@ -38,6 +38,7 @@ import {
 } from "./opencodeEvents.js";
 import {
   getOpenCodeSessionId,
+  getOpenCodeSessionParentId,
   getOpenCodeSessionPid,
   markOpenCodeSessionUsed,
   selectOpenCodeSessionForTui,
@@ -92,7 +93,7 @@ const OPENCODE_PREFETCH_COOLDOWN_MS = 30_000;
 // Track subagent observation times for hold mechanism
 const subagentSeen = new Map<
   string,
-  { lastAt?: number; observedAt?: number }
+  { lastRemoteAt?: number; observedAt?: number; lastSeenAt: number }
 >();
 
 function getOpencodePrefetchKey(host: string, port: number): string {
@@ -1015,6 +1016,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   type OpenCodeSession = (typeof opencodeSessions)[number];
   const opencodeSessionsByPid = new Map<number, OpenCodeSession>();
   const opencodeSessionsById = new Map<string, OpenCodeSession>();
+  const opencodeChildSessionIds = new Set<string>();
   // Track ALL recent sessions per directory for activity polling (not just the latest)
   const opencodeAllSessionsByDir = new Map<string, OpenCodeSession[]>();
   const opencodeSessionTimestamp = (session: OpenCodeSession): number => {
@@ -1049,12 +1051,28 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const sessionId = getOpenCodeSessionId(session);
     if (sessionId) {
       opencodeSessionsById.set(sessionId, session);
+      if (getOpenCodeSessionParentId(session)) {
+        opencodeChildSessionIds.add(sessionId);
+      }
     }
     if (typeof session.directory === "string") {
       addSessionToDir(session.directory, session);
     }
     if (typeof session.cwd === "string") {
       addSessionToDir(session.cwd, session);
+    }
+  }
+  if (opencodeApiAvailable && subagentSeen.size > 0) {
+    for (const sessionId of subagentSeen.keys()) {
+      const session = opencodeSessionsById.get(sessionId);
+      if (!session) {
+        subagentSeen.delete(sessionId);
+        continue;
+      }
+      const parentId = getOpenCodeSessionParentId(session);
+      if (!parentId || !opencodeSessionsById.has(parentId)) {
+        subagentSeen.delete(sessionId);
+      }
     }
   }
   for (const sessions of opencodeAllSessionsByDir.values()) {
@@ -1707,6 +1725,10 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     if (isLspRun) continue;
     const isServer = kind === "opencode-server";
     let cachedSessionId = opencodeSessionByPidCache.get(proc.pid)?.sessionId;
+    if (cachedSessionId && opencodeChildSessionIds.has(cachedSessionId)) {
+      cachedSessionId = undefined;
+      opencodeSessionByPidCache.delete(proc.pid);
+    }
     const cwdMatch = cwds.get(proc.pid);
     // Check if cached session is still active; if not and there are active sessions available,
     // invalidate the cache to allow reassignment to an active session.
@@ -1733,6 +1755,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
           sessionsByDir: opencodeAllSessionsByDir,
           activeSessionIdsByDir: opencodeActiveSessionIdsByDir,
           usedSessionIds: usedOpenCodeSessionIds,
+          childSessionIds: opencodeChildSessionIds,
         })
       : { session: undefined, sessionId: undefined, source: "none" as const };
     const session = selection.session;
@@ -1743,7 +1766,12 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         : undefined;
     if (!isServer && !sessionId && storageSession) {
       const storageSessionId = getOpenCodeSessionId(storageSession);
-      if (storageSessionId) {
+      const storageParentId = getOpenCodeSessionParentId(storageSession);
+      if (
+        storageSessionId &&
+        !storageParentId &&
+        !opencodeChildSessionIds.has(storageSessionId)
+      ) {
         if (markOpenCodeSessionUsed(usedOpenCodeSessionIds, storageSessionId, proc.pid)) {
           sessionId = storageSessionId;
         }
@@ -1751,7 +1779,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
     if (!isServer && !sessionId) {
       const extractedId = extractOpenCodeSessionId(cmdRaw);
-      if (extractedId) {
+      if (extractedId && !opencodeChildSessionIds.has(extractedId)) {
         if (markOpenCodeSessionUsed(usedOpenCodeSessionIds, extractedId, proc.pid)) {
           sessionId = extractedId;
         }
@@ -2033,9 +2061,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     for (const session of opencodeSessions) {
       const sessionId = getOpenCodeSessionId(session);
       if (!sessionId) continue;
-      const parentId = typeof (session as { parentID?: string }).parentID === "string"
-        ? (session as { parentID?: string }).parentID
-        : undefined;
+      const parentId = getOpenCodeSessionParentId(session);
       if (!parentId) continue;
       if (!assignedOpenCodeSessionIds.has(parentId)) continue;
       if (assignedOpenCodeSessionIds.has(sessionId)) continue;
@@ -2049,58 +2075,53 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
           cache: true,
         }));
       const sessionUpdatedAt = opencodeSessionTimestamp(session);
-      const activityAt = maxMs(
+      const remoteAt = maxMs(
         toMs(eventActivity?.lastActivityAt),
-        toMs(messageActivity?.lastActivityAt),
-        sessionUpdatedAt
+        toMs(messageActivity?.lastActivityAt)
       );
+      const fallbackAt = typeof remoteAt === "number" ? undefined : sessionUpdatedAt;
       const inFlight =
         eventActivity?.inFlight === true || messageActivity?.inFlight === true;
-      const hasEventActivity =
-        typeof activityAt === "number" &&
+      const hasRemoteFresh =
+        typeof remoteAt === "number" &&
         Number.isFinite(opencodeSubagentWindowMs) &&
         opencodeSubagentWindowMs > 0 &&
-        now - activityAt <= opencodeSubagentWindowMs;
+        now - remoteAt <= opencodeSubagentWindowMs;
+      const hasFallbackFresh =
+        typeof fallbackAt === "number" &&
+        Number.isFinite(opencodeSubagentWindowMs) &&
+        opencodeSubagentWindowMs > 0 &&
+        now - fallbackAt <= opencodeSubagentWindowMs;
+      const hasEventActivity = hasRemoteFresh || hasFallbackFresh;
+      const effectiveAt = typeof remoteAt === "number" ? remoteAt : fallbackAt;
+      const activityAt =
+        typeof effectiveAt === "number" ? effectiveAt : inFlight ? now : 0;
 
       // Observation hold: track when we see activity timestamps increase
-      const entry = subagentSeen.get(sessionId);
-      if (!entry) {
-        // First sight: store lastAt, and set observedAt only if within remote window
-        const newEntry: { lastAt?: number; observedAt?: number } = {
-          lastAt: activityAt,
-        };
-        if (
-          typeof activityAt === "number" &&
-          now - activityAt <= opencodeSubagentWindowMs
-        ) {
-          newEntry.observedAt = now;
-        }
-        subagentSeen.set(sessionId, newEntry);
-      } else if (
-        typeof activityAt === "number" &&
-        (typeof entry.lastAt !== "number" || activityAt > entry.lastAt)
-      ) {
-        // Timestamp increased: update and refresh observedAt
-        entry.lastAt = activityAt;
-        entry.observedAt = now;
-      } else if (inFlight) {
-        // Currently in flight: refresh observedAt
-        entry.observedAt = now;
+      const prev = subagentSeen.get(sessionId);
+      let observedAt = prev?.observedAt;
+      const remoteIncreased =
+        typeof remoteAt === "number" && remoteAt > (prev?.lastRemoteAt ?? -Infinity);
+      if (!prev) {
+        if (inFlight || hasEventActivity) observedAt = now;
+      } else {
+        if (inFlight || hasEventActivity || remoteIncreased) observedAt = now;
       }
+      subagentSeen.set(sessionId, {
+        lastRemoteAt: typeof remoteAt === "number" ? remoteAt : prev?.lastRemoteAt,
+        observedAt,
+        lastSeenAt: now,
+      });
 
-      const observed = subagentSeen.get(sessionId);
       const hasRecentObserved =
-        typeof observed?.observedAt === "number" &&
-        now - observed.observedAt <= opencodeSubagentHoldMs;
+        typeof observedAt === "number" && now - observedAt <= opencodeSubagentHoldMs;
 
       if (!inFlight && !hasEventActivity && !hasRecentObserved) {
         if (debugSubagents) {
           const ageMs =
-            typeof activityAt === "number" ? Math.max(0, now - activityAt) : undefined;
+            typeof effectiveAt === "number" ? Math.max(0, now - effectiveAt) : undefined;
           const obsAgeMs =
-            typeof observed?.observedAt === "number"
-              ? now - observed.observedAt
-              : undefined;
+            typeof observedAt === "number" ? now - observedAt : undefined;
           const remoteSkewMs = ageMs;
           console.log(
             `[consensus][subagent-drop] ${sessionId} ` +
@@ -2110,10 +2131,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
               `sseAt=${String(eventActivity?.lastActivityAt)} ` +
               `msgAt=${String(messageActivity?.lastActivityAt)} ` +
               `updatedAt=${String(sessionUpdatedAt)} ` +
-              `effectiveAt=${String(activityAt)} ` +
+              `remoteAt=${String(remoteAt)} ` +
+              `effectiveAt=${String(effectiveAt)} ` +
               `ageMs=${String(ageMs)} ` +
               `remoteSkewMs=${String(remoteSkewMs)} ` +
-              `observedAt=${String(observed?.observedAt)} ` +
+              `observedAt=${String(observedAt)} ` +
               `obsAgeMs=${String(obsAgeMs)} ` +
               `windowMs=${opencodeSubagentWindowMs} ` +
               `holdMs=${opencodeSubagentHoldMs}`
@@ -2127,7 +2149,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
             `inFlight=${inFlight} ` +
             `hasEventActivity=${hasEventActivity} ` +
             `hasRecentObserved=${hasRecentObserved} ` +
-            `effectiveAt=${String(activityAt)} ` +
+            `effectiveAt=${String(effectiveAt)} ` +
             `windowMs=${opencodeSubagentWindowMs} ` +
             `holdMs=${opencodeSubagentHoldMs}`
         );
@@ -2266,21 +2288,12 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       }
     }
 
-    // Prune old subagent seen entries (1 hour retention)
-    for (const [id, entry] of subagentSeen) {
-      if (entry.observedAt && now - entry.observedAt > 3_600_000) {
-        subagentSeen.delete(id);
-        continue;
-      }
-      if (!entry.observedAt) {
-        if (typeof entry.lastAt === "number" && now - entry.lastAt > 3_600_000) {
-          subagentSeen.delete(id);
-          continue;
-        }
-        if (entry.lastAt === undefined) {
-          subagentSeen.delete(id);
-        }
-      }
+  }
+
+  // Prune old subagent seen entries (1 hour retention)
+  for (const [id, entry] of subagentSeen) {
+    if (typeof entry.lastSeenAt !== "number" || now - entry.lastSeenAt > 3_600_000) {
+      subagentSeen.delete(id);
     }
   }
 

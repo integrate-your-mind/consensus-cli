@@ -92,6 +92,7 @@ export const pickOpenCodeSessionByDir = <T extends OpenCodeSessionLike>({
   sessionsById,
   usedSessionIds,
   pid,
+  childSessionIds,
 }: {
   dir?: string;
   sessionsByDir: Map<string, T[]>;
@@ -99,13 +100,16 @@ export const pickOpenCodeSessionByDir = <T extends OpenCodeSessionLike>({
   sessionsById: Map<string, T>;
   usedSessionIds: UsedSessionMap;
   pid: number;
+  childSessionIds?: Set<string>;
 }): T | undefined => {
   if (!dir) return undefined;
   const sessions = sessionsByDir.get(dir);
   if (!sessions || sessions.length === 0) return undefined;
   const activeIds = activeSessionIdsByDir.get(dir);
+  const isChildId = (id: string): boolean => !!childSessionIds?.has(id);
   if (activeIds) {
     for (const id of activeIds) {
+      if (isChildId(id)) continue;
       const activeSession = sessionsById.get(id);
       if (activeSession && isOpenCodeChildSession(activeSession)) continue;
       if (!markOpenCodeSessionUsed(usedSessionIds, id, pid)) continue;
@@ -118,6 +122,7 @@ export const pickOpenCodeSessionByDir = <T extends OpenCodeSessionLike>({
     if (isOpenCodeChildSession(session)) continue;
     const id = getOpenCodeSessionId(session);
     if (!id) continue;
+    if (isChildId(id)) continue;
     if (!markOpenCodeSessionUsed(usedSessionIds, id, pid)) continue;
     return session;
   }
@@ -133,6 +138,7 @@ export const selectOpenCodeSessionForTui = <T extends OpenCodeSessionLike>({
   sessionsByDir,
   activeSessionIdsByDir,
   usedSessionIds,
+  childSessionIds,
 }: {
   pid: number;
   dir?: string;
@@ -142,17 +148,19 @@ export const selectOpenCodeSessionForTui = <T extends OpenCodeSessionLike>({
   sessionsByDir: Map<string, T[]>;
   activeSessionIdsByDir: Map<string, string[]>;
   usedSessionIds: UsedSessionMap;
+  childSessionIds?: Set<string>;
 }): { session?: T; sessionId?: string; source: "pid" | "cache" | "dir" | "none" } => {
   const sessionByPidId = getOpenCodeSessionId(sessionByPid);
   if (
     sessionByPidId &&
     !isOpenCodeChildSession(sessionByPid) &&
+    !childSessionIds?.has(sessionByPidId) &&
     markOpenCodeSessionUsed(usedSessionIds, sessionByPidId, pid)
   ) {
     return { session: sessionByPid, sessionId: sessionByPidId, source: "pid" };
   }
 
-  if (cachedSessionId) {
+  if (cachedSessionId && !childSessionIds?.has(cachedSessionId)) {
     const cachedSession = sessionsById.get(cachedSessionId);
     if (
       !isOpenCodeChildSession(cachedSession) &&
@@ -173,6 +181,7 @@ export const selectOpenCodeSessionForTui = <T extends OpenCodeSessionLike>({
     sessionsById,
     usedSessionIds,
     pid,
+    childSessionIds,
   });
   if (byDir) {
     return { session: byDir, sessionId: getOpenCodeSessionId(byDir), source: "dir" };
