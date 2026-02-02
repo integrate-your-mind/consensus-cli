@@ -48,6 +48,7 @@ import { deriveOpenCodeState } from "./opencodeState.js";
 import { shouldUseOpenCodeApiActivityAt } from "./opencodeApiActivity.js";
 import { shouldIncludeOpenCodeProcess } from "./opencodeFilter.js";
 import { summarizeClaudeCommand } from "./claudeCli.js";
+import { hasCodexToken, hasCodexVendorPath, isCodexBinary } from "./codexCmd.js";
 import { deriveStateWithHold } from "./activity.js";
 import { getClaudeActivityByCwd, getClaudeActivityBySession } from "./services/claudeEvents.js";
 import { parseOpenCodeCommand, summarizeOpenCodeCommand } from "./opencodeCmd.js";
@@ -241,24 +242,6 @@ function stripQuotes(value: string): string {
   return value.replace(/^["']|["']$/g, "");
 }
 
-function isCodexBinary(value: string | undefined): boolean {
-  if (!value) return false;
-  const cleaned = stripQuotes(value);
-  const base = path.basename(cleaned).toLowerCase();
-  return base === "codex" || base === "codex.exe";
-}
-
-function hasCodexVendorPath(cmdLine: string): boolean {
-  return /[\\/]+codex[\\/]+vendor[\\/]+/i.test(cmdLine);
-}
-
-function hasCodexToken(cmdLine: string): boolean {
-  return (
-    /(?:^|\s|[\\/])codex(\.exe)?(?:\s|$)/i.test(cmdLine) ||
-    /[\\/]+codex(\.exe)?/i.test(cmdLine)
-  );
-}
-
 function isCodexProcess(cmd: string | undefined, name: string | undefined, matchRe?: RegExp): boolean {
   if (!cmd && !name) return false;
   if (isOpenCodeProcess(cmd, name)) return false;
@@ -310,12 +293,7 @@ function inferKind(cmd: string): AgentKind {
   const claudeInfo = summarizeClaudeCommand(cmd);
   if (claudeInfo) return claudeInfo.kind;
   if (cmd.includes(" exec")) return "exec";
-  if (
-    cmd.includes(" codex") ||
-    cmd.startsWith("codex") ||
-    cmd.startsWith("codex.exe") ||
-    /[\\/]+codex(\.exe)?/i.test(cmd)
-  ) {
+  if (hasCodexToken(cmd)) {
     return "tui";
   }
   return "unknown";
@@ -373,7 +351,7 @@ function parseDoingFromCmd(cmd: string): string | undefined {
     return "monitor";
   }
   if (cmd.includes("app-server")) return "app-server";
-  if (cmd.startsWith("codex") || cmd.startsWith("codex.exe")) return "codex";
+  if (hasCodexToken(cmd)) return "codex";
   return undefined;
 }
 
