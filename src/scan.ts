@@ -191,6 +191,22 @@ export function markSessionDirty(sessionPath: string): void {
   dirtySessionPaths.add(sessionPath);
 }
 
+export interface CodexNotifyEndGateInput {
+  tailAllowsNotifyEnd: boolean;
+  notifyEndIsFresh: boolean;
+  tailEndAt?: number;
+  tailInFlight?: boolean;
+}
+
+export function shouldApplyCodexNotifyEnd(input: CodexNotifyEndGateInput): boolean {
+  return (
+    input.tailAllowsNotifyEnd &&
+    input.notifyEndIsFresh &&
+    !input.tailEndAt &&
+    !input.tailInFlight
+  );
+}
+
 function consumeDirtySessions(): Set<string> {
   const dirty = new Set(dirtySessionPaths);
   dirtySessionPaths.clear();
@@ -1521,12 +1537,6 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         : typeof tailEventAt === "number"
           ? tailEventAt
           : undefined;
-    const tailSignalAtCandidate =
-      typeof tailInFlightSignalAt === "number"
-        ? tailInFlightSignalAt
-        : typeof tailIngestAt === "number"
-          ? tailIngestAt
-          : tailActivityAtCandidate;
     inFlight = eventInFlight || tailInFlight;
     const mergedActivityAt = Math.max(
       typeof eventActivityAt === "number" ? eventActivityAt : 0,
@@ -1579,7 +1589,12 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       const notifyEndIsFresh =
         typeof notifyEndAt === "number" &&
         (typeof tailActivityAtCandidate !== "number" || notifyEndAt >= tailActivityAtCandidate);
-      const notifyShouldEnd = tailAllowsNotifyEnd && notifyEndIsFresh && !tailEndAt;
+      const notifyShouldEnd = shouldApplyCodexNotifyEnd({
+        tailAllowsNotifyEnd,
+        notifyEndIsFresh,
+        tailEndAt,
+        tailInFlight,
+      });
       if (notifyShouldEnd) {
         inFlight = false;
       }

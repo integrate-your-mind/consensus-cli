@@ -121,7 +121,7 @@ const startServer = async () => {
       });
     });
 
-    if (result.status === "running") return;
+    if (result.status === "running") return port;
     if (result.status === "conflict") {
       process.stderr.write(`[dev] port ${port} in use, trying next\n`);
       continue;
@@ -134,9 +134,10 @@ const startServer = async () => {
 
   process.stderr.write("[dev] failed to find an open port for server\n");
   shutdown(1);
+  return null;
 };
 
-const startVite = async () => {
+const startVite = async (serverPort) => {
   const maxAttempts = 6;
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
@@ -148,7 +149,11 @@ const startVite = async () => {
       [vitePath, "--port", String(port), "--host", "127.0.0.1", "--strictPort"],
       {
         cwd: path.join(root, "public"),
-        env: { ...process.env, CONSENSUS_UI_PORT: String(port) },
+        env: {
+          ...process.env,
+          CONSENSUS_UI_PORT: String(port),
+          CONSENSUS_PORT: String(serverPort),
+        },
         stdio: ["ignore", "pipe", "pipe"],
       }
     );
@@ -197,8 +202,13 @@ const startVite = async () => {
   shutdown(1);
 };
 
-void startServer();
-void startVite();
+const main = async () => {
+  const serverPort = await startServer();
+  if (!serverPort) return;
+  await startVite(serverPort);
+};
+
+void main();
 
 const shutdown = (code = 0) => {
   for (const child of children) {
