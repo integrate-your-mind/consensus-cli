@@ -1,0 +1,575 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import net from "node:net";
+import { spawn, execFile } from "node:child_process";
+import { once } from "node:events";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
+
+const execFileAsync = promisify(execFile);
+const currentFile = fileURLToPath(import.meta.url);
+const currentDir = path.dirname(currentFile);
+const repoRoot = path.resolve(currentDir, "..", "..");
+
+export type ConsensusServer = {
+  port: number;
+  inspectorPort?: number;
+  output: string;
+  stop: () => Promise<void>;
+};
+
+export type TmuxSession = {
+  socketPath: string;
+  sessionId: string;
+  target: string;
+  sendText: (text: string) => Promise<void>;
+  capture: () => Promise<string>;
+  panePid: () => Promise<number>;
+  kill: () => Promise<void>;
+};
+
+const ANSI_ESCAPE_RE = /\u001b\[[0-9;]*m/g;
+const CODEX_AUTH_ERROR_RE = /unauthorized|login|api key|missing bearer/i;
+const DEFAULT_READY_PROMPT_RE = /(?:^|\n)\s*(?:codex[^\n]*>|>)\s*$/i;
+const READY_HINT_RE = /type\s+\/help|\/help\s+for\s+commands/i;
+
+export async function isTmuxAvailable(): Promise<boolean> {
+  try {
+    await execFileAsync("tmux", ["-V"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function isCodexAvailable(codexBin = "codex"): Promise<boolean> {
+  try {
+    await execFileAsync(codexBin, ["--version"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function getFreePort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        reject(new Error("Failed to acquire free port"));
+        return;
+      }
+      const { port } = address;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+export async function createTempProject(): Promise<{ root: string; cleanup: () => Promise<void> }> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-live-project-"));
+  const srcDir = path.join(root, "src");
+  await fs.mkdir(srcDir, { recursive: true });
+  await fs.writeFile(path.join(root, "a.config.ts"), "export const A = 1;\n");
+  await fs.writeFile(path.join(root, "b.config.ts"), "export const B = 2;\n");
+  await fs.writeFile(path.join(root, "c.config.ts"), "export const C = 3;\n");
+  await fs.writeFile(path.join(srcDir, "alpha.ts"), "export const alpha = 'alpha';\n");
+  await fs.writeFile(path.join(srcDir, "beta.ts"), "export const beta = 'beta';\n");
+  await fs.writeFile(path.join(srcDir, "gamma.ts"), "export const gamma = 'gamma';\n");
+  await fs.writeFile(path.join(root, "README.md"), "Deterministic test project.\n");
+  return {
+    root,
+    cleanup: async () => fs.rm(root, { recursive: true, force: true }),
+  };
+}
+
+export async function createCodexHome(options?: {
+  useRealHome?: boolean;
+}): Promise<{
+  home: string;
+  root: string;
+  cleanup: () => Promise<void>;
+}> {
+  const useRealHome =
+    options?.useRealHome ??
+    (process.env.RUN_LIVE_CODEX === "1" && process.env.CODEX_TEST_USE_REAL_HOME !== "0");
+  if (useRealHome) {
+    const root = os.homedir();
+    const home = process.env.CODEX_HOME || path.join(root, ".codex");
+    await fs.mkdir(path.join(home, "sessions"), { recursive: true });
+    await fs.mkdir(path.join(home, "consensus"), { recursive: true });
+    return {
+      home,
+      root,
+      cleanup: async () => {},
+    };
+  }
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-codex-home-"));
+  const home = path.join(root, ".codex");
+  await fs.mkdir(path.join(home, "sessions"), { recursive: true });
+  await fs.mkdir(path.join(home, "consensus"), { recursive: true });
+  return {
+    home,
+    root,
+    cleanup: async () => fs.rm(root, { recursive: true, force: true }),
+  };
+}
+
+function shellQuote(value: string): string {
+  return JSON.stringify(value);
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(ANSI_ESCAPE_RE, "");
+}
+
+function lastNonEmptyLine(value: string): string | undefined {
+  const lines = value.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const trimmed = lines[i]?.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
+export function isCodexAuthError(output: string): boolean {
+  return CODEX_AUTH_ERROR_RE.test(stripAnsi(output));
+}
+
+export function isCodexReadyOutput(output: string): boolean {
+  const normalized = stripAnsi(output);
+  const override = process.env.CODEX_TEST_READY_REGEX;
+  if (override) {
+    try {
+      const re = new RegExp(override, "i");
+      return re.test(normalized);
+    } catch {
+      // Fall back to defaults if override is invalid.
+    }
+  }
+  const lastLine = lastNonEmptyLine(normalized) ?? "";
+  if (DEFAULT_READY_PROMPT_RE.test(lastLine)) return true;
+  if (READY_HINT_RE.test(normalized)) return true;
+  return false;
+}
+
+export function formatPaneOutput(output: string, maxChars = 2000): string {
+  const normalized = stripAnsi(output);
+  if (normalized.length <= maxChars) return normalized;
+  return normalized.slice(-maxChars);
+}
+
+export async function capturePaneExcerpt(
+  session: TmuxSession,
+  maxChars = 2000
+): Promise<string> {
+  const output = await session.capture();
+  return formatPaneOutput(output, maxChars);
+}
+
+export async function startConsensusServer(options: {
+  port: number;
+  codexHome: string;
+  inspector?: boolean;
+  debugActivity?: boolean;
+  testHooks?: boolean;
+  processMatch?: string;
+  timeoutMs?: number;
+}): Promise<ConsensusServer> {
+  const args = [] as string[];
+  if (options.inspector) {
+    args.push("--inspect=0");
+  }
+  args.push("--import", "tsx", path.join(repoRoot, "src", "server.ts"));
+
+  const child = spawn(process.execPath, args, {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      CONSENSUS_PORT: String(options.port),
+      CONSENSUS_HOST: "127.0.0.1",
+      CONSENSUS_CODEX_HOME: options.codexHome,
+      CONSENSUS_DEBUG_ACTIVITY: options.debugActivity ? "1" : "0",
+      CODEX_TEST_HOOKS: options.testHooks ? "1" : "0",
+      CONSENSUS_PROCESS_MATCH: options.processMatch,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let output = "";
+  const onOutput = (chunk: Buffer) => {
+    output += chunk.toString();
+  };
+  child.stdout?.on("data", onOutput);
+  child.stderr?.on("data", onOutput);
+
+  let inspectorPort: number | undefined;
+  if (options.inspector && child.stderr) {
+    inspectorPort = await waitForInspectorPort(child.stderr, 5000);
+  }
+
+  try {
+    await waitForHttpOk(
+      `http://127.0.0.1:${options.port}/health`,
+      options.timeoutMs ?? 15000,
+      child
+    );
+  } catch (err) {
+    const trimmed = output.trim();
+    const suffix = trimmed ? `\nServer output:\n${trimmed}` : "";
+    throw new Error(`${(err as Error).message}${suffix}`);
+  }
+
+  const stop = async () => {
+    if (child.killed) return;
+    child.kill("SIGTERM");
+    const exited = await waitForExit(child, 5000);
+    if (!exited) {
+      child.kill("SIGKILL");
+      await waitForExit(child, 2000);
+    }
+  };
+
+  return { port: options.port, inspectorPort, output, stop };
+}
+
+async function waitForExit(child: ReturnType<typeof spawn>, timeoutMs: number): Promise<boolean> {
+  try {
+    await Promise.race([once(child, "exit"), delay(timeoutMs)]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForInspectorPort(
+  stream: NodeJS.ReadableStream,
+  timeoutMs: number
+): Promise<number> {
+  const start = Date.now();
+  let buffer = "";
+  return await new Promise((resolve, reject) => {
+    const onData = (chunk: Buffer) => {
+      buffer += chunk.toString();
+      const match = buffer.match(/Debugger listening on ws:\/\/[^\s:]+:(\d+)\//);
+      if (match) {
+        cleanup();
+        resolve(Number(match[1]));
+      }
+    };
+    const onTimeout = () => {
+      cleanup();
+      reject(new Error("Timed out waiting for inspector port"));
+    };
+    const cleanup = () => {
+      stream.off("data", onData);
+      clearTimeout(timer);
+    };
+    stream.on("data", onData);
+    const remaining = Math.max(0, timeoutMs - (Date.now() - start));
+    const timer = setTimeout(onTimeout, remaining);
+  });
+}
+
+async function waitForHttpOk(
+  url: string,
+  timeoutMs: number,
+  child: ReturnType<typeof spawn>
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (child.exitCode !== null) {
+      throw new Error(`Server process exited with code ${child.exitCode}`);
+    }
+    try {
+      const res = await fetch(url);
+      if (res.ok) return;
+    } catch {
+      // ignore
+    }
+    await delay(200);
+  }
+  throw new Error(`Timed out waiting for ${url}`);
+}
+
+export async function startTmuxSession(): Promise<TmuxSession> {
+  const sessionId = `consensus-test-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const socketPath = path.join(os.tmpdir(), `${sessionId}.sock`);
+  await execFileAsync("tmux", [
+    "-f",
+    "/dev/null",
+    "-S",
+    socketPath,
+    "new-session",
+    "-d",
+    "-s",
+    sessionId,
+    "-n",
+    "main",
+    "-x",
+    "120",
+    "-y",
+    "40",
+  ]);
+  const target = `${sessionId}:main.0`;
+  const sendText = async (text: string) => {
+    await execFileAsync("tmux", ["-S", socketPath, "send-keys", "-t", target, "-l", text]);
+    await execFileAsync("tmux", ["-S", socketPath, "send-keys", "-t", target, "C-m"]);
+  };
+  const capture = async () => {
+    const { stdout } = await execFileAsync("tmux", ["-S", socketPath, "capture-pane", "-p", "-t", target]);
+    return stdout.toString();
+  };
+  const panePid = async () => {
+    const { stdout } = await execFileAsync("tmux", [
+      "-S",
+      socketPath,
+      "display-message",
+      "-p",
+      "-t",
+      target,
+      "#{pane_pid}",
+    ]);
+    const pid = Number(stdout.toString().trim());
+    if (!Number.isFinite(pid)) {
+      throw new Error("Failed to resolve tmux pane pid");
+    }
+    return pid;
+  };
+  const kill = async () => {
+    try {
+      await execFileAsync("tmux", ["-S", socketPath, "kill-server"]);
+    } catch {
+      // ignore
+    }
+  };
+  return { socketPath, sessionId, target, sendText, capture, panePid, kill };
+}
+
+export async function waitForPaneOutput(
+  session: TmuxSession,
+  predicate: (output: string) => boolean,
+  timeoutMs: number
+): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const output = await session.capture();
+    if (predicate(output)) return output;
+    await delay(200);
+  }
+  const output = await session.capture();
+  const excerpt = formatPaneOutput(output);
+  throw new Error(`Timed out waiting for tmux output.\n--- tmux pane ---\n${excerpt}`);
+}
+
+function parsePsStart(value: string): number | undefined {
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+type PsEntry = {
+  pid: number;
+  ppid: number;
+  startedAt?: number;
+  cmd: string;
+};
+
+function parsePsLine(line: string): PsEntry | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split(/\s+/);
+  if (parts.length < 8) return null;
+  const pid = Number(parts[0]);
+  const ppid = Number(parts[1]);
+  if (!Number.isFinite(pid) || !Number.isFinite(ppid)) return null;
+  const startStr = parts.slice(2, 7).join(" ");
+  const startedAt = parsePsStart(startStr);
+  const cmd = parts.slice(7).join(" ");
+  return { pid, ppid, startedAt, cmd };
+}
+
+function buildProcessMatcher(options: {
+  codexBin?: string;
+  processMatch?: string;
+}): (cmd: string) => boolean {
+  if (options.processMatch) {
+    try {
+      const re = new RegExp(options.processMatch, "i");
+      return (cmd) => re.test(cmd);
+    } catch {
+      // ignore invalid regex
+    }
+  }
+  const base =
+    options.codexBin && options.codexBin.trim().length > 0
+      ? path.basename(options.codexBin)
+      : undefined;
+  if (base) {
+    return (cmd) => cmd.includes(base) || /(?:^|\s|[\\/])codex(?:-cli)?(\.exe)?(?:\s|$)/i.test(cmd);
+  }
+  return (cmd) => /(?:^|\s|[\\/])codex(?:-cli)?(\.exe)?(?:\s|$)/i.test(cmd);
+}
+
+function collectDescendants(entries: PsEntry[], rootPid: number): PsEntry[] {
+  const byParent = new Map<number, PsEntry[]>();
+  for (const entry of entries) {
+    const list = byParent.get(entry.ppid);
+    if (list) {
+      list.push(entry);
+    } else {
+      byParent.set(entry.ppid, [entry]);
+    }
+  }
+  const descendants: PsEntry[] = [];
+  const stack = [rootPid];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    const children = byParent.get(current);
+    if (!children) continue;
+    for (const child of children) {
+      descendants.push(child);
+      stack.push(child.pid);
+    }
+  }
+  return descendants;
+}
+
+export async function waitForCodexPid(options: {
+  startAfterMs: number;
+  timeoutMs: number;
+  panePid?: number;
+  codexBin?: string;
+  processMatch?: string;
+  session?: TmuxSession;
+}): Promise<number> {
+  const matcher = buildProcessMatcher({
+    codexBin: options.codexBin,
+    processMatch: options.processMatch,
+  });
+  const start = Date.now();
+  while (Date.now() - start < options.timeoutMs) {
+    const { stdout } = await execFileAsync("ps", ["-ax", "-o", "pid=,ppid=,lstart=,command="]);
+    const entries = stdout
+      .toString()
+      .split("\n")
+      .map(parsePsLine)
+      .filter((entry): entry is PsEntry => Boolean(entry));
+
+    const startedAfter = options.startAfterMs - 2000;
+    let candidates = entries.filter((entry) => !entry.startedAt || entry.startedAt >= startedAfter);
+
+    if (options.panePid) {
+      const descendants = collectDescendants(entries, options.panePid);
+      const descendantIds = new Set(descendants.map((entry) => entry.pid));
+      candidates = candidates.filter((entry) => descendantIds.has(entry.pid));
+    }
+
+    const matched = candidates.filter((entry) => matcher(entry.cmd));
+    const pickFrom = matched.length > 0 ? matched : candidates;
+    if (pickFrom.length > 0) {
+      pickFrom.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+      return pickFrom[0].pid;
+    }
+    await delay(200);
+  }
+  let suffix = "";
+  if (options.session) {
+    try {
+      const excerpt = await capturePaneExcerpt(options.session);
+      suffix = `\n--- tmux pane ---\n${excerpt}`;
+    } catch {
+      // ignore capture errors
+    }
+  }
+  throw new Error(`Timed out waiting for codex pid.${suffix}`);
+}
+
+export async function waitForCodexReady(
+  session: TmuxSession,
+  timeoutMs: number
+): Promise<string> {
+  return await waitForPaneOutput(
+    session,
+    (output) => isCodexAuthError(output) || isCodexReadyOutput(output),
+    timeoutMs
+  );
+}
+
+export async function startCodexInteractiveInTmux(options: {
+  session: TmuxSession;
+  projectDir: string;
+  codexHome: string;
+  codexRoot: string;
+  codexBin?: string;
+  debugEnv?: string;
+}): Promise<void> {
+  const codexBin = options.codexBin || "codex";
+  const debugEnv = options.debugEnv ?? "RUST_LOG=debug";
+  const cmd =
+    `env HOME=${shellQuote(options.codexRoot)} ` +
+    `CODEX_HOME=${shellQuote(options.codexHome)} ` +
+    `${debugEnv} ${shellQuote(codexBin)} ` +
+    "--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check " +
+    `-C ${shellQuote(options.projectDir)}`;
+  await options.session.sendText(cmd);
+}
+
+async function collectSessionFiles(dir: string): Promise<Array<{ path: string; mtimeMs: number }>> {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const files: Array<{ path: string; mtimeMs: number }> = [];
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await collectSessionFiles(full)));
+      continue;
+    }
+    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+    const stat = await fs.stat(full);
+    files.push({ path: full, mtimeMs: stat.mtimeMs });
+  }
+  return files;
+}
+
+export async function waitForSessionFile(
+  codexHome: string,
+  timeoutMs: number,
+  afterMs?: number
+): Promise<string> {
+  const sessionsDir = path.join(codexHome, "sessions");
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const fullPaths = await collectSessionFiles(sessionsDir);
+      if (fullPaths.length > 0) {
+        const filtered =
+          typeof afterMs === "number"
+            ? fullPaths.filter((entry) => entry.mtimeMs >= afterMs)
+            : fullPaths;
+        if (filtered.length > 0) {
+          filtered.sort((a, b) => b.mtimeMs - a.mtimeMs);
+          return filtered[0].path;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    await delay(200);
+  }
+  throw new Error(`Timed out waiting for codex session file in ${sessionsDir}`);
+}
+
+export async function fetchSnapshot(port: number): Promise<unknown> {
+  const res = await fetch(`http://127.0.0.1:${port}/api/snapshot`);
+  if (!res.ok) {
+    throw new Error(`Snapshot request failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function delay(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
