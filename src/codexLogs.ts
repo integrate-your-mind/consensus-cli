@@ -760,7 +760,7 @@ export async function updateTail(
     if (process.env.CODEX_TEST_HOOKS === "1") {
       "TEST_HOOK_EXPIRE_CHECK";
     }
-    if (!state.inFlight) return;
+    if (!state.inFlight && !state.pendingEndAt) return;
     if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
     if (state.pendingEndAt) {
       const elapsed = nowMs - state.pendingEndAt;
@@ -1376,7 +1376,8 @@ export function summarizeTail(state: TailState): {
   };
   const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
   const hasOpenCalls = openCallCount > 0;
-  const inFlight = state.inFlight || state.reviewMode || hasOpenCalls;
+  const hasPendingEnd = typeof state.pendingEndAt === "number";
+  const inFlight = state.inFlight || state.reviewMode || hasOpenCalls || hasPendingEnd;
   return {
     doing,
     title,
