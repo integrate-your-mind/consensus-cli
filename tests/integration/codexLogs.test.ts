@@ -962,6 +962,127 @@ test("open tool call keeps in-flight without new events", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("tool call without call_id times out without open calls", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+  const originalNow = Date.now;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
+  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+
+  const start = {
+    type: "response_item",
+    ts: 1,
+    payload: {
+      type: "function_call",
+      arguments: "{}",
+    },
+  };
+  await fs.writeFile(file, `${JSON.stringify(start)}\n`);
+
+  Date.now = () => 1_000;
+  const stateStart = await updateTail(file);
+  assert.ok(stateStart);
+  assert.equal(stateStart.openCallIds?.size ?? 0, 0);
+  const summaryStart = summarizeTail(stateStart);
+  assert.equal(summaryStart.inFlight, true);
+
+  Date.now = () => 5_000;
+  const stateLater = await updateTail(file);
+  assert.ok(stateLater);
+  const summaryLater = summarizeTail(stateLater);
+  assert.equal(summaryLater.inFlight, undefined);
+
+  Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("pending end waits for tool output to finish", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+  const originalNow = Date.now;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
+  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+
+  const lines = [
+    {
+      type: "response_item",
+      ts: 1,
+      payload: { type: "function_call", name: "tool", call_id: "call_1" },
+    },
+    { type: "response.completed", ts: 2 },
+  ];
+  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  Date.now = () => 2_000;
+  const stateStart = await updateTail(file);
+  assert.ok(stateStart);
+  assert.ok(stateStart.pendingEndAt);
+  assert.equal(stateStart.inFlight, true);
+
+  const output = {
+    type: "response_item",
+    ts: 3,
+    payload: { type: "function_call_output", call_id: "call_1" },
+  };
+  await fs.appendFile(file, `${JSON.stringify(output)}\n`);
+
+  Date.now = () => 3_000;
+  const stateLater = await updateTail(file);
+  assert.ok(stateLater);
+  assert.equal(stateLater.pendingEndAt, undefined);
+  const summaryLater = summarizeTail(stateLater);
+  assert.equal(summaryLater.inFlight, undefined);
+
+  Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("tool output without call_id does not retain open call", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+  const originalNow = Date.now;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
+  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+
+  const lines = [
+    {
+      type: "response_item",
+      ts: 1,
+      payload: { type: "function_call", name: "tool", call_id: "call_1" },
+    },
+    { type: "response.completed", ts: 2 },
+    {
+      type: "response_item",
+      ts: 3,
+      payload: { type: "function_call_output" },
+    },
+  ];
+  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  Date.now = () => 3_000;
+  const stateStart = await updateTail(file);
+  assert.ok(stateStart);
+  assert.equal(stateStart.openCallIds?.size ?? 0, 1);
+  const summaryStart = summarizeTail(stateStart);
+  assert.equal(summaryStart.inFlight, true);
+
+  Date.now = () => 10_000;
+  const stateLater = await updateTail(file);
+  assert.ok(stateLater);
+  assert.equal(stateLater.openCallIds?.size ?? 0, 0);
+  const summaryLater = summarizeTail(stateLater);
+  assert.equal(summaryLater.inFlight, undefined);
+
+  Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
 test("keeps in-flight codex state within timeout window", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
