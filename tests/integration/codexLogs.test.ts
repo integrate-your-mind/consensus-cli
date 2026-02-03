@@ -1041,6 +1041,50 @@ test("pending end waits for tool output to finish", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+test("pending end waits for item completion", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+  const originalNow = Date.now;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
+  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+
+  const lines = [
+    {
+      type: "item.started",
+      ts: 1,
+      item: { id: "item_1", type: "command_execution" },
+    },
+    { type: "response.completed", ts: 2 },
+  ];
+  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  Date.now = () => 2_000;
+  const stateStart = await updateTail(file);
+  assert.ok(stateStart);
+  assert.equal(stateStart.openCallIds?.size ?? 0, 1);
+  assert.ok(stateStart.pendingEndAt);
+  assert.equal(stateStart.inFlight, true);
+
+  const output = {
+    type: "item.completed",
+    ts: 3,
+    item: { id: "item_1", type: "command_execution", status: "completed" },
+  };
+  await fs.appendFile(file, `${JSON.stringify(output)}\n`);
+
+  Date.now = () => 3_000;
+  const stateLater = await updateTail(file);
+  assert.ok(stateLater);
+  assert.equal(stateLater.pendingEndAt, undefined);
+  const summaryLater = summarizeTail(stateLater);
+  assert.equal(summaryLater.inFlight, undefined);
+
+  Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
 test("tool output without call_id does not retain open call", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");

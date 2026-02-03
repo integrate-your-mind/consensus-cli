@@ -1540,7 +1540,6 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     inFlight = eventInFlight || tailInFlight;
     if (process.env.CODEX_TEST_HOOKS === "1") {
       "TEST_HOOK_INFLIGHT_MERGE";
-      debugger;
     }
     const mergedActivityAt = Math.max(
       typeof eventActivityAt === "number" ? eventActivityAt : 0,
@@ -1601,7 +1600,6 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       });
       if (process.env.CODEX_TEST_HOOKS === "1") {
         "TEST_HOOK_NOTIFY_END_APPLY";
-        debugger;
       }
       if (notifyShouldEnd) {
         inFlight = false;

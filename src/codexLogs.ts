@@ -737,7 +737,6 @@ export async function updateTail(
   const finalizeEnd = (ts: number, { clearReview = false }: { clearReview?: boolean } = {}) => {
     if (process.env.CODEX_TEST_HOOKS === "1") {
       "TEST_HOOK_FINALIZE_END";
-      debugger;
     }
     if (clearReview) state.reviewMode = false;
     state.turnOpen = false;
@@ -752,17 +751,14 @@ export async function updateTail(
     state.pendingEndAt = Math.max(state.pendingEndAt || 0, ts);
     if (process.env.CODEX_TEST_HOOKS === "1") {
       "TEST_HOOK_PENDING_END";
-      debugger;
     }
   };
 
   const expireInFlight = () => {
     if (process.env.CODEX_TEST_HOOKS === "1") {
       "TEST_HOOK_EXPIRE_CHECK";
-      debugger;
     }
     if (!state.inFlight) return;
-    if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
     if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
     if (state.pendingEndAt) {
       const elapsed = nowMs - state.pendingEndAt;
@@ -795,7 +791,6 @@ export async function updateTail(
     ) {
       if (process.env.CODEX_TEST_HOOKS === "1") {
         "TEST_HOOK_EXPIRE_TIMEOUT";
-        debugger;
       }
       state.inFlight = false;
       state.inFlightStart = false;
@@ -964,6 +959,8 @@ export async function updateTail(
     const itemId = typeof itemIdRaw === "string" ? itemIdRaw : undefined;
     const itemStatusRaw = item?.status || item?.state;
     const itemStatus = typeof itemStatusRaw === "string" ? itemStatusRaw : undefined;
+    const itemStatusLower = itemStatus ? itemStatus.toLowerCase() : undefined;
+    const openCallId = callId || itemId;
     state.recentEvents?.push({
       ts,
       type: typeStrRaw || "event",
@@ -987,6 +984,7 @@ export async function updateTail(
     const isTurnStart = combinedType.includes("turn.started");
     const isResponseDelta = responseDeltaTypes.has(typeStr) || responseDeltaTypes.has(payloadType);
     const isItemStarted = typeStr === "item.started" || payloadType === "item.started";
+    const isItemCompleted = typeStr === "item.completed" || payloadType === "item.completed";
     const isReviewEnter = payloadType === "entered_review_mode";
     const isReviewExit = payloadType === "exited_review_mode";
     const itemStartWorkTypes = new Set([
@@ -996,6 +994,16 @@ export async function updateTail(
       "file_change",
       "file_edit",
       "file_write",
+    ]);
+    const itemEndStatuses = new Set([
+      "completed",
+      "failed",
+      "errored",
+      "canceled",
+      "cancelled",
+      "aborted",
+      "interrupted",
+      "stopped",
     ]);
     if (typeof type === "string") {
       if (isTurnStart) {
@@ -1020,6 +1028,10 @@ export async function updateTail(
       }
       if (isItemStarted && itemStartWorkTypes.has(itemTypeLower)) {
         clearEndMarkers();
+        if (openCallId) {
+          if (!state.openCallIds) state.openCallIds = new Set();
+          state.openCallIds.add(openCallId);
+        }
         if (canSignal) {
           state.turnOpen = true;
           state.inFlight = true;
@@ -1028,9 +1040,22 @@ export async function updateTail(
         }
         if (process.env.CODEX_TEST_HOOKS === "1") {
           "TEST_HOOK_WORK_START";
-          debugger;
         }
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
+      }
+      const itemEnded =
+        (isItemCompleted || (itemStatusLower && itemEndStatuses.has(itemStatusLower))) &&
+        itemStartWorkTypes.has(itemTypeLower);
+      if (itemEnded && openCallId) {
+        if (state.openCallIds) {
+          state.openCallIds.delete(openCallId);
+        }
+        if (process.env.CODEX_TEST_HOOKS === "1") {
+          "TEST_HOOK_WORK_END";
+        }
+        if ((state.openCallIds?.size ?? 0) === 0 && state.pendingEndAt && !state.reviewMode) {
+          finalizeEnd(state.pendingEndAt);
+        }
       }
       if (isResponseDelta) {
         clearEndMarkers();
@@ -1111,7 +1136,6 @@ export async function updateTail(
         if (callId) state.openCallIds.add(callId);
         if (process.env.CODEX_TEST_HOOKS === "1") {
           "TEST_HOOK_TOOL_START";
-          debugger;
         }
         recordToolSignal(ts);
         if (canSignal) {
@@ -1137,7 +1161,6 @@ export async function updateTail(
         }
         if (process.env.CODEX_TEST_HOOKS === "1") {
           "TEST_HOOK_TOOL_END";
-          debugger;
         }
         recordToolSignal(ts);
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
@@ -1248,7 +1271,6 @@ export async function updateTail(
       if (kind && workKinds.has(kind) && !isItemStarted) {
         if (process.env.CODEX_TEST_HOOKS === "1") {
           "TEST_HOOK_WORK_END";
-          debugger;
         }
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
