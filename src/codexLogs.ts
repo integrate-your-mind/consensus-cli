@@ -45,6 +45,7 @@ interface TailState {
   pendingEndAt?: number;
   lastEndAt?: number;
   lastToolSignalAt?: number;
+  openItemCount?: number;
   openCallIds?: Set<string>;
   lastCommand?: EventSummary;
   lastEdit?: EventSummary;
@@ -746,6 +747,7 @@ export async function updateTail(
     state.lastEndAt = ts;
     clearActivitySignals();
     if (state.openCallIds) state.openCallIds.clear();
+    state.openItemCount = 0;
   };
   const deferEnd = (ts: number) => {
     state.pendingEndAt = Math.max(state.pendingEndAt || 0, ts);
@@ -769,7 +771,8 @@ export async function updateTail(
       }
     }
     if (state.reviewMode) return;
-    if (state.openCallIds && state.openCallIds.size > 0) return;
+    const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
+    if (openCallCount > 0) return;
     if (state.lastEndAt) {
       state.inFlight = false;
       state.inFlightStart = false;
@@ -799,6 +802,7 @@ export async function updateTail(
       state.lastEndAt = nowMs;
       clearActivitySignals();
       if (state.openCallIds) state.openCallIds.clear();
+      state.openItemCount = 0;
     }
   };
 
@@ -813,6 +817,7 @@ export async function updateTail(
       state.lastToolSignalAt = undefined;
       state.lastInFlightSignalAt = undefined;
       if (state.openCallIds) state.openCallIds.clear();
+      state.openItemCount = 0;
     }
     state.lastEventAt = undefined;
     state.lastActivityAt = undefined;
@@ -840,6 +845,7 @@ export async function updateTail(
     state.openCallIds = undefined;
     state.lastInFlightSignalAt = undefined;
     state.lastToolSignalAt = undefined;
+    state.openItemCount = undefined;
   }
 
   if (stat.size === state.offset) {
@@ -1031,6 +1037,8 @@ export async function updateTail(
         if (openCallId) {
           if (!state.openCallIds) state.openCallIds = new Set();
           state.openCallIds.add(openCallId);
+        } else {
+          state.openItemCount = (state.openItemCount ?? 0) + 1;
         }
         if (canSignal) {
           state.turnOpen = true;
@@ -1046,14 +1054,20 @@ export async function updateTail(
       const itemEnded =
         (isItemCompleted || (itemStatusLower && itemEndStatuses.has(itemStatusLower))) &&
         itemStartWorkTypes.has(itemTypeLower);
-      if (itemEnded && openCallId) {
-        if (state.openCallIds) {
-          state.openCallIds.delete(openCallId);
+      if (itemEnded) {
+        if (openCallId) {
+          if (state.openCallIds) {
+            state.openCallIds.delete(openCallId);
+          }
+        } else if ((state.openItemCount ?? 0) > 0) {
+          state.openItemCount = (state.openItemCount ?? 0) - 1;
         }
         if (process.env.CODEX_TEST_HOOKS === "1") {
           "TEST_HOOK_WORK_END";
         }
-        if ((state.openCallIds?.size ?? 0) === 0 && state.pendingEndAt && !state.reviewMode) {
+        const openCallCount =
+          (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
+        if (openCallCount === 0 && state.pendingEndAt && !state.reviewMode) {
           finalizeEnd(state.pendingEndAt);
         }
       }
@@ -1190,7 +1204,8 @@ export async function updateTail(
       }
     }
     if (isResponseEnd) {
-      const hasOpenCalls = (state.openCallIds?.size ?? 0) > 0;
+      const hasOpenCalls =
+        (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0) > 0;
       if (hasOpenCalls || state.reviewMode) {
         deferEnd(ts);
         state.turnOpen = false;
@@ -1236,7 +1251,8 @@ export async function updateTail(
     }
   }
     if (itemTypeIsTurnAbort) {
-      const hasOpenCalls = (state.openCallIds?.size ?? 0) > 0;
+      const hasOpenCalls =
+        (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0) > 0;
       if (hasOpenCalls || state.reviewMode) {
         deferEnd(ts);
         state.turnOpen = false;
@@ -1245,7 +1261,8 @@ export async function updateTail(
       }
     }
     if (isTurnEnd) {
-      const hasOpenCalls = (state.openCallIds?.size ?? 0) > 0;
+      const hasOpenCalls =
+        (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0) > 0;
       if (hasOpenCalls || state.reviewMode) {
         deferEnd(ts);
         state.turnOpen = false;
@@ -1334,7 +1351,8 @@ export async function updateTail(
   }
 
   if (state.pendingEndAt) {
-    if ((state.openCallIds?.size ?? 0) === 0 && !state.turnOpen) {
+    const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
+    if (openCallCount === 0 && !state.turnOpen) {
       finalizeEnd(state.pendingEndAt);
     }
   }
@@ -1393,7 +1411,7 @@ export function summarizeTail(state: TailState): {
     lastTool: state.lastTool?.summary,
     lastPrompt: state.lastPrompt?.summary,
   };
-  const openCallCount = state.openCallIds?.size ?? 0;
+  const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
   const hasOpenCalls = openCallCount > 0;
   const inFlight = state.inFlight || state.reviewMode || hasOpenCalls;
   return {
