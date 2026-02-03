@@ -1089,13 +1089,8 @@ export async function updateTail(
       }
       if (isReviewExit) {
         state.reviewMode = false;
-        const hasOpenCalls = (state.openCallIds?.size ?? 0) > 0;
-        if (hasOpenCalls) {
-          deferEnd(ts);
-          state.turnOpen = false;
-        } else {
-          finalizeEnd(ts, { clearReview: false });
-        }
+        deferEnd(ts);
+        state.turnOpen = false;
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
     }
@@ -1196,14 +1191,8 @@ export async function updateTail(
       }
     }
     if (isResponseEnd) {
-      const hasOpenCalls =
-        (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0) > 0;
-      if (hasOpenCalls || state.reviewMode) {
-        deferEnd(ts);
-        state.turnOpen = false;
-      } else {
-        finalizeEnd(ts);
-      }
+      deferEnd(ts);
+      state.turnOpen = false;
     }
   const itemTypeIsAgentReasoning = itemTypeLower.includes("agent_reasoning");
   const itemTypeIsAgentMessage = itemTypeLower.includes("agent_message");
@@ -1243,24 +1232,12 @@ export async function updateTail(
     }
   }
     if (itemTypeIsTurnAbort) {
-      const hasOpenCalls =
-        (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0) > 0;
-      if (hasOpenCalls || state.reviewMode) {
-        deferEnd(ts);
-        state.turnOpen = false;
-      } else {
-        finalizeEnd(ts, { clearReview: false });
-      }
+      deferEnd(ts);
+      state.turnOpen = false;
     }
     if (isTurnEnd) {
-      const hasOpenCalls =
-        (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0) > 0;
-      if (hasOpenCalls || state.reviewMode) {
-        deferEnd(ts);
-        state.turnOpen = false;
-      } else {
-        finalizeEnd(ts);
-      }
+      deferEnd(ts);
+      state.turnOpen = false;
     }
 
     if (summary) {

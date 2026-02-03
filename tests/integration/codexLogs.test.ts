@@ -634,6 +634,7 @@ test("stays active with periodic signals and turns idle after explicit end", asy
   const pulseEveryMs = 300;
   const pollEveryMs = 50;
   const durationMs = 1500;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "200";
 
   const first = {
     type: "response.output_text.delta",
@@ -669,8 +670,15 @@ test("stays active with periodic signals and turns idle after explicit end", asy
   const endState = await updateTail(file);
   assert.ok(endState);
   const endSummary = summarizeTail(endState);
-  assert.equal(endSummary.inFlight, undefined);
+  assert.equal(endSummary.inFlight, true);
 
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const finalState = await updateTail(file);
+  assert.ok(finalState);
+  const finalSummary = summarizeTail(finalState);
+  assert.equal(finalSummary.inFlight, undefined);
+
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
   await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -737,10 +745,11 @@ test("parses trailing codex event without newline", async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("response.completed clears in-flight even without turn end", async () => {
+test("response.completed holds in-flight until timeout", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
   const originalNow = Date.now;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
   Date.now = () => 1_000;
 
   const started = {
@@ -760,11 +769,17 @@ test("response.completed clears in-flight even without turn end", async () => {
   };
   await fs.appendFile(file, `${JSON.stringify(completed)}\n`);
 
-  Date.now = () => 5_000;
+  Date.now = () => 1_500;
   const second = await updateTail(file);
   assert.ok(second);
   const secondSummary = summarizeTail(second);
-  assert.equal(secondSummary.inFlight, undefined);
+  assert.equal(secondSummary.inFlight, true);
+
+  Date.now = () => 5_000;
+  const third = await updateTail(file);
+  assert.ok(third);
+  const thirdSummary = summarizeTail(third);
+  assert.equal(thirdSummary.inFlight, undefined);
 
   const turnCompleted = {
     type: "turn.completed",
@@ -772,12 +787,13 @@ test("response.completed clears in-flight even without turn end", async () => {
   };
   await fs.appendFile(file, `${JSON.stringify(turnCompleted)}\n`);
   Date.now = () => 3_000;
-  const third = await updateTail(file);
-  assert.ok(third);
-  const thirdSummary = summarizeTail(third);
-  assert.equal(thirdSummary.inFlight, undefined);
+  const fourth = await updateTail(file);
+  assert.ok(fourth);
+  const fourthSummary = summarizeTail(fourth);
+  assert.equal(fourthSummary.inFlight, undefined);
 
   Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
   await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -815,7 +831,7 @@ test("review mode keeps in-flight until exited", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
   const originalNow = Date.now;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
   delete process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS;
   process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
 
@@ -854,9 +870,16 @@ test("review mode keeps in-flight until exited", async () => {
   const stateExit = await updateTail(file);
   assert.ok(stateExit);
   const summaryExit = summarizeTail(stateExit);
-  assert.equal(summaryExit.inFlight, undefined);
+  assert.equal(summaryExit.inFlight, true);
+
+  Date.now = () => 14_000;
+  const stateEnd = await updateTail(file);
+  assert.ok(stateEnd);
+  const summaryEnd = summarizeTail(stateEnd);
+  assert.equal(summaryEnd.inFlight, undefined);
 
   Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
   delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
   await fs.rm(dir, { recursive: true, force: true });
 });
@@ -1260,6 +1283,7 @@ test("turn.completed clears in-flight after response completion", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
   const originalNow = Date.now;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
   Date.now = () => 1_000;
 
   const start = [
@@ -1291,9 +1315,16 @@ test("turn.completed clears in-flight after response completion", async () => {
   const stateEnd = await updateTail(file);
   assert.ok(stateEnd);
   const summaryEnd = summarizeTail(stateEnd);
-  assert.equal(summaryEnd.inFlight, undefined);
+  assert.equal(summaryEnd.inFlight, true);
+
+  Date.now = () => 6_000;
+  const stateFinal = await updateTail(file);
+  assert.ok(stateFinal);
+  const summaryFinal = summarizeTail(stateFinal);
+  assert.equal(summaryFinal.inFlight, undefined);
 
   Date.now = originalNow;
+  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
   await fs.rm(dir, { recursive: true, force: true });
 });
 
