@@ -14,14 +14,22 @@ export interface ActivityInput {
   eventWindowMs?: number;
 }
 
+const getNumber = (value: number | undefined, envKey: string, fallback: number): number =>
+  value ?? Number(process.env[envKey] || fallback);
+
 export function deriveState(input: ActivityInput): AgentState {
   if (input.hasError) return "error";
   const now = input.now ?? Date.now();
-  const cpuThreshold =
-    input.cpuThreshold ?? Number(process.env.CONSENSUS_CPU_ACTIVE || DEFAULT_CPU_THRESHOLD);
-  const eventWindowMs =
-    input.eventWindowMs ??
-    Number(process.env.CONSENSUS_EVENT_ACTIVE_MS || DEFAULT_EVENT_WINDOW_MS);
+  const cpuThreshold = getNumber(
+    input.cpuThreshold,
+    "CONSENSUS_CPU_ACTIVE",
+    DEFAULT_CPU_THRESHOLD
+  );
+  const eventWindowMs = getNumber(
+    input.eventWindowMs,
+    "CONSENSUS_EVENT_ACTIVE_MS",
+    DEFAULT_EVENT_WINDOW_MS
+  );
   const cpuActive = input.cpu > cpuThreshold;
   const eventActive =
     typeof input.lastEventAt === "number" &&
@@ -44,17 +52,30 @@ export interface ActivityHoldResult {
 
 export function deriveStateWithHold(input: ActivityHoldInput): ActivityHoldResult {
   const now = input.now ?? Date.now();
-  const holdMs =
-    input.holdMs ?? Number(process.env.CONSENSUS_ACTIVE_HOLD_MS || DEFAULT_ACTIVE_HOLD_MS);
-  const cpuThreshold =
-    input.cpuThreshold ?? Number(process.env.CONSENSUS_CPU_ACTIVE || DEFAULT_CPU_THRESHOLD);
-  const eventWindowMs =
-    input.eventWindowMs ?? Number(process.env.CONSENSUS_EVENT_ACTIVE_MS || DEFAULT_EVENT_WINDOW_MS);
+  const holdMs = getNumber(
+    input.holdMs,
+    "CONSENSUS_ACTIVE_HOLD_MS",
+    DEFAULT_ACTIVE_HOLD_MS
+  );
+  const cpuThreshold = getNumber(
+    input.cpuThreshold,
+    "CONSENSUS_CPU_ACTIVE",
+    DEFAULT_CPU_THRESHOLD
+  );
+  const eventWindowMs = getNumber(
+    input.eventWindowMs,
+    "CONSENSUS_EVENT_ACTIVE_MS",
+    DEFAULT_EVENT_WINDOW_MS
+  );
   const cpuActive = input.cpu > cpuThreshold;
   const eventActive =
     typeof input.lastEventAt === "number" && now - input.lastEventAt <= eventWindowMs;
   const inFlight = !!input.inFlight;
-  const baseState = deriveState({ ...input, now, cpuThreshold, eventWindowMs });
+  const baseState: AgentState = input.hasError
+    ? "error"
+    : cpuActive || eventActive || inFlight
+      ? "active"
+      : "idle";
   let reason = "idle";
   if (input.hasError) {
     reason = "error";
