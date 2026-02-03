@@ -2177,7 +2177,8 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         const statusRaw = typeof (session as { status?: string }).status === "string"
           ? (session as { status?: string }).status
           : undefined;
-        const status = eventActivity?.lastStatus ?? statusRaw?.toLowerCase();
+        const statusCandidate = eventActivity?.lastStatus ?? statusRaw;
+        const status = typeof statusCandidate === "string" ? statusCandidate.toLowerCase() : undefined;
         const statusIsError = !!status && /error|failed|failure/.test(status);
         const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
         const statusIsActive = !!status && /running|active|processing|busy|retry/.test(status);

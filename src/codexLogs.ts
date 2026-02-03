@@ -1065,11 +1065,6 @@ export async function updateTail(
         if (process.env.CODEX_TEST_HOOKS === "1") {
           "TEST_HOOK_WORK_END";
         }
-        const openCallCount =
-          (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
-        if (openCallCount === 0 && state.pendingEndAt && !state.reviewMode) {
-          finalizeEnd(state.pendingEndAt);
-        }
       }
       if (isResponseDelta) {
         clearEndMarkers();
@@ -1178,9 +1173,6 @@ export async function updateTail(
         }
         recordToolSignal(ts);
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
-        if ((state.openCallIds?.size ?? 0) === 0 && state.pendingEndAt && !state.reviewMode) {
-          finalizeEnd(state.pendingEndAt);
-        }
       }
       if (payloadType === "reasoning") {
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
@@ -1350,12 +1342,6 @@ export async function updateTail(
     }
   }
 
-  if (state.pendingEndAt) {
-    const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
-    if (openCallCount === 0 && !state.turnOpen) {
-      finalizeEnd(state.pendingEndAt);
-    }
-  }
 
   state.offset = stat.size;
   expireInFlight();

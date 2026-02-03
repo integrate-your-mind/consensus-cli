@@ -1031,9 +1031,16 @@ test("pending end waits for tool output to finish", async () => {
   Date.now = () => 3_000;
   const stateLater = await updateTail(file);
   assert.ok(stateLater);
-  assert.equal(stateLater.pendingEndAt, undefined);
+  assert.ok(stateLater.pendingEndAt);
   const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, undefined);
+  assert.equal(summaryLater.inFlight, true);
+
+  Date.now = () => 6_000;
+  const stateEnd = await updateTail(file);
+  assert.ok(stateEnd);
+  assert.equal(stateEnd.pendingEndAt, undefined);
+  const summaryEnd = summarizeTail(stateEnd);
+  assert.equal(summaryEnd.inFlight, undefined);
 
   Date.now = originalNow;
   delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
@@ -1075,9 +1082,16 @@ test("pending end waits for item completion", async () => {
   Date.now = () => 3_000;
   const stateLater = await updateTail(file);
   assert.ok(stateLater);
-  assert.equal(stateLater.pendingEndAt, undefined);
+  assert.ok(stateLater.pendingEndAt);
   const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, undefined);
+  assert.equal(summaryLater.inFlight, true);
+
+  Date.now = () => 6_000;
+  const stateEnd = await updateTail(file);
+  assert.ok(stateEnd);
+  assert.equal(stateEnd.pendingEndAt, undefined);
+  const summaryEnd = summarizeTail(stateEnd);
+  assert.equal(summaryEnd.inFlight, undefined);
 
   Date.now = originalNow;
   delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
@@ -1118,9 +1132,16 @@ test("pending end waits for item completion without id", async () => {
   Date.now = () => 3_000;
   const stateLater = await updateTail(file);
   assert.ok(stateLater);
-  assert.equal(stateLater.pendingEndAt, undefined);
+  assert.ok(stateLater.pendingEndAt);
   const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, undefined);
+  assert.equal(summaryLater.inFlight, true);
+
+  Date.now = () => 6_000;
+  const stateEnd = await updateTail(file);
+  assert.ok(stateEnd);
+  assert.equal(stateEnd.pendingEndAt, undefined);
+  const summaryEnd = summarizeTail(stateEnd);
+  assert.equal(summaryEnd.inFlight, undefined);
 
   Date.now = originalNow;
   delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
