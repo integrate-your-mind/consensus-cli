@@ -735,6 +735,10 @@ export async function updateTail(
     state.lastToolSignalAt = Math.max(state.lastToolSignalAt || 0, ts);
   };
   const finalizeEnd = (ts: number, { clearReview = false }: { clearReview?: boolean } = {}) => {
+    if (process.env.CODEX_TEST_HOOKS === "1") {
+      "TEST_HOOK_FINALIZE_END";
+      debugger;
+    }
     if (clearReview) state.reviewMode = false;
     state.turnOpen = false;
     state.inFlight = false;
@@ -746,9 +750,17 @@ export async function updateTail(
   };
   const deferEnd = (ts: number) => {
     state.pendingEndAt = Math.max(state.pendingEndAt || 0, ts);
+    if (process.env.CODEX_TEST_HOOKS === "1") {
+      "TEST_HOOK_PENDING_END";
+      debugger;
+    }
   };
 
   const expireInFlight = () => {
+    if (process.env.CODEX_TEST_HOOKS === "1") {
+      "TEST_HOOK_EXPIRE_CHECK";
+      debugger;
+    }
     if (!state.inFlight) return;
     if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
     if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
@@ -781,6 +793,10 @@ export async function updateTail(
       typeof lastSignal === "number" &&
       nowMs - lastSignal >= inflightTimeoutMs
     ) {
+      if (process.env.CODEX_TEST_HOOKS === "1") {
+        "TEST_HOOK_EXPIRE_TIMEOUT";
+        debugger;
+      }
       state.inFlight = false;
       state.inFlightStart = false;
       state.turnOpen = false;
@@ -1010,6 +1026,10 @@ export async function updateTail(
           state.inFlightStart = true;
           markInFlightSignal();
         }
+        if (process.env.CODEX_TEST_HOOKS === "1") {
+          "TEST_HOOK_WORK_START";
+          debugger;
+        }
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
       if (isResponseDelta) {
@@ -1089,6 +1109,10 @@ export async function updateTail(
       if (isToolCall) {
         if (!state.openCallIds) state.openCallIds = new Set();
         if (callId) state.openCallIds.add(callId);
+        if (process.env.CODEX_TEST_HOOKS === "1") {
+          "TEST_HOOK_TOOL_START";
+          debugger;
+        }
         recordToolSignal(ts);
         if (canSignal) {
           clearEndMarkers();
@@ -1110,6 +1134,10 @@ export async function updateTail(
       if (isToolOutput) {
         if (state.openCallIds && callId) {
           state.openCallIds.delete(callId);
+        }
+        if (process.env.CODEX_TEST_HOOKS === "1") {
+          "TEST_HOOK_TOOL_END";
+          debugger;
         }
         recordToolSignal(ts);
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
@@ -1218,6 +1246,10 @@ export async function updateTail(
       if (kind === "tool") state.lastTool = entry;
       if (kind === "prompt") state.lastPrompt = entry;
       if (kind && workKinds.has(kind) && !isItemStarted) {
+        if (process.env.CODEX_TEST_HOOKS === "1") {
+          "TEST_HOOK_WORK_END";
+          debugger;
+        }
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
       if (kind === "message") {
