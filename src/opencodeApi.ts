@@ -33,10 +33,20 @@ export interface OpenCodeApiOptions {
 }
 
 function shouldWarn(options?: OpenCodeApiOptions): boolean {
-  return options?.silent ? false : true;
+  return options?.silent !== true;
 }
 
 const DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS = 15000;
+
+function getInFlightWindowMs(): number {
+  const windowMsRaw = process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS;
+  const windowMs =
+    windowMsRaw !== undefined && windowMsRaw !== ""
+      ? Number(windowMsRaw)
+      : DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS;
+  if (!Number.isFinite(windowMs) || windowMs <= 0) return 0;
+  return windowMs;
+}
 
 export async function getOpenCodeSessions(
   host: string = "localhost",
@@ -258,12 +268,8 @@ export async function getOpenCodeSessionActivity(
     if (!latestAssistant) {
       let inFlight = false;
       if (latestMessageRole === "user" && typeof latestMessageAt === "number") {
-        const windowMsRaw = process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS;
-        const windowMs =
-          windowMsRaw !== undefined && windowMsRaw !== ""
-            ? Number(windowMsRaw)
-            : DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS;
-        if (Number.isFinite(windowMs) && windowMs > 0 && Date.now() - latestMessageAt <= windowMs) {
+        const windowMs = getInFlightWindowMs();
+        if (windowMs > 0 && Date.now() - latestMessageAt <= windowMs) {
           inFlight = true;
         }
       }
@@ -300,12 +306,8 @@ export async function getOpenCodeSessionActivity(
     let inFlight = !hasCompleted || hasPendingTool || hasIncompletePart;
 
     if (!inFlight && latestMessageRole === "user" && typeof latestMessageAt === "number") {
-      const windowMsRaw = process.env.CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS;
-      const windowMs =
-        windowMsRaw !== undefined && windowMsRaw !== ""
-          ? Number(windowMsRaw)
-          : DEFAULT_OPENCODE_INFLIGHT_TIMEOUT_MS;
-      if (Number.isFinite(windowMs) && windowMs > 0 && Date.now() - latestMessageAt <= windowMs) {
+      const windowMs = getInFlightWindowMs();
+      if (windowMs > 0 && Date.now() - latestMessageAt <= windowMs) {
         inFlight = true;
       }
     }

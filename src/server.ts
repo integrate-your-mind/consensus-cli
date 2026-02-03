@@ -72,21 +72,31 @@ function buildDelta(prev: SnapshotPayload, next: SnapshotPayload): DeltaOp[] {
   }
   const prevMeta = prev.meta ?? null;
   const nextMeta = next.meta ?? null;
-  if (JSON.stringify(prevMeta) !== JSON.stringify(nextMeta)) {
-    ops.push({ op: "meta", value: nextMeta });
+  if (prevMeta !== nextMeta) {
+    const prevMetaJson = prevMeta ? JSON.stringify(prevMeta) : "";
+    const nextMetaJson = nextMeta ? JSON.stringify(nextMeta) : "";
+    if (prevMetaJson !== nextMetaJson) {
+      ops.push({ op: "meta", value: nextMeta });
+    }
   }
-  const prevById = new Map<string, AgentSnapshot>();
+  const prevById = new Map<string, { agent: AgentSnapshot; json: string }>();
   for (const agent of prev.agents) {
-    prevById.set(identityForAgent(agent), agent);
+    prevById.set(identityForAgent(agent), {
+      agent,
+      json: serializeAgent(agent),
+    });
   }
-  const nextById = new Map<string, AgentSnapshot>();
+  const nextById = new Map<string, { agent: AgentSnapshot; json: string }>();
   for (const agent of next.agents) {
-    nextById.set(identityForAgent(agent), agent);
+    nextById.set(identityForAgent(agent), {
+      agent,
+      json: serializeAgent(agent),
+    });
   }
-  for (const [id, agent] of nextById) {
-    const prevAgent = prevById.get(id);
-    if (!prevAgent || serializeAgent(prevAgent) !== serializeAgent(agent)) {
-      ops.push({ op: "upsert", id, value: agent });
+  for (const [id, nextEntry] of nextById) {
+    const prevEntry = prevById.get(id);
+    if (!prevEntry || prevEntry.json !== nextEntry.json) {
+      ops.push({ op: "upsert", id, value: nextEntry.agent });
     }
   }
   for (const id of prevById.keys()) {
@@ -551,7 +561,7 @@ function scheduleHoldTick(nextTickAt: number | undefined): void {
 }
 
 function broadcastSnapshot(snapshot: SnapshotPayload, deltaOps: DeltaOp[] = []): void {
-  const payload = JSON.stringify(snapshot);
+  let payload: string | null = null;
   for (const client of wss.clients) {
     if (client.readyState !== WebSocket.OPEN) continue;
     const state = wsClients.get(client);
@@ -559,6 +569,7 @@ function broadcastSnapshot(snapshot: SnapshotPayload, deltaOps: DeltaOp[] = []):
       sendDeltaEnvelope(client, deltaOps);
       continue;
     }
+    if (!payload) payload = JSON.stringify(snapshot);
     client.send(payload);
   }
 }

@@ -29,13 +29,7 @@ export function escapeHtml(value: unknown): string {
 
 export function agentIdentity(agent: AgentSnapshot): string {
   const identity = agent.identity || agent.sessionPath;
-  if (identity) return identity;
-  const kind = typeof agent.kind === 'string' ? agent.kind : '';
-  const isServer = kind === 'app-server' || kind === 'opencode-server';
-  if (!isServer) {
-    return agent.id || `${agent.pid}`;
-  }
-  return agent.id || `${agent.pid}`;
+  return identity || agent.id || `${agent.pid}`;
 }
 
 export function groupKeyForAgent(agent: AgentSnapshot): string {
