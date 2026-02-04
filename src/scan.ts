@@ -769,36 +769,58 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     processes = await psList();
     endProfile(psTimer, { count: processes.length });
   }
-  const codexWrapperProcs = processes.filter((proc) =>
-    isCodexProcess(proc.cmd, proc.name, matchRe)
-  );
-  const codexWrapperPidSet = new Set(codexWrapperProcs.map((proc) => proc.pid));
-  const codexVendorCandidates = processes.filter((proc) =>
-    isCodexVendorProcess(proc.cmd, proc.name)
-  );
-  const codexVendorChildren = codexVendorCandidates.filter((proc) =>
-    codexWrapperPidSet.has(proc.ppid ?? -1)
-  );
-  const codexVendorProcs = codexVendorCandidates.filter(
-    (proc) => !codexWrapperPidSet.has(proc.ppid ?? -1)
-  );
+  const codexWrapperProcs: PsProcess[] = [];
+  const codexVendorCandidates: PsProcess[] = [];
+  const codexWrapperPidSet = new Set<number>();
+  for (const proc of processes) {
+    if (isCodexProcess(proc.cmd, proc.name, matchRe)) {
+      codexWrapperProcs.push(proc);
+      codexWrapperPidSet.add(proc.pid);
+    }
+    if (isCodexVendorProcess(proc.cmd, proc.name)) {
+      codexVendorCandidates.push(proc);
+    }
+  }
+  const codexVendorChildren: PsProcess[] = [];
+  const codexVendorProcs: PsProcess[] = [];
+  for (const proc of codexVendorCandidates) {
+    if (codexWrapperPidSet.has(proc.ppid ?? -1)) {
+      codexVendorChildren.push(proc);
+    } else {
+      codexVendorProcs.push(proc);
+    }
+  }
   const includeVendor =
     process.env.CONSENSUS_INCLUDE_CODEX_VENDOR === "1" ||
     process.env.CONSENSUS_INCLUDE_CODEX_VENDOR === "true";
   const codexProcs = includeVendor ? [...codexWrapperProcs, ...codexVendorProcs] : codexWrapperProcs;
-  const codexPidSet = new Set(codexProcs.map((proc) => proc.pid));
-  const opencodeProcs = processes
-    .filter((proc) => isOpenCodeProcess(proc.cmd, proc.name))
-    .filter((proc) => !codexPidSet.has(proc.pid));
-  const opencodePidSet = new Set(opencodeProcs.map((proc) => proc.pid));
-  const claudeProcs = processes
-    .filter((proc) => isClaudeProcess(proc.cmd, proc.name))
-    .filter((proc) => !codexPidSet.has(proc.pid) && !opencodePidSet.has(proc.pid));
-  const pids = Array.from(
-    new Set([...codexProcs, ...opencodeProcs, ...claudeProcs].map((proc) => proc.pid))
-  );
+  const codexPidSet = new Set<number>();
+  for (const proc of codexProcs) codexPidSet.add(proc.pid);
+
+  const opencodeProcs: PsProcess[] = [];
+  const claudeProcs: PsProcess[] = [];
+  const opencodePidSet = new Set<number>();
+  for (const proc of processes) {
+    if (codexPidSet.has(proc.pid)) continue;
+    if (isOpenCodeProcess(proc.cmd, proc.name)) {
+      opencodeProcs.push(proc);
+      opencodePidSet.add(proc.pid);
+      continue;
+    }
+    if (isClaudeProcess(proc.cmd, proc.name)) {
+      claudeProcs.push(proc);
+    }
+  }
+
+  const pidSet = new Set<number>();
+  for (const proc of codexProcs) pidSet.add(proc.pid);
+  for (const proc of opencodeProcs) pidSet.add(proc.pid);
+  for (const proc of claudeProcs) pidSet.add(proc.pid);
+  const pids = Array.from(pidSet);
   const codexVendorPids = codexVendorChildren.map((proc) => proc.pid);
-  const usagePids = Array.from(new Set([...pids, ...codexVendorPids]));
+  const usagePidSet = new Set<number>(pidSet);
+  for (const proc of codexVendorChildren) usagePidSet.add(proc.pid);
+  const usagePids = Array.from(usagePidSet);
   if (shouldUseProcessCache) {
     const refreshPids = new Set<number>(
       [...opencodeProcs, ...claudeProcs].map((proc) => proc.pid)
