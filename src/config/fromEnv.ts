@@ -110,6 +110,7 @@ const buildActivityConfig = () => ({
 
 const buildRedactConfig = () => ({
   enabled: Option.getOrUndefined(parseBoolean(process.env.CONSENSUS_REDACT_PII)) ?? true,
+  strict: Option.getOrUndefined(parseBoolean(process.env.CONSENSUS_REDACT_STRICT)) ?? false,
 })
 
 const buildDebugConfig = () => ({

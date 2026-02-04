@@ -19,6 +19,8 @@ Claude activity is hook-driven. Configure Claude Code hooks to call
 `dist/claudeHook.js` and post to `http://127.0.0.1:<port>/api/claude-event`
 from `~/.claude/settings.json`, `.claude/settings.json`, or
 `.claude/settings.local.json`.
+If `CONSENSUS_API_TOKEN` is set, the hook process must run with that env var
+so it can include the `Authorization: Bearer` header automatically.
 
 Minimal config (tool hooks require a matcher):
 ```json
@@ -60,3 +62,5 @@ TypeScript entrypoint so changes apply without a build:
 
 ## WebSocket disconnects
 Check for network proxies, and reload. The client will auto-reconnect.
+If `CONSENSUS_API_TOKEN` is set, include `?token=<token>` in the UI URL or
+`ws` override so the browser can authenticate.

@@ -43,6 +43,13 @@ const liveReloadEnabled =
   (isDevRuntime && process.env.CONSENSUS_LIVE_RELOAD !== "0");
 
 const app = express();
+app.disable("x-powered-by");
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
@@ -132,6 +139,17 @@ function sendDeltaEnvelope(socket: WebSocket, ops: DeltaOp[]): void {
 
 const port = Number(process.env.CONSENSUS_PORT || 8787);
 const host = process.env.CONSENSUS_HOST || "127.0.0.1";
+const apiToken = (process.env.CONSENSUS_API_TOKEN || "").trim() || null;
+const allowRemote = process.env.CONSENSUS_ALLOW_REMOTE === "1";
+const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
+const isLoopbackHost = loopbackHosts.has(host);
+const requireAuth = Boolean(apiToken) || !isLoopbackHost;
+if (!isLoopbackHost && (!allowRemote || !apiToken)) {
+  process.stderr.write(
+    "[consensus] Refusing to bind non-loopback host without CONSENSUS_ALLOW_REMOTE=1 and CONSENSUS_API_TOKEN.\n"
+  );
+  process.exit(1);
+}
 const pollMs = Math.max(50, Number(process.env.CONSENSUS_POLL_MS || 250));
 const scanTimeoutMs = Math.max(
   500,
@@ -177,6 +195,82 @@ const activityTestMode = process.env.ACTIVITY_TEST_MODE === "1";
 const testUiPath = fs.existsSync(path.join(clientBuildDir, "index.html"))
   ? path.join(clientBuildDir, "index.html")
   : path.join(publicDir, "index.html");
+const jsonBodyLimit = "256kb";
+const rateLimitWindowMs = Math.max(
+  1000,
+  Number(process.env.CONSENSUS_RATE_LIMIT_WINDOW_MS || 10000)
+);
+const rateLimitMax = Math.max(
+  1,
+  Number(process.env.CONSENSUS_RATE_LIMIT_MAX || 120)
+);
+const rateLimitState = new Map<string, { resetAt: number; count: number }>();
+
+function isLoopbackAddress(addr?: string | null): boolean {
+  if (!addr) return false;
+  if (addr === "::1" || addr === "127.0.0.1") return true;
+  if (addr.startsWith("::ffff:")) {
+    const mapped = addr.slice("::ffff:".length);
+    return mapped === "127.0.0.1";
+  }
+  return false;
+}
+
+function readBearerToken(req: {
+  headers?: Record<string, string | string[] | undefined>;
+  query?: Record<string, unknown>;
+  url?: string;
+}): string | null {
+  const header = req.headers?.authorization || "";
+  if (typeof header === "string" && header.toLowerCase().startsWith("bearer ")) {
+    return header.slice(7).trim() || null;
+  }
+  const direct = req.headers?.["x-consensus-token"];
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  if (Array.isArray(direct) && direct[0]?.trim()) return direct[0].trim();
+  const queryToken =
+    typeof req.query?.token === "string" ? req.query.token.trim() : null;
+  if (queryToken) return queryToken;
+  if (typeof req.url === "string") {
+    try {
+      const parsed = new URL(req.url, "http://localhost");
+      const token = parsed.searchParams.get("token");
+      if (token) return token.trim();
+    } catch {
+      // ignore
+    }
+  }
+  return null;
+}
+
+function enforceAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  if (!requireAuth) return next();
+  if (!apiToken) return res.status(503).json({ error: "auth_not_configured" });
+  const token = readBearerToken(req);
+  if (token && token === apiToken) return next();
+  res.status(401).json({ error: "unauthorized" });
+}
+
+function enforceLocalOrAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  if (!apiToken && isLoopbackAddress(req.socket.remoteAddress)) return next();
+  return enforceAuth(req, res, next);
+}
+
+function enforceRateLimit(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  const key = `${req.socket.remoteAddress || "unknown"}:${req.path}`;
+  const now = Date.now();
+  const entry = rateLimitState.get(key);
+  if (!entry || entry.resetAt <= now) {
+    rateLimitState.set(key, { resetAt: now + rateLimitWindowMs, count: 1 });
+    return next();
+  }
+  entry.count += 1;
+  if (entry.count > rateLimitMax) {
+    res.status(429).json({ error: "rate_limited" });
+    return;
+  }
+  next();
+}
 if (activityTestMode) {
   app.get("/", (_req, res) => {
     res.setHeader("Cache-Control", "no-cache");
@@ -246,7 +340,7 @@ function stopReloadWatcher(): Promise<void> | void {
 }
 
 if (liveReloadEnabled) {
-  app.get("/__dev/reload", (req, res) => {
+  app.get("/__dev/reload", enforceLocalOrAuth, (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -291,7 +385,7 @@ function runHttpEffect(
   });
 }
 
-app.get("/api/snapshot", (req, res) => {
+app.get("/api/snapshot", enforceAuth, (req, res) => {
   const effect = Effect.tryPromise({
     try: () => scanCodexProcesses({ mode: "full" }),
     catch: (err) => err as Error,
@@ -315,7 +409,7 @@ app.get("/api/snapshot", (req, res) => {
   runHttpEffect(req, res, "/api/snapshot", effect);
 });
 
-app.get("/health", (req, res) => {
+app.get("/health", enforceAuth, (req, res) => {
   runHttpEffect(
     req,
     res,
@@ -327,89 +421,107 @@ app.get("/health", (req, res) => {
   );
 });
 
-app.post("/__debug/activity", express.json(), (req, res) => {
-  const effect = Effect.sync(() => {
-    const enable =
-      req.query.enable ??
-      req.query.enabled ??
-      req.body?.enable ??
-      req.body?.enabled;
-    const normalized =
-      enable === "1" ||
-      enable === "true" ||
-      enable === "on" ||
-      enable === 1 ||
-      enable === true;
-    process.env.CONSENSUS_DEBUG_ACTIVITY = normalized ? "1" : "0";
-    res.json({ ok: true, enabled: process.env.CONSENSUS_DEBUG_ACTIVITY === "1" });
-    return 200;
-  });
+app.post(
+  "/__debug/activity",
+  enforceLocalOrAuth,
+  express.json({ limit: jsonBodyLimit }),
+  enforceRateLimit,
+  (req, res) => {
+    const effect = Effect.sync(() => {
+      const enable =
+        req.query.enable ??
+        req.query.enabled ??
+        req.body?.enable ??
+        req.body?.enabled;
+      const normalized =
+        enable === "1" ||
+        enable === "true" ||
+        enable === "on" ||
+        enable === 1 ||
+        enable === true;
+      process.env.CONSENSUS_DEBUG_ACTIVITY = normalized ? "1" : "0";
+      res.json({ ok: true, enabled: process.env.CONSENSUS_DEBUG_ACTIVITY === "1" });
+      return 200;
+    });
 
-  runHttpEffect(req, res, "/__debug/activity", effect);
-});
+    runHttpEffect(req, res, "/__debug/activity", effect);
+  }
+);
 
 // Codex webhook endpoint - receives events from notify hook
-app.post("/api/codex-event", express.json(), (req, res) => {
-  const effect = Effect.gen(function* () {
-    // Decode and validate event
-    const decodeResult = Schema.decodeUnknownEither(CodexEventSchema)(req.body);
-    
-    if (decodeResult._tag === "Left") {
-      const error = ParseResult.TreeFormatter.formatErrorSync(decodeResult.left);
-      res.status(400).json({ 
-        ok: false, 
-        error: "Invalid event schema",
-        details: error 
-      });
-      return 400;
-    }
-    
-    const event = decodeResult.right;
+app.post(
+  "/api/codex-event",
+  enforceAuth,
+  express.json({ limit: jsonBodyLimit }),
+  enforceRateLimit,
+  (req, res) => {
+    const effect = Effect.gen(function* () {
+      // Decode and validate event
+      const decodeResult = Schema.decodeUnknownEither(CodexEventSchema)(req.body);
 
-    if (process.env.CONSENSUS_CODEX_NOTIFY_DEBUG === "1") {
-      process.stderr.write(
-        `[consensus] codex event type=${event.type} thread=${event.threadId}\n`
-      );
-    }
-    
-    // Store event (sync for immediate availability)
-    codexEventStore.handleEvent(event);
-    
-    // Trigger fast scan to update UI
-    requestTick("fast");
-    
-    res.json({ ok: true, received: event.type });
-    return 200;
-  });
-  
-  runHttpEffect(req, res, "/api/codex-event", effect);
-});
+      if (decodeResult._tag === "Left") {
+        const error = ParseResult.TreeFormatter.formatErrorSync(decodeResult.left);
+        res.status(400).json({
+          ok: false,
+          error: "Invalid event schema",
+          details: error,
+        });
+        return 400;
+      }
+
+      const event = decodeResult.right;
+
+      if (process.env.CONSENSUS_CODEX_NOTIFY_DEBUG === "1") {
+        process.stderr.write(
+          `[consensus] codex event type=${event.type} thread=${event.threadId}\n`
+        );
+      }
+
+      // Store event (sync for immediate availability)
+      codexEventStore.handleEvent(event);
+
+      // Trigger fast scan to update UI
+      requestTick("fast");
+
+      res.json({ ok: true, received: event.type });
+      return 200;
+    });
+
+    runHttpEffect(req, res, "/api/codex-event", effect);
+  }
+);
 
 // Claude webhook endpoint - receives events from Claude hooks
-app.post("/api/claude-event", express.json(), (req, res) => {
-  const effect = Effect.gen(function* () {
-    const decodeResult = Schema.decodeUnknownEither(ClaudeEventSchema)(req.body);
+app.post(
+  "/api/claude-event",
+  enforceAuth,
+  express.json({ limit: jsonBodyLimit }),
+  enforceRateLimit,
+  (req, res) => {
+    const effect = Effect.gen(function* () {
+      const decodeResult = Schema.decodeUnknownEither(ClaudeEventSchema)(req.body);
 
-    if (decodeResult._tag === "Left") {
-      const error = ParseResult.TreeFormatter.formatErrorSync(decodeResult.left);
-      res.status(400).json({
-        ok: false,
-        error: "Invalid event schema",
-        details: error,
-      });
-      return 400;
-    }
+      if (decodeResult._tag === "Left") {
+        const error = ParseResult.TreeFormatter.formatErrorSync(decodeResult.left);
+        res.status(400).json({
+          ok: false,
+          error: "Invalid event schema",
+          details: error,
+        });
+        return 400;
+      }
 
-    const event = decodeResult.right;
-    yield* handleClaudeEventEffect(event);
-    requestTick("fast");
+      const event = decodeResult.right;
+      yield* handleClaudeEventEffect(event);
+      requestTick("fast");
 
-    res.json({ ok: true, received: event.type });
-    return 200;
-  });
+      res.json({ ok: true, received: event.type });
+      return 200;
+    });
 
-  runHttpEffect(req, res, "/api/claude-event", effect);
-});
+    runHttpEffect(req, res, "/api/claude-event", effect);
+  }
+);
 
 let lastSnapshot: SnapshotPayload = { ts: Date.now(), agents: [] };
 let lastBaseSnapshot: SnapshotPayload = lastSnapshot;
@@ -681,7 +793,11 @@ async function tick(): Promise<void> {
   }
 }
 
-wss.on("connection", (socket) => {
+wss.on("connection", (socket, req) => {
+  if (requireAuth && (!apiToken || readBearerToken(req as any) !== apiToken)) {
+    socket.close(1008, "unauthorized");
+    return;
+  }
   wsClients.set(socket, { mode: "legacy", ready: false });
   socket.send(JSON.stringify(lastSnapshot));
 
@@ -796,6 +912,9 @@ registerActivityTestRoutes(app, {
     pollMs,
     activityTestMode,
   }),
+  guard: enforceLocalOrAuth,
+  rateLimit: enforceRateLimit,
+  jsonLimit: jsonBodyLimit,
 });
 
 const pollLoop = Effect.forever(

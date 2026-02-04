@@ -6,6 +6,12 @@ All configuration is via environment variables.
 - `CONSENSUS_HOST`
   - Default: `127.0.0.1`
   - Bind address for the server.
+- `CONSENSUS_ALLOW_REMOTE`
+  - Default: disabled
+  - Set to `1` to allow binding to non-loopback hosts. Requires `CONSENSUS_API_TOKEN`.
+- `CONSENSUS_API_TOKEN`
+  - Default: unset
+  - If set, all API and WebSocket clients must send `Authorization: Bearer <token>` or `?token=<token>`.
 - `CONSENSUS_PORT`
   - Default: `8787`
   - Port for the HTTP server.
@@ -104,6 +110,15 @@ All configuration is via environment variables.
 - `CONSENSUS_REDACT_PII`
   - Default: enabled
   - Set to `0` to disable redaction.
+- `CONSENSUS_REDACT_STRICT`
+  - Default: disabled
+  - Set to `1` to enable strict secret/token redaction patterns.
+- `CONSENSUS_RATE_LIMIT_WINDOW_MS`
+  - Default: `10000`
+  - Sliding window size for API rate limiting (ms).
+- `CONSENSUS_RATE_LIMIT_MAX`
+  - Default: `120`
+  - Max requests per window per IP+route before 429.
 - `ACTIVITY_TEST_MODE`
   - Default: disabled
   - Set to `1` to enable test-only activity injection endpoints under `/__test`.

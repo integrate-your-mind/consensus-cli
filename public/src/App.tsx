@@ -15,6 +15,7 @@ const query = new URLSearchParams(window.location.search);
 const mockMode = query.get('mock') === '1';
 const wsOverrideRaw = query.get('ws');
 const wsOverrideDecoded = wsOverrideRaw ? decodeURIComponent(wsOverrideRaw) : null;
+const wsToken = query.get('token');
 
 let wsOverride: string | null = null;
 if (wsOverrideDecoded) {
@@ -24,6 +25,19 @@ if (wsOverrideDecoded) {
     wsOverride = wsOverrideDecoded.replace(/^http/, 'ws');
   }
 }
+
+const withToken = (url: string | null): string | null => {
+  if (!url || !wsToken) return url;
+  try {
+    const parsed = new URL(url);
+    if (!parsed.searchParams.has('token')) {
+      parsed.searchParams.set('token', wsToken);
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+};
 
 if (mockMode) {
   initMockBridge();
@@ -38,7 +52,8 @@ if (wsOverrideRaw || mockMode) {
 }
 
 const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-const wsUrl = wsOverride || `${wsProtocol}://${window.location.host}/ws`;
+const wsBaseUrl = wsOverride || `${wsProtocol}://${window.location.host}/ws`;
+const wsUrl = withToken(wsBaseUrl);
 
 function App() {
   const { status, agents, meta } = useWebSocket(wsUrl, { mockMode });

@@ -68,11 +68,18 @@ const program = pipe(
         const event = normalizePayload(payload);
         if (!event) return Effect.succeed(null);
         return Effect.promise(() =>
-          fetch(endpoint, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(event),
-          })
+          {
+            const headers: Record<string, string> = {
+              "Content-Type": "application/json",
+            };
+            const token = (process.env.CONSENSUS_API_TOKEN || "").trim();
+            if (token) headers.Authorization = `Bearer ${token}`;
+            return fetch(endpoint, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(event),
+            });
+          }
         ).pipe(Effect.as(null));
       })
     );
