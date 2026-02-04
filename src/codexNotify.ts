@@ -78,11 +78,18 @@ const postEvent = (
 ) =>
   Effect.tryPromise({
     try: () =>
-      fetchImpl(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(event),
-      }),
+      {
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+        };
+        const token = (process.env.CONSENSUS_API_TOKEN || "").trim();
+        if (token) headers.Authorization = `Bearer ${token}`;
+        return fetchImpl(endpoint, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(event),
+        });
+      },
     catch: () => undefined,
   }).pipe(
     Effect.tap(() =>

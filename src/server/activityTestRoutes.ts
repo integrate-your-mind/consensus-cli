@@ -1,4 +1,4 @@
-import express, { type Express } from "express";
+import express, { type Express, type RequestHandler } from "express";
 
 type ReportFn = (laneId: string, source: string, active: boolean) => void;
 type StateFn = (laneId: string) => unknown;
@@ -10,11 +10,18 @@ export function registerActivityTestRoutes(
     state: StateFn;
     reset?: () => void;
     config?: () => unknown;
+    guard?: RequestHandler;
+    rateLimit?: RequestHandler;
+    jsonLimit?: string;
   }
 ): void {
   if (process.env.ACTIVITY_TEST_MODE !== "1") return;
 
-  app.use("/__test", express.json());
+  const middleware: RequestHandler[] = [];
+  if (deps.guard) middleware.push(deps.guard);
+  middleware.push(express.json({ limit: deps.jsonLimit ?? "256kb" }));
+  if (deps.rateLimit) middleware.push(deps.rateLimit);
+  app.use("/__test", ...middleware);
 
   app.post("/__test/activity/report", (req, res) => {
     const { laneId, source, active } = req.body ?? {};

@@ -227,6 +227,9 @@ export const RedactConfig = Schema.Struct({
   enabled: Schema.Boolean.pipe(
     Schema.optionalWith({ default: () => true })
   ),
+  strict: Schema.Boolean.pipe(
+    Schema.optionalWith({ default: () => false })
+  ),
 })
 
 /** Debug flags configuration */
@@ -308,7 +311,7 @@ export const AppConfig = Schema.Struct({
     }) })
   ),
   redact: RedactConfig.pipe(
-    Schema.optionalWith({ default: () => ({ enabled: true }) })
+    Schema.optionalWith({ default: () => ({ enabled: true, strict: false }) })
   ),
   debug: DebugConfig.pipe(
     Schema.optionalWith({ default: () => ({ 
