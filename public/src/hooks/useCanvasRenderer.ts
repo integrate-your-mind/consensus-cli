@@ -27,6 +27,7 @@ interface RenderContext {
   options: RendererOptions;
   width: number;
   height: number;
+  reducedMotion: boolean;
 }
 
 interface HitItem {
@@ -96,7 +97,7 @@ function drawTag(
 }
 
 function renderFrame(context: RenderContext): HitItem[] {
-  const { ctx, view, agents, options, width, height } = context;
+  const { ctx, view, agents, options, width, height, reducedMotion } = context;
   const { layout, hovered, selected, spawnTimes, deviceScale } = options;
   
   const roofW = TILE_W * ROOF_SCALE;
@@ -124,7 +125,6 @@ function renderFrame(context: RenderContext): HitItem[] {
 
   const time = Date.now();
   const spawnDuration = 260;
-  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const hitList: HitItem[] = [];
   const roofList: Array<{
     x: number;
@@ -272,25 +272,35 @@ function renderFrame(context: RenderContext): HitItem[] {
     });
   }
 
-  // Collision detection
-  for (const a of hitList) {
+  // Collision detection (only check occluders drawn after the item)
+  for (let i = 0; i < hitList.length; i += 1) {
+    const a = hitList[i];
     const roofPoint = { x: a.x, y: a.roofY };
-    for (const b of hitList) {
-      if (a === b) continue;
+    for (let j = i + 1; j < hitList.length; j += 1) {
+      const b = hitList[j];
       const topY = b.y - b.height;
       const halfW = TILE_W / 2;
       const halfH = TILE_H / 2;
-      
+
+      if (
+        roofPoint.x < b.x - halfW ||
+        roofPoint.x > b.x + halfW ||
+        roofPoint.y < topY ||
+        roofPoint.y > b.y + halfH
+      ) {
+        continue;
+      }
+
       const leftA = { x: b.x - halfW, y: topY };
       const leftB = { x: b.x, y: topY + halfH };
       const leftC = { x: b.x, y: b.y + halfH };
       const leftD = { x: b.x - halfW, y: b.y };
-      
+
       const rightA = { x: b.x + halfW, y: topY };
       const rightB = { x: b.x, y: topY + halfH };
       const rightC = { x: b.x, y: b.y + halfH };
       const rightD = { x: b.x + halfW, y: b.y };
-      
+
       if (
         pointInQuad(roofPoint, leftA, leftB, leftC, leftD) ||
         pointInQuad(roofPoint, rightA, rightB, rightC, rightD)
@@ -362,6 +372,54 @@ export function useCanvasRenderer() {
   const hitListRef = useRef<HitItem[]>([]);
   const rafRef = useRef<number | null>(null);
   const deviceScaleRef = useRef(1);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const viewRef = useRef<ViewState>({ x: 0, y: 0, scale: 1 });
+  const agentsRef = useRef<AgentSnapshot[]>([]);
+  const optionsRef = useRef<RendererOptions | null>(null);
+  const reducedMotionRef = useRef(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const update = () => {
+      reducedMotionRef.current = mql.matches;
+    };
+    update();
+    if (mql.addEventListener) {
+      mql.addEventListener('change', update);
+    } else {
+      mql.addListener(update);
+    }
+    return () => {
+      if (mql.removeEventListener) {
+        mql.removeEventListener('change', update);
+      } else {
+        mql.removeListener(update);
+      }
+    };
+  }, []);
+
+  const syncCanvasSize = useCallback((canvas: HTMLCanvasElement) => {
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = window.innerWidth;
+    const cssH = window.innerHeight;
+    const nextW = Math.max(1, Math.floor(cssW * dpr));
+    const nextH = Math.max(1, Math.floor(cssH * dpr));
+
+    if (
+      canvas.width !== nextW ||
+      canvas.height !== nextH ||
+      deviceScaleRef.current !== dpr
+    ) {
+      deviceScaleRef.current = dpr;
+      canvas.width = nextW;
+      canvas.height = nextH;
+      canvas.style.width = `${cssW}px`;
+      canvas.style.height = `${cssH}px`;
+    }
+
+    return { width: canvas.width, height: canvas.height, dpr };
+  }, []);
 
   const startRender = useCallback((
     view: ViewState,
@@ -371,37 +429,45 @@ export function useCanvasRenderer() {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    viewRef.current = view;
+    agentsRef.current = agents;
+    optionsRef.current = options;
 
-    // Update canvas size
-    deviceScaleRef.current = window.devicePixelRatio || 1;
-    canvas.width = window.innerWidth * deviceScaleRef.current;
-    canvas.height = window.innerHeight * deviceScaleRef.current;
-    canvas.style.width = `${window.innerWidth}px`;
-    canvas.style.height = `${window.innerHeight}px`;
+    if (!ctxRef.current) {
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctxRef.current = ctx;
+    }
+
+    if (rafRef.current) return;
+
+    syncCanvasSize(canvas);
 
     const render = () => {
-      const width = canvas.width;
-      const height = canvas.height;
-      
+      const canvasEl = canvasRef.current;
+      const ctx = ctxRef.current;
+      const opts = optionsRef.current;
+      if (!canvasEl || !ctx || !opts) {
+        rafRef.current = null;
+        return;
+      }
+
+      const { width, height, dpr } = syncCanvasSize(canvasEl);
       hitListRef.current = renderFrame({
         ctx,
-        view,
-        agents,
-        options: { ...options, deviceScale: deviceScaleRef.current },
+        view: viewRef.current,
+        agents: agentsRef.current,
+        options: { ...opts, deviceScale: dpr },
         width,
         height,
+        reducedMotion: reducedMotionRef.current,
       });
-      
+
       rafRef.current = requestAnimationFrame(render);
     };
 
-    if (rafRef.current) {
-      cancelAnimationFrame(rafRef.current);
-    }
     rafRef.current = requestAnimationFrame(render);
-  }, []);
+  }, [syncCanvasSize]);
 
   const stopRender = useCallback(() => {
     if (rafRef.current) {
@@ -410,19 +476,16 @@ export function useCanvasRenderer() {
     }
   }, []);
 
+  const getHitList = useCallback(() => hitListRef.current, []);
+
   const getAgentAtPoint = useCallback((screenX: number, screenY: number): AgentSnapshot | null => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
 
     const rect = canvas.getBoundingClientRect();
-    const x = screenX - rect.left;
-    const y = screenY - rect.top;
-
-    const viewX = (x - canvas.width / 2 / deviceScaleRef.current) / 1; // simplified
-    const viewY = (y - canvas.height / 2 / deviceScaleRef.current) / 1;
-
-    // Transform to world space (this needs proper view transform)
-    // For now, return simplified hit detection
+    const view = viewRef.current;
+    const worldX = (screenX - rect.left - view.x) / view.scale;
+    const worldY = (screenY - rect.top - view.y) / view.scale;
     const hitList = hitListRef.current;
     if (!hitList.length) return null;
 
@@ -432,7 +495,7 @@ export function useCanvasRenderer() {
       if (!item.markerY) continue;
       const markerW = TILE_W * MARKER_SCALE;
       const markerH = markerW * 0.5;
-      if (pointInDiamond(viewX, viewY, item.x, item.markerY, markerW, markerH)) {
+      if (pointInDiamond(worldX, worldY, item.x, item.markerY, markerW, markerH)) {
         return item.agent;
       }
     }
@@ -442,7 +505,7 @@ export function useCanvasRenderer() {
       const item = hitList[i];
       const roofHitW = item.roofHitW;
       const roofHitH = item.roofHitH;
-      if (pointInDiamond(viewX, viewY, item.x, item.roofY, roofHitW, roofHitH)) {
+      if (pointInDiamond(worldX, worldY, item.x, item.roofY, roofHitW, roofHitH)) {
         return item.agent;
       }
     }
@@ -450,7 +513,7 @@ export function useCanvasRenderer() {
     // Check base
     for (let i = hitList.length - 1; i >= 0; i -= 1) {
       const item = hitList[i];
-      if (pointInDiamond(viewX, viewY, item.x, item.y, TILE_W, TILE_H)) {
+      if (pointInDiamond(worldX, worldY, item.x, item.y, TILE_W, TILE_H)) {
         return item.agent;
       }
     }
@@ -469,5 +532,6 @@ export function useCanvasRenderer() {
     startRender,
     stopRender,
     getAgentAtPoint,
+    getHitList,
   };
 }
