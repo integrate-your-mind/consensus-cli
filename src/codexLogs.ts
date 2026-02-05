@@ -2,13 +2,19 @@ import fs from "fs";
 import fsp from "fs/promises";
 import os from "os";
 import path from "path";
+import { StringDecoder } from "node:string_decoder";
 import type { EventSummary, WorkSummary } from "./types.js";
 import { redactText } from "./redact.js";
 
 const SESSION_WINDOW_MS = 30 * 60 * 1000;
 const SESSION_SCAN_INTERVAL_MS = 500;
 const SESSION_ID_SCAN_INTERVAL_MS = 60000;
-const MAX_READ_BYTES = 512 * 1024;
+const TAIL_CHUNK_BYTES = 64 * 1024;
+const TAIL_MAX_BYTES_PER_UPDATE = 2 * 1024 * 1024;
+const MAX_READ_BYTES = TAIL_MAX_BYTES_PER_UPDATE;
+const TAIL_PARSE_ERROR_MAX_BYTES = 16 * 1024;
+const FAST_TYPE_BYTES = 256;
+const FAST_PREFIX_BYTES = 512;
 const MAX_EVENTS = 50;
 const SESSION_META_READ_BYTES = 16 * 1024;
 const SESSION_META_RESYNC_MS = 10000;
@@ -16,6 +22,91 @@ const NOTIFY_MAX_EVENTS = 100;
 const NOTIFY_POLL_MS = 1000;
 const SESSION_CWD_CHECK_MAX = 256;
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
+
+const RESPONSE_START_RE = /(?:turn|response)\.(started|in_progress|running)/i;
+const RESPONSE_END_RE =
+  /response\.(completed|failed|errored|canceled|cancelled|aborted|interrupted|stopped)/i;
+const TURN_END_RE =
+  /turn\.(completed|failed|errored|canceled|cancelled|aborted|interrupted|stopped)/i;
+const RESPONSE_ITEM_DELTA_TYPES = [
+  "response.output_text.delta",
+  "response.function_call_arguments.delta",
+  "response.content_part.delta",
+  "response.text.delta",
+] as const;
+const ITEM_START_WORK_TYPES = new Set([
+  "command_execution",
+  "mcp_tool_call",
+  "tool_call",
+  "file_change",
+  "file_edit",
+  "file_write",
+]);
+const ITEM_END_STATUSES = new Set([
+  "completed",
+  "failed",
+  "errored",
+  "canceled",
+  "cancelled",
+  "aborted",
+  "interrupted",
+  "stopped",
+]);
+const WORK_KINDS = new Set(["command", "edit", "tool", "message"]);
+
+function fastExtractTopType(line: string): string | undefined {
+  const prefix = line.slice(0, FAST_TYPE_BYTES);
+  const typeIndex = prefix.indexOf('"type"');
+  if (typeIndex === -1) return undefined;
+  const colon = prefix.indexOf(":", typeIndex);
+  if (colon === -1) return undefined;
+  const quote = prefix.indexOf('"', colon);
+  if (quote === -1) return undefined;
+  const end = prefix.indexOf('"', quote + 1);
+  if (end === -1) return undefined;
+  return prefix.slice(quote + 1, end);
+}
+
+function shouldParseJsonLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (!trimmed.startsWith("{")) return false;
+  const prefix = trimmed.slice(0, FAST_PREFIX_BYTES);
+  const topType = fastExtractTopType(prefix);
+  if (!topType) {
+    return trimmed.length <= TAIL_PARSE_ERROR_MAX_BYTES && prefix.includes('"error"');
+  }
+  const typeLower = topType.toLowerCase();
+  if (typeLower.includes(".delta")) return false;
+  if (typeLower === "response_item") {
+    for (const deltaType of RESPONSE_ITEM_DELTA_TYPES) {
+      if (prefix.includes(deltaType)) return false;
+    }
+    return true;
+  }
+  if (typeLower === "event_msg") {
+    const lower = prefix.toLowerCase();
+    return (
+      lower.includes("token_count") ||
+      lower.includes("agent_reasoning") ||
+      lower.includes("agent_message") ||
+      lower.includes("user_message") ||
+      lower.includes("entered_review_mode") ||
+      lower.includes("exited_review_mode") ||
+      lower.includes("approval")
+    );
+  }
+  if (typeLower === "session_meta") return true;
+  if (
+    typeLower.startsWith("thread.") ||
+    typeLower.startsWith("turn.") ||
+    typeLower.startsWith("response.") ||
+    typeLower.startsWith("item.")
+  ) {
+    return true;
+  }
+  return trimmed.length <= TAIL_PARSE_ERROR_MAX_BYTES && prefix.includes('"error"');
+}
 
 function logDebug(message: string): void {
   if (!isDebugActivity()) return;
@@ -31,6 +122,8 @@ interface TailState {
   path: string;
   offset: number;
   partial: string;
+  decoder?: StringDecoder;
+  needsCatchUp?: boolean;
   events: EventSummary[];
   recentEvents?: CodexEventLite[];
   lastEventAt?: number;
@@ -664,7 +757,7 @@ function summarizeEvent(ev: any): {
   return { kind: "other", isError, model, type };
 }
 
-export async function updateTail(
+async function updateTailLegacy(
   sessionPath: string,
   options?: { keepStale?: boolean }
 ): Promise<TailState | null> {
@@ -762,25 +855,24 @@ export async function updateTail(
     }
     if (!state.inFlight && !state.pendingEndAt) return;
     if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
+    const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
     if (state.pendingEndAt) {
+      if (openCallCount > 0) return;
       const elapsed = nowMs - state.pendingEndAt;
       const forceEndMs = inflightTimeoutMs > 0 ? inflightTimeoutMs : defaultInflightTimeoutMs;
       if (elapsed >= forceEndMs) {
         finalizeEnd(state.pendingEndAt);
-        return;
       }
+      return;
     }
     if (state.reviewMode) return;
-    const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
+    if (state.turnOpen) return;
     if (openCallCount > 0) return;
     if (state.lastEndAt) {
       state.inFlight = false;
       state.inFlightStart = false;
       state.pendingEndAt = undefined;
       clearActivitySignals();
-      return;
-    }
-    if (fileFresh) {
       return;
     }
     const lastSignal =
@@ -987,7 +1079,8 @@ export async function updateTail(
     const isTurnEnd = /turn\.(completed|failed|errored|canceled|cancelled|aborted|interrupted|stopped)/i.test(
       combinedType
     );
-    const isTurnStart = combinedType.includes("turn.started");
+    const isTurnStart =
+      combinedType.includes("turn.started") || combinedType.includes("thread.started");
     const isResponseDelta = responseDeltaTypes.has(typeStr) || responseDeltaTypes.has(payloadType);
     const isItemStarted = typeStr === "item.started" || payloadType === "item.started";
     const isItemCompleted = typeStr === "item.completed" || payloadType === "item.completed";
@@ -1104,13 +1197,13 @@ export async function updateTail(
     }
   }
   if (payloadType.includes("user_message") || payloadRole === "user") {
+    state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
     if (canSignal) {
       clearEndMarkers();
       state.turnOpen = true;
-      state.inFlight = true;
-      state.inFlightStart = true;
-      markInFlightSignal();
-      state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
+      if (state.inFlight) {
+        markInFlightSignal();
+      }
     }
   }
   if (payloadType === "token_count") {
@@ -1137,7 +1230,11 @@ export async function updateTail(
           payloadType === "tool");
       if (isToolCall) {
         if (!state.openCallIds) state.openCallIds = new Set();
-        if (callId) state.openCallIds.add(callId);
+        if (callId) {
+          state.openCallIds.add(callId);
+        } else {
+          state.openItemCount = (state.openItemCount ?? 0) + 1;
+        }
         if (process.env.CODEX_TEST_HOOKS === "1") {
           "TEST_HOOK_TOOL_START";
         }
@@ -1162,6 +1259,11 @@ export async function updateTail(
       if (isToolOutput) {
         if (state.openCallIds && callId) {
           state.openCallIds.delete(callId);
+        } else if (state.openCallIds && state.openCallIds.size > 0) {
+          const first = state.openCallIds.values().next().value as string | undefined;
+          if (first) state.openCallIds.delete(first);
+        } else if ((state.openItemCount ?? 0) > 0) {
+          state.openItemCount = (state.openItemCount ?? 0) - 1;
         }
         if (process.env.CODEX_TEST_HOOKS === "1") {
           "TEST_HOOK_TOOL_END";
@@ -1215,10 +1317,11 @@ export async function updateTail(
   if (itemTypeIsUserMessage || payloadIsUserMessage) {
     state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
     if (canSignal) {
+      clearEndMarkers();
       state.turnOpen = true;
-      state.inFlight = true;
-      state.inFlightStart = true;
-      markInFlightSignal();
+      if (state.inFlight) {
+        markInFlightSignal();
+      }
     }
   }
   if (itemTypeIsAgentMessage || payloadIsAgentMessage) {
@@ -1337,6 +1440,13 @@ export async function updateTail(
   return state;
 }
 
+export async function updateTail(
+  sessionPath: string,
+  options?: { keepStale?: boolean }
+): Promise<TailState | null> {
+  return updateTailLegacy(sessionPath, options);
+}
+
 export function summarizeTail(state: TailState): {
   doing?: string;
   title?: string;
@@ -1377,7 +1487,25 @@ export function summarizeTail(state: TailState): {
   const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
   const hasOpenCalls = openCallCount > 0;
   const hasPendingEnd = typeof state.pendingEndAt === "number";
-  const inFlight = state.inFlight || state.reviewMode || hasOpenCalls || hasPendingEnd;
+  const inFlight =
+    state.inFlight || state.reviewMode || hasOpenCalls || hasPendingEnd || state.turnOpen;
+  if (isDebugActivity()) {
+    if (state.turnOpen || state.inFlight || hasOpenCalls || hasPendingEnd) {
+      logDebug(
+        `summary session=${path.basename(state.path)} ` +
+          `turnOpen=${state.turnOpen ? 1 : 0} ` +
+          `inFlight=${state.inFlight ? 1 : 0} ` +
+          `openCalls=${openCallCount} pendingEnd=${hasPendingEnd ? 1 : 0} ` +
+          `lastActivity=${state.lastActivityAt ?? "?"}`
+      );
+    }
+    if (state.turnOpen && !inFlight) {
+      logDebug(
+        `summary mismatch session=${path.basename(state.path)} turnOpen=1 inFlight=0`
+      );
+    }
+  }
+  const lastActivityAt = state.lastActivityAt;
   return {
     doing,
     title,
@@ -1386,7 +1514,7 @@ export function summarizeTail(state: TailState): {
     hasError,
     summary,
     lastEventAt,
-    lastActivityAt: state.lastActivityAt,
+    lastActivityAt,
     lastPromptAt: state.lastPrompt?.ts,
     lastInFlightSignalAt: state.lastInFlightSignalAt,
     lastIngestAt: state.lastIngestAt,

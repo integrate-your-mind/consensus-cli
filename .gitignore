@@ -3,6 +3,8 @@ dist/
 test-results/
 playwright-report/
 tmp/
+.worktrees/
+.codex/
 .DS_Store
 .env
 .env.local

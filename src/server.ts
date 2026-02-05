@@ -11,7 +11,6 @@ import { Effect, Exit, Fiber } from "effect";
 import { scanCodexProcesses, markSessionDirty } from "./scan.js";
 import { resolveCodexHome } from "./codexLogs.js";
 import { onOpenCodeEvent, stopOpenCodeEventStream } from "./opencodeEvents.js";
-import { codexEventStore } from "./services/codexEvents.js";
 import { CodexEventSchema } from "./codex/types.js";
 import { ClaudeEventSchema } from "./claude/types.js";
 import { handleClaudeEventEffect } from "./services/claudeEvents.js";
@@ -353,17 +352,17 @@ app.post("/api/codex-event", express.json(), (req, res) => {
   const effect = Effect.gen(function* () {
     // Decode and validate event
     const decodeResult = Schema.decodeUnknownEither(CodexEventSchema)(req.body);
-    
+
     if (decodeResult._tag === "Left") {
       const error = ParseResult.TreeFormatter.formatErrorSync(decodeResult.left);
-      res.status(400).json({ 
-        ok: false, 
+      res.status(400).json({
+        ok: false,
         error: "Invalid event schema",
-        details: error 
+        details: error
       });
       return 400;
     }
-    
+
     const event = decodeResult.right;
 
     if (process.env.CONSENSUS_CODEX_NOTIFY_DEBUG === "1") {
@@ -371,18 +370,23 @@ app.post("/api/codex-event", express.json(), (req, res) => {
         `[consensus] codex event type=${event.type} thread=${event.threadId}\n`
       );
     }
-    
-    // Store event (sync for immediate availability)
-    codexEventStore.handleEvent(event);
-    
+
     // Trigger fast scan to update UI
     requestTick("fast");
-    
+
     res.json({ ok: true, received: event.type });
     return 200;
   });
-  
+
   runHttpEffect(req, res, "/api/codex-event", effect);
+});
+
+app.get("/api/codex-event", (_req, res) => {
+  res.status(405).json({
+    ok: false,
+    error: "Method Not Allowed",
+    message: "This endpoint expects a POST request with an event payload.",
+  });
 });
 
 // Claude webhook endpoint - receives events from Claude hooks
@@ -409,6 +413,14 @@ app.post("/api/claude-event", express.json(), (req, res) => {
   });
 
   runHttpEffect(req, res, "/api/claude-event", effect);
+});
+
+app.get("/api/claude-event", (_req, res) => {
+  res.status(405).json({
+    ok: false,
+    error: "Method Not Allowed",
+    message: "This endpoint expects a POST request with an event payload.",
+  });
 });
 
 let lastSnapshot: SnapshotPayload = { ts: Date.now(), agents: [] };
@@ -485,8 +497,8 @@ function logStateChanges(prev: SnapshotPayload, next: SnapshotPayload): void {
     if (!prevAgent || prevAgent.state !== agent.state) {
       logDebug(
         `state ${key} ${prevAgent?.state ?? "none"} -> ${agent.state} ` +
-          `pid=${agent.pid ?? "?"} lastEventAt=${agent.lastEventAt ?? "?"} ` +
-          `doing=${agent.doing ?? "?"}`
+        `pid=${agent.pid ?? "?"} lastEventAt=${agent.lastEventAt ?? "?"} ` +
+        `doing=${agent.doing ?? "?"}`
       );
     }
   }
@@ -737,11 +749,11 @@ function startCodexWatcher(): void {
   if (!fs.existsSync(codexSessionsDir)) return;
   const watchOptions = codexWatchPoll
     ? {
-        ignoreInitial: true,
-        usePolling: true,
-        interval: codexWatchInterval,
-        binaryInterval: codexWatchBinaryInterval,
-      }
+      ignoreInitial: true,
+      usePolling: true,
+      interval: codexWatchInterval,
+      binaryInterval: codexWatchBinaryInterval,
+    }
     : { ignoreInitial: true };
   codexWatcher = chokidar.watch(
     path.join(codexSessionsDir, "**/*.jsonl"),

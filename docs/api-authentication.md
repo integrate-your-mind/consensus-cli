@@ -12,7 +12,7 @@ This document records how Consensus exposes HTTP/WS APIs today and how callers p
 |-------|--------|---------|----------------|-------|
 | `/api/snapshot` | `GET` | Returns the last snapshot emitted by the scan loop. The React-less canvas UI polls this endpoint to rebuild the agent map. | None | The handler runs `scanCodexProcesses` and pushes a JSON payload (ts + agents). |
 | `/health` | `GET` | Basic JSON health check for monitoring. | None | Always responds `{ ok: true }`. |
-| `/api/codex-event` | `POST` | Codex notify hook forwards Codex events into the server. | None | Payload validated against `CodexEventSchema`; rejects with `400` on schema mismatch. | 
+| `/api/codex-event` | `POST` | Codex notify hook triggers a fast scan. | None | Payload validated against `CodexEventSchema`; rejects with `400` on schema mismatch. Events are not merged into activity state. | 
 | `/api/claude-event` | `POST` | Claude Code hooks post lifecycle events. | None | Schema validated via `ClaudeEventSchema`; `dist/claudeHook.js` reads stdin and forwards to this endpoint. |
 | `/__debug/activity` | `POST` | Toggles extra activity logging (guarded by localhost). | None | Accepts `enable` via query or JSON body. |
 | `/__dev/reload` | `GET (SSE)` | Development reload stream for browser clients. | None | Only available when `CONSENSUS_LIVE_RELOAD=1`. |
@@ -20,7 +20,7 @@ This document records how Consensus exposes HTTP/WS APIs today and how callers p
 The UI also opens a WebSocket (handled by `ws` in `src/server.ts`) but the WebSocket connection is only permitted from the same origin as the served static files.
 
 ## Client expectations
-- Codex notify hooks call `noun codex config set -g notify` with the Consensus endpoint (`/api/codex-event`) and expect no authentication steps beyond the default localhost requirement.
+- Codex notify hooks call `noun codex config set -g notify` with the Consensus endpoint (`/api/codex-event`) and expect no authentication steps beyond the default localhost requirement. Codex in-flight state is derived from session JSONL logs (e.g. `~/.codex/sessions/.../*.jsonl`); the webhook only triggers faster scans.
 - Claude Code hooks run `dist/claudeHook.js` which POSTs a minimal JSON event directly to `/api/claude-event` from the hook process; it neither signs the request nor retries if the hook fails.
 - The browser UI fetches `/api/snapshot` and opens the WebSocket without extra headers.
 

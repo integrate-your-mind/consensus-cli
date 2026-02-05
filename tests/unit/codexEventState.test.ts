@@ -70,6 +70,20 @@ test("codex event state: idle after hold window", () => {
   assert.equal(result.reason, "event_idle");
 });
 
+test("codex event state: holdMs=0 yields immediate idle when not inFlight", () => {
+  const now = 10_000;
+  const result = deriveCodexEventState({
+    inFlight: false,
+    lastActivityAt: now - 1,
+    hasError: false,
+    now,
+    holdMs: 0,
+    idleMs: 20000,
+  });
+  assert.equal(result.state, "idle");
+  assert.equal(result.reason, "event_idle");
+});
+
 test("codex event state: stale inFlight times out", () => {
   const now = Date.now();
   const result = deriveCodexEventState({

@@ -23,12 +23,8 @@ import {
   summarizeTail,
   updateTail,
   getTailState,
-  getSessionMeta,
   getSessionStartMsFromPath,
 } from "./codexLogs.js";
-import { codexEventStore } from "./services/codexEvents.js";
-import type { SessionFile } from "./codexLogs.js";
-
 import { getOpenCodeSessions, getOpenCodeSessionActivity, type OpenCodeSessionResult } from "./opencodeApi.js";
 import { ensureOpenCodeServer } from "./opencodeServer.js";
 import {
@@ -59,6 +55,11 @@ import {
   recordActivityTransition,
   runPromise,
 } from "./observability/index.js";
+
+type SessionFile = {
+  path: string;
+  mtimeMs: number;
+};
 
 const dirtySessionPaths = new Set<string>();
 const execFileAsync = promisify(execFile);
@@ -136,13 +137,20 @@ const opencodeSessionByPidCache = new Map<
   number,
   { sessionId: string; lastSeenAt: number }
 >();
+const pidIdentityCache = new Map<number, string>();
 const START_MS_EPSILON_MS = 1000;
 
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
+const isDebugSession = () => process.env.CONSENSUS_DEBUG_SESSION === "1";
 
 function logActivityDecision(message: string): void {
   if (!isDebugActivity()) return;
   process.stderr.write(`[consensus][activity] ${message}\n`);
+}
+
+function logSessionDecision(message: string): void {
+  if (!isDebugSession()) return;
+  process.stderr.write(`[consensus][session] ${Date.now()} ${message}\n`);
 }
 
 function isStartMsMismatch(cached?: number, current?: number): boolean {
@@ -189,22 +197,6 @@ function endProfile(
 export function markSessionDirty(sessionPath: string): void {
   if (!sessionPath) return;
   dirtySessionPaths.add(sessionPath);
-}
-
-export interface CodexNotifyEndGateInput {
-  tailAllowsNotifyEnd: boolean;
-  notifyEndIsFresh: boolean;
-  tailEndAt?: number;
-  tailInFlight?: boolean;
-}
-
-export function shouldApplyCodexNotifyEnd(input: CodexNotifyEndGateInput): boolean {
-  return (
-    input.tailAllowsNotifyEnd &&
-    input.notifyEndIsFresh &&
-    !input.tailEndAt &&
-    !input.tailInFlight
-  );
 }
 
 function consumeDirtySessions(): Set<string> {
@@ -821,6 +813,14 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     mode === "fast" &&
     now - processCache.at < processCacheTtl &&
     processCache.processes.length > 0;
+  if (isDebugSession()) {
+    logSessionDecision(
+      `scan mode=${mode} fastCache=${shouldUseProcessCache ? 1 : 0} ` +
+        `processCacheAge=${now - processCache.at} ` +
+        `processCount=${processCache.processes.length} ` +
+        `jsonlByPid=${processCache.jsonlByPid?.size ?? 0}`
+    );
+  }
 
   let processes: PsProcess[] = [];
   let usage: Record<number, pidusage.Status> = {};
@@ -829,6 +829,12 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   let jsonlByPid = new Map<number, string[]>();
 
   if (shouldUseProcessCache) {
+    if (isDebugSession()) {
+      logSessionDecision(
+        `using cached processes count=${processCache.processes.length} ` +
+          `jsonlByPid=${processCache.jsonlByPid?.size ?? 0}`
+      );
+    }
     processes = processCache.processes;
     usage = processCache.usage;
     cwds = processCache.cwds;
@@ -1271,6 +1277,10 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     process.env.CONSENSUS_CODEX_EVENT_IDLE_MS,
     20000
   );
+  const codexStaleFileMs = resolveMs(
+    process.env.CONSENSUS_CODEX_STALE_FILE_MS,
+    120000
+  );
 
   type CodexContext = {
     proc: PsProcess;
@@ -1283,11 +1293,19 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     session?: SessionFile;
     jsonlPaths?: string[];
     reuseBlocked?: boolean;
+    pinnedPath?: string;
   };
   const codexContexts: CodexContext[] = [];
   const usedSessionPaths = new Set<string>();
   const normalizeSessionPath = (value?: string): string | undefined =>
     value ? path.resolve(value) : undefined;
+  const sessionsRoot = path.join(codexHome, "sessions");
+  const isCodexSessionPath = (value?: string): boolean => {
+    if (!value) return false;
+    const normalized = normalizeSessionPath(value);
+    if (!normalized) return false;
+    return normalized.startsWith(`${sessionsRoot}${path.sep}`);
+  };
   const jsonlPathSet = new Set<string>();
 
   const jsonlPaths = Array.from(
@@ -1297,9 +1315,9 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   );
   for (const jsonlPath of jsonlPaths) {
     const normalized = normalizeSessionPath(jsonlPath);
-    if (normalized) jsonlPathSet.add(normalized);
+    if (normalized && isCodexSessionPath(normalized)) jsonlPathSet.add(normalized);
   }
-  const jsonlMtimes = await buildJsonlMtimeIndex(jsonlPaths);
+  const jsonlMtimes = await buildJsonlMtimeIndex(Array.from(jsonlPathSet));
 
   const childJsonlByPid = new Map<number, string[]>();
   if (jsonlByPid.size > 0) {
@@ -1338,7 +1356,16 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     if (cachedEntry) {
       try {
         const stat = await fsp.stat(cachedEntry.path);
-        cachedSession = { path: cachedEntry.path, mtimeMs: stat.mtimeMs };
+        if (
+          Number.isFinite(codexStaleFileMs) &&
+          codexStaleFileMs > 0 &&
+          now - stat.mtimeMs > codexStaleFileMs
+        ) {
+          pidSessionCache.delete(proc.pid);
+          cachedEntry = undefined;
+        } else {
+          cachedSession = { path: cachedEntry.path, mtimeMs: stat.mtimeMs };
+        }
       } catch {
         pidSessionCache.delete(proc.pid);
       }
@@ -1346,40 +1373,77 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const directJsonl = jsonlByPid.get(proc.pid) || [];
     const childJsonl = childJsonlByPid.get(proc.pid) || [];
     const jsonlPaths = Array.from(
-      new Set([...directJsonl, ...childJsonl].map(normalizeSessionPath).filter(Boolean))
-    ) as string[];
-    const mappedJsonl = pickNewestJsonl([...directJsonl, ...childJsonl], jsonlMtimes);
+      new Set(
+        [...directJsonl, ...childJsonl]
+          .map(normalizeSessionPath)
+          .filter((value): value is string => !!value && isCodexSessionPath(value))
+      )
+    );
+    const mappedJsonl = pickNewestJsonl(jsonlPaths, jsonlMtimes);
     const startMsForCwd =
       typeof startMs === "number" && now - startMs < 5 * 60_000 ? startMs : undefined;
     const cwdSession = cwdRaw
-      ? await findSessionByCwd(sessions, cwdRaw, startMsForCwd, usedSessionPaths)
+      ? ((await findSessionByCwd(
+          sessions,
+          cwdRaw,
+          startMsForCwd,
+          usedSessionPaths
+        )) as SessionFile | undefined)
       : undefined;
     const mappedSession = mappedJsonl
       ? { path: mappedJsonl, mtimeMs: jsonlMtimes.get(mappedJsonl) ?? now }
       : undefined;
-    let session = mappedSession;
-    session =
-      (sessionId && sessions.find((item) => item.path.includes(sessionId))) ||
-      (sessionId ? await findSessionById(codexHome, sessionId) : undefined) ||
-      session ||
-      cwdSession ||
-      cachedSession;
-    if (cwdSession && mappedSession) {
+    const sessionFromId =
+      sessionId && sessions.find((item) => item.path.includes(sessionId));
+    const sessionFromFind = sessionId ? await findSessionById(codexHome, sessionId) : undefined;
+    const sessionFromMapped = mappedSession;
+    const sessionFromCwd = cwdSession;
+    const sessionFromCache = cachedSession;
+    let session =
+      sessionFromId ||
+      sessionFromFind ||
+      sessionFromMapped ||
+      sessionFromCwd ||
+      sessionFromCache;
+    let sessionSource: string =
+      (sessionFromId && "sessionId") ||
+      (sessionFromFind && "findSessionById") ||
+      (sessionFromMapped && "mapped") ||
+      (sessionFromCwd && "cwd") ||
+      (sessionFromCache && "cached") ||
+      "none";
+    const pinnedSession =
+      cachedSession && isCodexSessionPath(cachedSession.path)
+        ? cachedSession
+        : undefined;
+    if (pinnedSession) {
+      session = pinnedSession;
+      sessionSource = "pinned";
+    }
+    if (!pinnedSession && cwdSession && mappedSession) {
       const mappedMtime = mappedSession.mtimeMs ?? 0;
       const cwdMtime = cwdSession.mtimeMs ?? 0;
       if (cwdMtime > mappedMtime + 1000) {
         session = cwdSession;
+        sessionSource = "cwd-preferred";
       }
     }
-    const hasExplicitSession = !!sessionId || !!mappedJsonl;
+    const hasExplicitSession = !!sessionId || !!mappedJsonl || !!cwdSession;
+    const hasPinnedSession = !!pinnedSession;
     const allowReuse = hasExplicitSession || /\bresume\b/i.test(cmdRaw);
+    const allowReusePinned = allowReuse || hasPinnedSession;
     const initialSessionPath = normalizeSessionPath(session?.path);
     let reuseBlocked = false;
-    if (initialSessionPath && usedSessionPaths.has(initialSessionPath) && !allowReuse) {
-      const alternate = cwdSession;
-      const alternatePath = normalizeSessionPath(alternate?.path);
-      if (alternate && alternatePath && alternatePath !== initialSessionPath) {
-        session = alternate;
+    if (
+      initialSessionPath &&
+      usedSessionPaths.has(initialSessionPath) &&
+      !allowReusePinned
+    ) {
+      const cwdSessionValue = cwdSession as SessionFile | undefined;
+      const alternatePath = normalizeSessionPath(cwdSessionValue?.path);
+      if (cwdSessionValue && alternatePath && alternatePath !== initialSessionPath) {
+        session = cwdSessionValue;
+        sessionSource = "cwd-alternate";
       } else {
         reuseBlocked = true;
       }
@@ -1387,10 +1451,41 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     if (!session) {
       session = cwdSession;
       reuseBlocked = false;
+      if (session) sessionSource = "cwd-fallback";
     }
     const sessionPath = normalizeSessionPath(session?.path);
     if (sessionPath) {
       usedSessionPaths.add(sessionPath);
+    }
+    const pinnedPath = hasPinnedSession
+      ? normalizeSessionPath(cachedSession?.path)
+      : undefined;
+    if (isDebugSession()) {
+      const cmdShort = shortenCmd(cmdRaw);
+      const mappedLabel = mappedSession?.path ? path.basename(mappedSession.path) : "none";
+      const cwdLabel = cwdSession?.path ? path.basename(cwdSession.path) : "none";
+      const cachedLabel = cachedSession?.path ? path.basename(cachedSession.path) : "none";
+      const chosenLabel = sessionPath ? path.basename(sessionPath) : "none";
+      const pinnedLabel = pinnedPath ? path.basename(pinnedPath) : "none";
+      logSessionDecision(
+        `pid=${proc.pid} startMs=${startMs ?? "?"} cmd=${cmdShort} ` +
+          `sessionId=${sessionId ?? "none"} ` +
+          `mapped=${mappedLabel} cwd=${cwdLabel} cached=${cachedLabel} ` +
+          `jsonls=${jsonlPaths.length} reuseBlocked=${reuseBlocked ? 1 : 0} ` +
+          `hasExplicit=${hasExplicitSession ? 1 : 0} hasPinned=${hasPinnedSession ? 1 : 0} ` +
+          `pinned=${pinnedLabel} chosen=${chosenLabel} source=${sessionSource}`
+      );
+      if (cachedSession && !pinnedSession) {
+        logSessionDecision(
+          `pid=${proc.pid} cachedSession ignored (non-session path) ` +
+            `cached=${cachedLabel}`
+        );
+      }
+      if (!sessionPath && jsonlPaths.length > 0) {
+        logSessionDecision(
+          `pid=${proc.pid} missing sessionPath with jsonls=${jsonlPaths.length} `
+        );
+      }
     }
     codexContexts.push({
       proc,
@@ -1403,11 +1498,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       session,
       jsonlPaths,
       reuseBlocked,
+      pinnedPath,
     });
   }
 
   const tailTargets = new Set<string>();
-  const cachedTails = new Map<string, Awaited<ReturnType<typeof updateTail>>>();
   const tailOptionsByPath = new Map<string, { keepStale?: boolean }>();
   if (includeActivity) {
     if (dirtySessions) {
@@ -1419,18 +1514,25 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         }
       }
     }
+
     for (const ctx of codexContexts) {
-      const sessionPath = normalizeSessionPath(ctx.session?.path);
+      const sessionPath =
+        ctx.pinnedPath || normalizeSessionPath(ctx.session?.path);
       if (!sessionPath) continue;
-      tailTargets.add(sessionPath);
-      tailOptionsByPath.set(sessionPath, { keepStale: true });
-      if (ctx.jsonlPaths?.length) {
-        for (const jsonlPath of ctx.jsonlPaths) {
-          tailTargets.add(jsonlPath);
-          if (!tailOptionsByPath.has(jsonlPath)) {
-            tailOptionsByPath.set(jsonlPath, { keepStale: true });
-          }
-        }
+      const prevTail = getTailState(sessionPath);
+      const prevSummary = prevTail ? summarizeTail(prevTail) : undefined;
+      const isPinned = !!ctx.pinnedPath && ctx.pinnedPath === sessionPath;
+      const forceTail = isPinned && !!prevSummary?.inFlight;
+      const mtimeMs = ctx.session?.mtimeMs ?? jsonlMtimes.get(sessionPath);
+      const shouldTail =
+        forceTail ||
+        !prevTail ||
+        !!prevTail.needsCatchUp ||
+        (typeof mtimeMs === "number" &&
+          (typeof prevTail.lastMtimeMs !== "number" || mtimeMs > prevTail.lastMtimeMs));
+      if (shouldTail) {
+        tailTargets.add(sessionPath);
+        tailOptionsByPath.set(sessionPath, { keepStale: true });
       }
     }
   }
@@ -1444,11 +1546,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
           })
         )
       : [];
-  endProfile(tailsTimer, { updated: tailTargets.size, cached: cachedTails.size });
-  const tailsByPath = new Map<string, Awaited<ReturnType<typeof updateTail>>>([
-    ...cachedTails.entries(),
-    ...tailEntries,
-  ]);
+  endProfile(tailsTimer, { updated: tailTargets.size });
+  const tailsByPath = new Map<string, Awaited<ReturnType<typeof updateTail>>>(tailEntries);
+  for (const [sessionPath, tail] of tailsByPath) {
+    if (tail?.needsCatchUp) markSessionDirty(sessionPath);
+  }
   for (const ctx of codexContexts) {
     const { proc, cpu, mem, startMs, cmdRaw, cwdRaw, session, sessionId, reuseBlocked } = ctx;
     let doing: string | undefined;
@@ -1467,7 +1569,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       let bestScore = -1;
       let bestActivity = -1;
       for (const candidate of paths) {
-        const tail = includeActivity ? tailsByPath.get(candidate) : getTailState(candidate);
+        const tail = includeActivity ? tailsByPath.get(candidate) ?? getTailState(candidate) : getTailState(candidate);
         const summary = tail ? summarizeTail(tail) : undefined;
         const inFlightScore = summary?.inFlight ? 1 : 0;
         const activity = summary?.lastActivityAt ?? summary?.lastEventAt ?? 0;
@@ -1483,70 +1585,34 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       return normalizeSessionPath(fallback);
     };
     const sessionPath =
-      pickBestJsonl(ctx.jsonlPaths) || normalizeSessionPath(session?.path);
+      ctx.pinnedPath ||
+      normalizeSessionPath(session?.path) ||
+      pickBestJsonl(ctx.jsonlPaths);
     
-    // Get thread state from event store (webhook-based events)
-    let threadId: string | undefined;
-    let threadState = undefined;
-    if (sessionPath) {
-      const meta = await getSessionMeta(sessionPath);
-      threadId = meta?.id;
-      if (threadId) {
-        threadState = codexEventStore.getThreadState(threadId);
-      }
-    }
-    
-    // Event store provides authoritative inFlight + lastActivityAt if available
-    const eventInFlight = threadState?.inFlight ?? false;
-    const eventActivityAt = threadState?.lastActivityAt;
-
-    let tailInFlight = false;
-    let tailActivityAt: number | undefined;
     let tailEventAt: number | undefined;
-    let tailInFlightSignalAt: number | undefined;
-    let tailIngestAt: number | undefined;
-    let tailEndAt: number | undefined;
-    let tailReviewMode = false;
-    let tailOpenCallCount = 0;
+    let tailSummary: ReturnType<typeof summarizeTail> | undefined;
 
     if (sessionPath) {
-      const tail = includeActivity ? tailsByPath.get(sessionPath) : getTailState(sessionPath);
+      const tail = includeActivity
+        ? tailsByPath.get(sessionPath) ?? getTailState(sessionPath)
+        : getTailState(sessionPath);
       if (tail) {
-        const tailSummary = summarizeTail(tail);
+        tailSummary = summarizeTail(tail);
         doing = tailSummary.doing;
         events = tailSummary.events;
         model = tailSummary.model;
         hasError = tailSummary.hasError;
         title = normalizeTitle(tailSummary.title);
         summary = tailSummary.summary;
-        tailInFlight = !!tailSummary.inFlight;
-        tailActivityAt = tailSummary.lastActivityAt;
         tailEventAt = tailSummary.lastEventAt;
-        tailInFlightSignalAt = tailSummary.lastInFlightSignalAt;
-        tailIngestAt = tailSummary.lastIngestAt;
-        tailEndAt = tailSummary.lastEndAt;
-        tailReviewMode = !!tailSummary.reviewMode;
-        tailOpenCallCount = tailSummary.openCallCount ?? 0;
       }
     }
 
-    // Merge notify + JSONL tail events (no CPU/mtime heuristics)
-    const tailActivityAtCandidate =
-      typeof tailActivityAt === "number"
-        ? tailActivityAt
-        : typeof tailEventAt === "number"
-          ? tailEventAt
-          : undefined;
-    inFlight = eventInFlight || tailInFlight;
-    if (process.env.CODEX_TEST_HOOKS === "1") {
-      "TEST_HOOK_INFLIGHT_MERGE";
-    }
-    const mergedActivityAt = Math.max(
-      typeof eventActivityAt === "number" ? eventActivityAt : 0,
-      typeof tailActivityAtCandidate === "number" ? tailActivityAtCandidate : 0
-    );
-    lastActivityAt = mergedActivityAt > 0 ? mergedActivityAt : undefined;
-    lastEventAt = tailEventAt ?? eventActivityAt;
+    // JSONL tail is the single source of truth for in-flight/activity.
+    inFlight = !!tailSummary?.inFlight;
+    lastActivityAt = tailSummary?.lastActivityAt;
+    lastEventAt = tailEventAt;
+    const activityAt = lastActivityAt ?? lastEventAt;
 
     if (!doing) {
       doing =
@@ -1561,11 +1627,47 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
 
     const redactedSessionPath = sessionPath ? redactText(sessionPath) || sessionPath : undefined;
-    const sessionIdentity =
-      redactedSessionPath && !reuseBlocked
-        ? `codex:${redactedSessionPath}`
-        : `pid:${proc.pid}`;
+    // Use stable sessionId for identity to prevent flicker when pickBestJsonl changes the path
+    let sessionIdentity = `pid:${proc.pid}`;
+    if (!reuseBlocked) {
+      if (sessionId) {
+        sessionIdentity = `codex:${sessionId}`;
+      } else if (redactedSessionPath) {
+        sessionIdentity = `codex:${redactedSessionPath}`;
+      }
+    }
+    if (isDebugSession()) {
+      const prevIdentity = pidIdentityCache.get(proc.pid);
+      if (prevIdentity && prevIdentity !== sessionIdentity) {
+        logSessionDecision(
+          `pid=${proc.pid} identity ${prevIdentity} -> ${sessionIdentity} ` +
+            `reuseBlocked=${reuseBlocked ? 1 : 0} ` +
+            `sessionPath=${redactedSessionPath ? path.basename(redactedSessionPath) : "none"}`
+        );
+      }
+      if (
+        sessionIdentity.startsWith("pid:") &&
+        prevIdentity &&
+        !prevIdentity.startsWith("pid:")
+      ) {
+        logSessionDecision(
+          `pid=${proc.pid} identity downgrade to pid-only prev=${prevIdentity}`
+        );
+      }
+    }
+    pidIdentityCache.set(proc.pid, sessionIdentity);
     if (sessionPath) {
+      const prevPinned = pidSessionCache.get(proc.pid);
+      if (
+        prevPinned &&
+        prevPinned.path !== sessionPath &&
+        !isStartMsMismatch(prevPinned.startMs, startMs)
+      ) {
+        logActivityDecision(
+          `codex session switch pid=${proc.pid} ` +
+            `${path.basename(prevPinned.path)} -> ${path.basename(sessionPath)}`
+        );
+      }
       pidSessionCache.set(proc.pid, { path: sessionPath, lastSeenAt: now, startMs });
     }
     const id = `${proc.pid}`;
@@ -1574,62 +1676,34 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       activityCache.delete(id);
       cached = undefined;
     }
-    // Event-driven state only (notify + JSONL events)
-    const hasNotify = !!threadState;
-    const hasTailEvents =
-      typeof tailActivityAt === "number" ||
-      typeof tailEventAt === "number" ||
-      tailInFlight;
-    const activityAt = typeof lastActivityAt === "number" ? lastActivityAt : undefined;
+    // Event-driven state (JSONL tail only)
+    const hasTail = !!tailSummary;
     let state: AgentState;
     let reason: string;
-    if (!hasNotify && !hasTailEvents) {
+    const effectiveHoldMs = codexHoldMs;
+    const effectiveIdleMs = inFlight ? 0 : codexEventIdleMs;
+
+    if (!hasTail) {
       state = "idle";
-      reason = "no_hook";
+      reason = "no_session";
     } else {
-      const tailAllowsNotifyEnd = tailOpenCallCount === 0 && !tailReviewMode;
-      const notifyEndAt = !eventInFlight && eventActivityAt ? eventActivityAt : undefined;
-      const notifyEndIsFresh =
-        typeof notifyEndAt === "number" &&
-        (typeof tailActivityAtCandidate !== "number" || notifyEndAt >= tailActivityAtCandidate);
-      const notifyShouldEnd = shouldApplyCodexNotifyEnd({
-        tailAllowsNotifyEnd,
-        notifyEndIsFresh,
-        tailEndAt,
-        tailInFlight,
-      });
-      if (process.env.CODEX_TEST_HOOKS === "1") {
-        "TEST_HOOK_NOTIFY_END_APPLY";
-      }
-      if (notifyShouldEnd) {
-        inFlight = false;
-      }
-      const explicitEndAt = tailEndAt ?? (notifyShouldEnd ? notifyEndAt : undefined);
-      const effectiveHoldMs = explicitEndAt ? 0 : codexHoldMs;
-      const effectiveIdleMs = inFlight ? 0 : codexEventIdleMs;
       const eventState = deriveCodexEventState({
         inFlight,
-        lastActivityAt: activityAt,
+        lastActivityAt: lastActivityAt,
         hasError,
         now,
         holdMs: effectiveHoldMs,
         idleMs: effectiveIdleMs,
       });
       state = eventState.state;
-      if (!hasNotify) {
-        reason = eventState.reason?.startsWith("event_")
-          ? eventState.reason.replace("event_", "tail_")
-          : "tail";
-      } else {
-        reason = eventState.reason || "event";
+      reason = eventState.reason || "event";
+      if (
+        eventState.reason === "event_hold" &&
+        typeof lastActivityAt === "number" &&
+        codexHoldMs > 0
+      ) {
+        bumpNextTickAt(lastActivityAt + codexHoldMs);
       }
-    }
-    if (
-      reason === "event_hold" &&
-      typeof activityAt === "number" &&
-      codexHoldMs > 0
-    ) {
-      bumpNextTickAt(activityAt + codexHoldMs);
     }
     const prevState = cached?.lastState;
     if (prevState && prevState !== state) {
@@ -1638,8 +1712,8 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       logActivityDecision(
         `codex state ${prevState} -> ${state} pid=${proc.pid} reason=${reason} ` +
           `inFlight=${inFlight ? 1 : 0} ` +
-          `lastActivity=${activityAt ?? "?"} ` +
-          `eventStore=${hasNotify ? "yes" : "no"}`
+          `lastActivity=${lastActivityAt ?? "?"} ` +
+          `tail=${hasTail ? "yes" : "no"}`
       );
     }
     // Don't track CPU for Codex - we're event-driven now

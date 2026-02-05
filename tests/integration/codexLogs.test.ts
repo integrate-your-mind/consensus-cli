@@ -6,6 +6,10 @@ import path from "node:path";
 import { updateTail, summarizeTail, findSessionByCwd } from "../../src/codexLogs.ts";
 import { getSessionStartMsFromPath, pickSessionForProcess } from "../../src/codexLogs.ts";
 
+function makeSessionMeta(id: string, cwd: string, ts: number) {
+  return { type: "session_meta", ts, payload: { cwd, id } };
+}
+
 test("summarizes codex exec session logs", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
@@ -153,11 +157,16 @@ test("pickSessionForProcess uses session start over mtime", () => {
 test("treats user_message as in-flight activity", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
+  const now = Date.now();
 
   const lines = [
     {
+      ...makeSessionMeta(threadId, dir, now),
+    },
+    {
       type: "event_msg",
-      timestamp: "2026-01-29T20:00:00.000Z",
+      ts: now + 1,
       payload: { type: "user_message", role: "user", content: "Run tests" },
     },
   ];
@@ -215,9 +224,13 @@ test("marks prompts and assistant responses as activity", async () => {
 test("treats user-only prompts as in-flight activity", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
   const now = Date.now();
 
   const lines = [
+    {
+      ...makeSessionMeta(threadId, dir, now - 10),
+    },
     {
       type: "response_item",
       ts: now,
@@ -235,6 +248,10 @@ test("treats user-only prompts as in-flight activity", async () => {
         role: "user",
         content: [{ type: "input_text", text: "still waiting" }],
       },
+    },
+    {
+      type: "response.started",
+      ts: now + 2,
     },
   ];
 
@@ -255,28 +272,25 @@ test("treats user-only prompts as in-flight activity", async () => {
 test("session metadata does not start in-flight work", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
   const now = Date.now();
 
-  const lines = [
-    {
-      type: "session_meta",
-      ts: now,
-      payload: { cwd: "/tmp/project", id: "session-meta" },
-    },
-    {
-      type: "thread.started",
-      ts: now + 1,
-      item: { type: "prompt", input: "hello" },
-    },
-  ];
+  await fs.writeFile(file, `${JSON.stringify(makeSessionMeta(threadId, "/tmp/project", now))}\n`);
+  const first = await updateTail(file);
+  assert.ok(first);
+  const firstSummary = summarizeTail(first);
+  assert.equal(firstSummary.inFlight, undefined);
 
-  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
-
-  const state = await updateTail(file);
-  assert.ok(state);
-
-  const summary = summarizeTail(state);
-  assert.equal(summary.inFlight, undefined);
+  const started = {
+    type: "thread.started",
+    ts: now + 1,
+    item: { type: "prompt", input: "hello" },
+  };
+  await fs.appendFile(file, `${JSON.stringify(started)}\n`);
+  const second = await updateTail(file);
+  assert.ok(second);
+  const secondSummary = summarizeTail(second);
+  assert.equal(secondSummary.inFlight, true);
 
   await fs.rm(dir, { recursive: true, force: true });
 });
@@ -321,9 +335,13 @@ test("summarizes response_item payloads for tools and commands", async () => {
 test("marks response_item tool work as in-flight", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
   const now = Date.now();
 
   const lines = [
+    {
+      ...makeSessionMeta(threadId, dir, now - 10),
+    },
     {
       type: "response_item",
       ts: now,
@@ -359,9 +377,13 @@ test("marks response_item tool work as in-flight", async () => {
 test("assistant message does not end in-flight when no open calls", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
   const now = Date.now();
 
   const lines = [
+    {
+      ...makeSessionMeta(threadId, dir, now - 10),
+    },
     {
       type: "response_item",
       ts: now,
@@ -433,12 +455,20 @@ test("treats tool response items without names as activity", async () => {
 test("treats output response delta events as activity", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
 
   const now = Date.now();
   const lines = [
     {
-      type: "response.output_text.delta",
+      ...makeSessionMeta(threadId, dir, now - 10),
+    },
+    {
+      type: "response.started",
       ts: now,
+    },
+    {
+      type: "response.output_text.delta",
+      ts: now + 1,
       delta: { text: "hi" },
     },
   ];
@@ -483,9 +513,13 @@ test("ignores input_text delta events for in-flight/activity", async () => {
 test("treats turn.started as in-flight activity", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
   const now = Date.now();
 
   const lines = [
+    {
+      ...makeSessionMeta(threadId, dir, now - 10),
+    },
     {
       type: "turn.started",
       ts: now,
@@ -509,9 +543,13 @@ test("treats turn.started as in-flight activity", async () => {
 test("treats item.started as in-flight activity", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
   const now = Date.now();
 
   const lines = [
+    {
+      ...makeSessionMeta(threadId, dir, now - 10),
+    },
     {
       type: "item.started",
       ts: now,
@@ -571,11 +609,16 @@ test("treats reasoning payloads as activity without exposing content", async () 
 test("agent_message starts in-flight activity", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
+  const now = Date.now();
 
   const lines = [
     {
+      ...makeSessionMeta(threadId, dir, now - 10),
+    },
+    {
       type: "event_msg",
-      timestamp: 1,
+      ts: now,
       payload: {
         type: "agent_reasoning",
         text: "Working through the steps",
@@ -583,7 +626,7 @@ test("agent_message starts in-flight activity", async () => {
     },
     {
       type: "event_msg",
-      timestamp: 2,
+      ts: now + 1,
       payload: {
         type: "agent_message",
       },
@@ -631,25 +674,28 @@ test("treats event_msg text payloads as assistant messages", async () => {
 test("stays active with periodic signals and turns idle after explicit end", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const pulseEveryMs = 300;
+  const threadId = path.basename(dir);
+  const pulseEveryMs = 100;
   const pollEveryMs = 50;
-  const durationMs = 1500;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "200";
+  const durationMs = 600;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "250";
 
-  const first = {
-    type: "response.output_text.delta",
-    ts: Date.now(),
-    delta: { text: "hi" },
-  };
-  await fs.writeFile(file, `${JSON.stringify(first)}\n`);
+  const startedAt = Date.now();
+  const seed = [
+    makeSessionMeta(threadId, dir, startedAt - 10),
+    { type: "response.started", ts: startedAt },
+    { type: "response.output_text.delta", ts: startedAt + 1, delta: { text: "hi" } },
+  ];
+  await fs.writeFile(file, `${seed.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  const start = Date.now();
-  let nextPulse = start + pulseEveryMs;
-  while (Date.now() - start < durationMs) {
-    if (Date.now() >= nextPulse) {
+  const loopStart = Date.now();
+  let nextPulse = loopStart + pulseEveryMs;
+  while (Date.now() - loopStart < durationMs) {
+    const now = Date.now();
+    if (now >= nextPulse) {
       const line = {
         type: "response.output_text.delta",
-        ts: Date.now(),
+        ts: now,
         delta: { text: "tick" },
       };
       await fs.appendFile(file, `${JSON.stringify(line)}\n`);
@@ -672,7 +718,7 @@ test("stays active with periodic signals and turns idle after explicit end", asy
   const endSummary = summarizeTail(endState);
   assert.equal(endSummary.inFlight, true);
 
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  await new Promise((resolve) => setTimeout(resolve, 400));
   const finalState = await updateTail(file);
   assert.ok(finalState);
   const finalSummary = summarizeTail(finalState);
@@ -685,9 +731,13 @@ test("stays active with periodic signals and turns idle after explicit end", asy
 test("does not expire in-flight without explicit end", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
   const now = Date.now();
 
   const lines = [
+    {
+      ...makeSessionMeta(threadId, dir, now - 10),
+    },
     {
       type: "response_item",
       ts: now,
@@ -714,6 +764,87 @@ test("does not expire in-flight without explicit end", async () => {
   assert.equal(summaryAfter.inFlight, true);
 
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("open tool calls keep in-flight across timeouts until closed", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
+  const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  const originalFresh = process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
+  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+
+  try {
+    const now = Date.now();
+    const startLines = [
+      {
+        ...makeSessionMeta(threadId, dir, now - 10),
+      },
+      {
+        type: "response_item",
+        ts: now,
+        payload: { type: "function_call", name: "toolA", call_id: "call_a" },
+      },
+      {
+        type: "response_item",
+        ts: now + 1,
+        payload: { type: "function_call", name: "toolB", call_id: "call_b" },
+      },
+    ];
+    await fs.writeFile(file, `${startLines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+    const state = await updateTail(file);
+    assert.ok(state);
+    const summary = summarizeTail(state);
+    assert.equal(summary.inFlight, true);
+    assert.equal(summary.openCallCount, 2);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const stateAfter = await updateTail(file);
+    assert.ok(stateAfter);
+    const summaryAfter = summarizeTail(stateAfter);
+    assert.equal(summaryAfter.inFlight, true);
+    assert.equal(summaryAfter.openCallCount, 2);
+
+    const endLines = [
+      {
+        type: "response_item",
+        ts: Date.now(),
+        payload: { type: "tool_call_output", call_id: "call_a" },
+      },
+      {
+        type: "response_item",
+        ts: Date.now() + 1,
+        payload: { type: "tool_call_output", call_id: "call_b" },
+      },
+    ];
+    await fs.appendFile(file, `${endLines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+    const ingestState = await updateTail(file);
+    assert.ok(ingestState);
+    const ingestSummary = summarizeTail(ingestState);
+    assert.equal(ingestSummary.openCallCount, 0);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const stateFinal = await updateTail(file);
+    assert.ok(stateFinal);
+    const summaryFinal = summarizeTail(stateFinal);
+    assert.equal(summaryFinal.openCallCount, 0);
+    assert.equal(summaryFinal.inFlight, true);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    if (originalFresh === undefined) {
+      delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_FILE_FRESH_MS = originalFresh;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("parses trailing codex event without newline", async () => {
@@ -748,584 +879,621 @@ test("parses trailing codex event without newline", async () => {
 test("response.completed holds in-flight until timeout", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
-  Date.now = () => 1_000;
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  const originalGrace = process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
+  process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS = "1000";
 
-  const started = {
-    type: "response.started",
-    ts: 1,
-  };
-  await fs.writeFile(file, `${JSON.stringify(started)}\n`);
+  try {
+    const now = Date.now();
+    const lines = [
+      makeSessionMeta(threadId, dir, now - 10),
+      { type: "response.started", ts: now },
+      { type: "response.completed", ts: now + 1 },
+    ];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  const first = await updateTail(file);
-  assert.ok(first);
-  const firstSummary = summarizeTail(first);
-  assert.equal(firstSummary.inFlight, true);
+    const first = await updateTail(file);
+    assert.ok(first);
+    const firstSummary = summarizeTail(first);
+    assert.equal(firstSummary.inFlight, true);
 
-  const completed = {
-    type: "response.completed",
-    ts: 2,
-  };
-  await fs.appendFile(file, `${JSON.stringify(completed)}\n`);
-
-  Date.now = () => 1_500;
-  const second = await updateTail(file);
-  assert.ok(second);
-  const secondSummary = summarizeTail(second);
-  assert.equal(secondSummary.inFlight, true);
-
-  Date.now = () => 5_000;
-  const third = await updateTail(file);
-  assert.ok(third);
-  const thirdSummary = summarizeTail(third);
-  assert.equal(thirdSummary.inFlight, undefined);
-
-  const turnCompleted = {
-    type: "turn.completed",
-    ts: 3,
-  };
-  await fs.appendFile(file, `${JSON.stringify(turnCompleted)}\n`);
-  Date.now = () => 3_000;
-  const fourth = await updateTail(file);
-  assert.ok(fourth);
-  const fourthSummary = summarizeTail(fourth);
-  assert.equal(fourthSummary.inFlight, undefined);
-
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const later = await updateTail(file);
+    assert.ok(later);
+    const laterSummary = summarizeTail(later);
+    assert.equal(laterSummary.inFlight, undefined);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    if (originalGrace === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS = originalGrace;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("does not expire in-flight codex state without explicit end when disabled", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
   process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "0";
-  const lines = [
-    {
-      type: "response.started",
-      ts: 1,
-    },
-  ];
-  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 1_500;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  const summaryStart = summarizeTail(stateStart);
-  assert.equal(summaryStart.inFlight, true);
+  try {
+    const now = Date.now();
+    const lines = [
+      makeSessionMeta(threadId, dir, now - 10),
+      { type: "response.started", ts: now },
+    ];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 12_500;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
 
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("review mode keeps in-flight until exited", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
-  delete process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS;
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
 
-  const entered = {
-    type: "event_msg",
-    ts: 1,
-    payload: {
-      type: "entered_review_mode",
-      target: { type: "uncommittedChanges" },
-    },
-  };
-  await fs.writeFile(file, `${JSON.stringify(entered)}\n`);
+  try {
+    const now = Date.now();
+    const entered = {
+      type: "event_msg",
+      ts: now,
+      payload: {
+        type: "entered_review_mode",
+        target: { type: "uncommittedChanges" },
+      },
+    };
+    await fs.writeFile(
+      file,
+      `${JSON.stringify(makeSessionMeta(threadId, dir, now - 10))}\n${JSON.stringify(entered)}\n`
+    );
 
-  Date.now = () => 1_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  const summaryStart = summarizeTail(stateStart);
-  assert.equal(summaryStart.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
 
-  Date.now = () => 10_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, true);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
 
-  const exited = {
-    type: "event_msg",
-    ts: 11,
-    payload: {
-      type: "exited_review_mode",
-    },
-  };
-  await fs.appendFile(file, `${JSON.stringify(exited)}\n`);
+    const exited = {
+      type: "event_msg",
+      ts: Date.now(),
+      payload: {
+        type: "exited_review_mode",
+      },
+    };
+    await fs.appendFile(file, `${JSON.stringify(exited)}\n`);
 
-  Date.now = () => 11_000;
-  const stateExit = await updateTail(file);
-  assert.ok(stateExit);
-  const summaryExit = summarizeTail(stateExit);
-  assert.equal(summaryExit.inFlight, true);
+    const stateExit = await updateTail(file);
+    assert.ok(stateExit);
+    const summaryExit = summarizeTail(stateExit);
+    assert.equal(summaryExit.inFlight, true);
 
-  Date.now = () => 14_000;
-  const stateEnd = await updateTail(file);
-  assert.ok(stateEnd);
-  const summaryEnd = summarizeTail(stateEnd);
-  assert.equal(summaryEnd.inFlight, undefined);
-
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateEnd = await updateTail(file);
+    assert.ok(stateEnd);
+    const summaryEnd = summarizeTail(stateEnd);
+    assert.equal(summaryEnd.inFlight, undefined);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
-test("forces end after timeout when tool outputs never arrive", async () => {
+test("open tool calls keep in-flight across timeout after end marker", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  delete process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
 
-  const lines = [
-    { type: "response.started", ts: 1 },
-    { type: "response_item", ts: 2, payload: { type: "function_call", name: "tool", call_id: "call_1" } },
-    { type: "response.completed", ts: 3 },
-  ];
-  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+  try {
+    const now = Date.now();
+    const lines = [
+      makeSessionMeta(threadId, dir, now - 10),
+      { type: "response.started", ts: now },
+      { type: "response_item", ts: now + 1, payload: { type: "function_call", name: "tool", call_id: "call_1" } },
+      { type: "response.completed", ts: now + 2 },
+    ];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 2_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  const summaryStart = summarizeTail(stateStart);
-  assert.equal(summaryStart.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
+    assert.equal(summaryStart.openCallCount, 1);
 
-  Date.now = () => 6_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, undefined);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
+    assert.equal(summaryLater.openCallCount, 1);
 
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    const output = {
+      type: "response_item",
+      ts: Date.now(),
+      payload: { type: "function_call_output", call_id: "call_1" },
+    };
+    await fs.appendFile(file, `${JSON.stringify(output)}\n`);
+
+    const stateClosed = await updateTail(file);
+    assert.ok(stateClosed);
+    const summaryClosed = summarizeTail(stateClosed);
+    assert.equal(summaryClosed.openCallCount, 0);
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateEnd = await updateTail(file);
+    assert.ok(stateEnd);
+    const summaryEnd = summarizeTail(stateEnd);
+    assert.equal(summaryEnd.inFlight, undefined);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
-test("turnOpen expires after timeout without explicit end", async () => {
+test("turnOpen stays active without explicit end", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
 
-  const lines = [
-    { type: "turn.started", ts: 1 },
-    { type: "event_msg", ts: 2, payload: { type: "agent_message", message: "working" } },
-  ];
-  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+  try {
+    const now = Date.now();
+    const lines = [makeSessionMeta(threadId, dir, now - 10), { type: "turn.started", ts: now }];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 2_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  const summaryStart = summarizeTail(stateStart);
-  assert.equal(summaryStart.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
 
-  Date.now = () => 6_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, undefined);
-
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("open tool call keeps in-flight without new events", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "3000";
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
 
-  const start = {
-    type: "response_item",
-    ts: 1,
-    payload: {
-      type: "function_call",
-      name: "mcp__brv__brv-query",
-      call_id: "call_1",
-      arguments: "{}",
-    },
-  };
-  await fs.writeFile(file, `${JSON.stringify(start)}\n`);
+  try {
+    const now = Date.now();
+    const start = [
+      makeSessionMeta(threadId, dir, now - 10),
+      {
+        type: "response_item",
+        ts: now,
+        payload: {
+          type: "function_call",
+          name: "mcp__brv__brv-query",
+          call_id: "call_1",
+          arguments: "{}",
+        },
+      },
+    ];
+    await fs.writeFile(file, `${start.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 1_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  const summaryStart = summarizeTail(stateStart);
-  assert.equal(summaryStart.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
+    assert.equal(summaryStart.openCallCount, 1);
 
-  Date.now = () => 10_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, true);
-
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
+    assert.equal(summaryLater.openCallCount, 1);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
-test("tool call without call_id times out without open calls", async () => {
+test("tool call without call_id closes on tool output without call_id", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
 
-  const start = {
-    type: "response_item",
-    ts: 1,
-    payload: {
-      type: "function_call",
-      arguments: "{}",
-    },
-  };
-  await fs.writeFile(file, `${JSON.stringify(start)}\n`);
+  try {
+    const now = Date.now();
+    const start = [
+      makeSessionMeta(threadId, dir, now - 10),
+      { type: "response_item", ts: now, payload: { type: "function_call", arguments: "{}" } },
+    ];
+    await fs.writeFile(file, `${start.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 1_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  assert.equal(stateStart.openCallIds?.size ?? 0, 0);
-  const summaryStart = summarizeTail(stateStart);
-  assert.equal(summaryStart.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
+    assert.equal(summaryStart.openCallCount, 1);
 
-  Date.now = () => 5_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, undefined);
+    const output = { type: "response_item", ts: now + 1, payload: { type: "function_call_output" } };
+    await fs.appendFile(file, `${JSON.stringify(output)}\n`);
+    const stateClose = await updateTail(file);
+    assert.ok(stateClose);
+    const summaryClose = summarizeTail(stateClose);
+    assert.equal(summaryClose.openCallCount, 0);
 
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("pending end waits for tool output to finish", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
 
-  const lines = [
-    {
+  try {
+    const now = Date.now();
+    const lines = [
+      makeSessionMeta(threadId, dir, now - 10),
+      { type: "response_item", ts: now, payload: { type: "function_call", name: "tool", call_id: "call_1" } },
+      { type: "response.completed", ts: now + 1 },
+    ];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
+    assert.equal(summaryStart.openCallCount, 1);
+
+    const output = {
       type: "response_item",
-      ts: 1,
-      payload: { type: "function_call", name: "tool", call_id: "call_1" },
-    },
-    { type: "response.completed", ts: 2 },
-  ];
-  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+      ts: now + 2,
+      payload: { type: "function_call_output", call_id: "call_1" },
+    };
+    await fs.appendFile(file, `${JSON.stringify(output)}\n`);
 
-  Date.now = () => 2_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  assert.ok(stateStart.pendingEndAt);
-  assert.equal(stateStart.inFlight, true);
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
+    assert.equal(summaryLater.openCallCount, 0);
 
-  const output = {
-    type: "response_item",
-    ts: 3,
-    payload: { type: "function_call_output", call_id: "call_1" },
-  };
-  await fs.appendFile(file, `${JSON.stringify(output)}\n`);
-
-  Date.now = () => 3_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  assert.ok(stateLater.pendingEndAt);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, true);
-
-  Date.now = () => 6_000;
-  const stateEnd = await updateTail(file);
-  assert.ok(stateEnd);
-  assert.equal(stateEnd.pendingEndAt, undefined);
-  const summaryEnd = summarizeTail(stateEnd);
-  assert.equal(summaryEnd.inFlight, undefined);
-
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateEnd = await updateTail(file);
+    assert.ok(stateEnd);
+    const summaryEnd = summarizeTail(stateEnd);
+    assert.equal(summaryEnd.inFlight, undefined);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("pending end waits for item completion", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
 
-  const lines = [
-    {
-      type: "item.started",
-      ts: 1,
-      item: { id: "item_1", type: "command_execution" },
-    },
-    { type: "response.completed", ts: 2 },
-  ];
-  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+  try {
+    const now = Date.now();
+    const lines = [
+      makeSessionMeta(threadId, dir, now - 10),
+      { type: "item.started", ts: now, item: { id: "item_1", type: "command_execution" } },
+      { type: "response.completed", ts: now + 1 },
+    ];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 2_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  assert.equal(stateStart.openCallIds?.size ?? 0, 1);
-  assert.ok(stateStart.pendingEndAt);
-  assert.equal(stateStart.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
+    assert.equal(summaryStart.openCallCount, 1);
 
-  const output = {
-    type: "item.completed",
-    ts: 3,
-    item: { id: "item_1", type: "command_execution", status: "completed" },
-  };
-  await fs.appendFile(file, `${JSON.stringify(output)}\n`);
+    const output = {
+      type: "item.completed",
+      ts: now + 2,
+      item: { id: "item_1", type: "command_execution", status: "completed" },
+    };
+    await fs.appendFile(file, `${JSON.stringify(output)}\n`);
 
-  Date.now = () => 3_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  assert.ok(stateLater.pendingEndAt);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, true);
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
+    assert.equal(summaryLater.openCallCount, 0);
 
-  Date.now = () => 6_000;
-  const stateEnd = await updateTail(file);
-  assert.ok(stateEnd);
-  assert.equal(stateEnd.pendingEndAt, undefined);
-  const summaryEnd = summarizeTail(stateEnd);
-  assert.equal(summaryEnd.inFlight, undefined);
-
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateEnd = await updateTail(file);
+    assert.ok(stateEnd);
+    const summaryEnd = summarizeTail(stateEnd);
+    assert.equal(summaryEnd.inFlight, undefined);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("pending end waits for item completion without id", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
 
-  const lines = [
-    {
-      type: "item.started",
-      ts: 1,
-      item: { type: "command_execution" },
-    },
-    { type: "response.completed", ts: 2 },
-  ];
-  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+  try {
+    const now = Date.now();
+    const lines = [
+      makeSessionMeta(threadId, dir, now - 10),
+      { type: "item.started", ts: now, item: { type: "command_execution" } },
+      { type: "response.completed", ts: now + 1 },
+    ];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 2_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  assert.ok(stateStart.pendingEndAt);
-  assert.equal(stateStart.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
+    assert.equal(summaryStart.openCallCount, 1);
 
-  const output = {
-    type: "item.completed",
-    ts: 3,
-    item: { type: "command_execution", status: "completed" },
-  };
-  await fs.appendFile(file, `${JSON.stringify(output)}\n`);
+    const output = {
+      type: "item.completed",
+      ts: now + 2,
+      item: { type: "command_execution", status: "completed" },
+    };
+    await fs.appendFile(file, `${JSON.stringify(output)}\n`);
 
-  Date.now = () => 3_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  assert.ok(stateLater.pendingEndAt);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, true);
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
+    assert.equal(summaryLater.openCallCount, 0);
 
-  Date.now = () => 6_000;
-  const stateEnd = await updateTail(file);
-  assert.ok(stateEnd);
-  assert.equal(stateEnd.pendingEndAt, undefined);
-  const summaryEnd = summarizeTail(stateEnd);
-  assert.equal(summaryEnd.inFlight, undefined);
-
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateEnd = await updateTail(file);
+    assert.ok(stateEnd);
+    const summaryEnd = summarizeTail(stateEnd);
+    assert.equal(summaryEnd.inFlight, undefined);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("tool output without call_id does not retain open call", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
 
-  const lines = [
-    {
-      type: "response_item",
-      ts: 1,
-      payload: { type: "function_call", name: "tool", call_id: "call_1" },
-    },
-    { type: "response.completed", ts: 2 },
-    {
-      type: "response_item",
-      ts: 3,
-      payload: { type: "function_call_output" },
-    },
-  ];
-  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+  try {
+    const now = Date.now();
+    const lines = [
+      makeSessionMeta(threadId, dir, now - 10),
+      { type: "response_item", ts: now, payload: { type: "function_call", name: "tool", call_id: "call_1" } },
+      { type: "response.completed", ts: now + 1 },
+      { type: "response_item", ts: now + 2, payload: { type: "function_call_output" } },
+    ];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 3_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  assert.equal(stateStart.openCallIds?.size ?? 0, 1);
-  const summaryStart = summarizeTail(stateStart);
-  assert.equal(summaryStart.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
+    assert.equal(summaryStart.openCallCount, 0);
 
-  Date.now = () => 10_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  assert.equal(stateLater.openCallIds?.size ?? 0, 0);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, undefined);
-
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, undefined);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("keeps in-flight codex state within timeout window", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS;
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
-  const lines = [
-    {
-      type: "response.started",
-      ts: 1,
-    },
-  ];
-  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "200";
 
-  Date.now = () => 1_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  const summaryStart = summarizeTail(stateStart);
-  assert.equal(summaryStart.inFlight, true);
+  try {
+    const now = Date.now();
+    const lines = [makeSessionMeta(threadId, dir, now - 10), { type: "response.started", ts: now }];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 2_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
 
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("invalid in-flight timeout keeps in-flight within timeout window", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
   process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "not-a-number";
-  delete process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS;
-  process.env.CONSENSUS_CODEX_FILE_FRESH_MS = "0";
-  const lines = [
-    {
-      type: "response.started",
-      ts: 1,
-    },
-  ];
-  await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 1_000;
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  const summaryStart = summarizeTail(stateStart);
-  assert.equal(summaryStart.inFlight, true);
+  try {
+    const now = Date.now();
+    const lines = [makeSessionMeta(threadId, dir, now - 10), { type: "response.started", ts: now }];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 2_000;
-  const stateLater = await updateTail(file);
-  assert.ok(stateLater);
-  const summaryLater = summarizeTail(stateLater);
-  assert.equal(summaryLater.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
 
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  delete process.env.CONSENSUS_CODEX_FILE_FRESH_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const stateLater = await updateTail(file);
+    assert.ok(stateLater);
+    const summaryLater = summarizeTail(stateLater);
+    assert.equal(summaryLater.inFlight, true);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("turn.completed clears in-flight after response completion", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
-  const originalNow = Date.now;
-  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "2500";
-  Date.now = () => 1_000;
+  const threadId = path.basename(dir);
+  const originalTimeout = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+  const originalGrace = process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = "50";
+  process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS = "1000";
 
-  const start = [
-    {
-      type: "response.started",
-      ts: 1,
-    },
-  ];
-  await fs.writeFile(file, `${start.map((line) => JSON.stringify(line)).join("\n")}\n`);
+  try {
+    const now = Date.now();
+    const start = [makeSessionMeta(threadId, dir, now - 10), { type: "response.started", ts: now }];
+    await fs.writeFile(file, `${start.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  const stateStart = await updateTail(file);
-  assert.ok(stateStart);
-  const summaryStart = summarizeTail(stateStart);
-  assert.equal(summaryStart.inFlight, true);
+    const stateStart = await updateTail(file);
+    assert.ok(stateStart);
+    const summaryStart = summarizeTail(stateStart);
+    assert.equal(summaryStart.inFlight, true);
 
-  const end = [
-    {
-      type: "response.completed",
-      ts: 2,
-    },
-    {
-      type: "turn.completed",
-      ts: 3,
-    },
-  ];
-  await fs.appendFile(file, `${end.map((line) => JSON.stringify(line)).join("\n")}\n`);
+    const end = [
+      { type: "response.completed", ts: now + 1 },
+      { type: "turn.completed", ts: now + 2 },
+    ];
+    await fs.appendFile(file, `${end.map((line) => JSON.stringify(line)).join("\n")}\n`);
 
-  Date.now = () => 3_000;
-  const stateEnd = await updateTail(file);
-  assert.ok(stateEnd);
-  const summaryEnd = summarizeTail(stateEnd);
-  assert.equal(summaryEnd.inFlight, true);
+    const stateEnd = await updateTail(file);
+    assert.ok(stateEnd);
+    const summaryEnd = summarizeTail(stateEnd);
+    assert.equal(summaryEnd.inFlight, true);
 
-  Date.now = () => 6_000;
-  const stateFinal = await updateTail(file);
-  assert.ok(stateFinal);
-  const summaryFinal = summarizeTail(stateFinal);
-  assert.equal(summaryFinal.inFlight, undefined);
-
-  Date.now = originalNow;
-  delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  await fs.rm(dir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const stateFinal = await updateTail(file);
+    assert.ok(stateFinal);
+    const summaryFinal = summarizeTail(stateFinal);
+    assert.equal(summaryFinal.inFlight, undefined);
+  } finally {
+    if (originalTimeout === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS = originalTimeout;
+    }
+    if (originalGrace === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS = originalGrace;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("does not treat response.input_text.delta as in-flight activity", async () => {
@@ -1352,9 +1520,13 @@ test("does not treat response.input_text.delta as in-flight activity", async () 
 test("assistant message does not clear in-flight state", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consensus-"));
   const file = path.join(dir, "session.jsonl");
+  const threadId = path.basename(dir);
   const now = Date.now();
 
   const lines = [
+    {
+      ...makeSessionMeta(threadId, dir, now - 10),
+    },
     {
       type: "response.started",
       ts: now,

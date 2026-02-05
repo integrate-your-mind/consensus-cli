@@ -80,49 +80,65 @@ export async function setupCodexHook(): Promise<HookSetupResult> {
   // Generate notify script path (compiled JS in dist)
   const notifyScript = path.resolve(__dirname, "..", "codexNotify.js");
   
-  const notifyLine = `notify = ["node", "${notifyScript}", "http://127.0.0.1:${consensusPort}/api/codex-event"]`;
+  const notifyLine = `notify = ["node", "${notifyScript}", "http://127.0.0.1:${consensusPort}/api/codex-event"] # consensus-cli`;
   const notificationsLine =
-    'notifications = ["thread.started", "turn.started", "agent-turn-complete", "item.started", "item.completed"]';
+    'notifications = ["agent-turn-complete", "approval-requested"] # consensus-cli';
 
-  // Remove old consensus notify lines
-  const filtered = existingContent
-    .split("\n")
-    .filter((line) => {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("notify =")) return true;
-      if (trimmed.includes("/api/codex-event")) return false;
-      return true;
-    });
+  const rawLines = existingContent.split(/\r?\n/);
+  const filtered: string[] = [];
+  for (let i = 0; i < rawLines.length; i += 1) {
+    const line = rawLines[i];
+    const trimmed = line.trim();
+    const nextTrimmed = rawLines[i + 1]?.trim() ?? "";
+    const isConsensusComment =
+      trimmed.startsWith("#") && trimmed.includes("Added by consensus-cli");
+    const isNotifyLine = trimmed.startsWith("notify =") && trimmed.includes("/api/codex-event");
+    if (isNotifyLine) continue;
+    if (isConsensusComment && nextTrimmed.startsWith("notify =") && nextTrimmed.includes("/api/codex-event")) {
+      continue;
+    }
+    filtered.push(line);
+  }
 
-  const hasTuiSection = filtered.some((line) => line.trim() === "[tui]");
+  const hasNotifyHook = filtered.some((line) => {
+    const trimmed = line.trim();
+    return trimmed.startsWith("notify =") && trimmed.includes("/api/codex-event");
+  });
 
-  const withoutNotifications = filtered.filter(
-    (line) => !line.trim().startsWith("notifications =")
-  );
-  const lines: string[] = withoutNotifications.filter((line) => line.trim() !== "");
-  lines.push("");
-  lines.push("# Added by consensus-cli");
-  lines.push(notifyLine);
-  if (!hasTuiSection) {
+  const lines = [...filtered];
+  if (!hasNotifyHook) {
+    if (lines.length && lines[lines.length - 1].trim() !== "") lines.push("");
+    lines.push("# Added by consensus-cli");
+    lines.push(notifyLine);
+  }
+
+  const tuiIndex = lines.findIndex((line) => line.trim() === "[tui]");
+  if (tuiIndex === -1) {
     lines.push("");
     lines.push("[tui]");
     lines.push(notificationsLine);
   } else {
-    const tuiIndex = lines.findIndex((line) => line.trim() === "[tui]");
-    const insertAt = (() => {
-      if (tuiIndex === -1) return lines.length;
+    const sectionEnd = (() => {
       for (let i = tuiIndex + 1; i < lines.length; i += 1) {
         const trimmed = lines[i].trim();
-        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-          return i;
-        }
+        if (trimmed.startsWith("[") && trimmed.endsWith("]")) return i;
       }
       return lines.length;
     })();
-    lines.splice(insertAt, 0, notificationsLine);
+    const notificationsIndex = (() => {
+      for (let i = tuiIndex + 1; i < sectionEnd; i += 1) {
+        if (lines[i].trim().startsWith("notifications =")) return i;
+      }
+      return -1;
+    })();
+    if (notificationsIndex === -1) {
+      lines.splice(sectionEnd, 0, notificationsLine);
+    } else if (lines[notificationsIndex].includes("consensus-cli")) {
+      lines[notificationsIndex] = notificationsLine;
+    }
   }
 
-  const newContent = lines.join("\n") + "\n";
+  const newContent = lines.join("\n").replace(/\n*$/, "\n");
   
   // Write config
   await fs.writeFile(configPath, newContent, "utf-8");

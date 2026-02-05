@@ -199,6 +199,30 @@ SAFE ALTERNATIVE: Provide a legal, safe approach to the same goal.
 
 ## Verification
 - Default: `npm run build` for type-checking.
+- After any changes, run `npm test` and `npm run build`.
+
+## Completion protocol (non-negotiable)
+- Gate order: 1) Build gate, 2) Evidence gate, 3) Regression gate.
+- Build gate: `npm run build` and `npm test` must pass with zero failures, and report the actual summary output.
+- Evidence gate: Every state-change fix must include a reproduction artifact.
+- Flicker fixes require a poller log (JSONL) showing zero `active->idle->active` transitions within the hold window during a live agent run.
+- State logic fixes require a before/after snapshot diff showing the incorrect state and the corrected state.
+- Event parsing fixes require a test case using real JSONL from a captured session, not synthetic data.
+- If an artifact cannot be produced, report the blocker and do not claim the fix works.
+- Regression gate: Confirm that no previously-passing test now fails and no unrelated behavior changed.
+- If unrelated files are modified, flag them explicitly and do not commit them.
+
+## Completion rules
+- `npm test` success must include the summary line, not a claim.
+- "Flicker count: 0" must include the log file path and polling parameters used.
+- If validation is blocked (hooks not firing, file missing, process not found), report it as a blocker.
+- Do not say "if you want, I can validate." Validate first and report results.
+- Do not ask for a next step after a fix. Run the evidence gate and report pass or fail.
+
+## Decision protocol
+- If project instructions or prior conversation already answered the question, do not ask again. Act.
+- If two options exist and one is clearly safer under the "if unsure, stay active" principle, take it and explain why.
+- If progress is genuinely blocked, state the specific blocker in one sentence and stop.
 
 ## Configuration
 - `CONSENSUS_HOST`, `CONSENSUS_PORT`, `CONSENSUS_POLL_MS`, `CONSENSUS_CODEX_HOME`, `CONSENSUS_PROCESS_MATCH`, `CONSENSUS_REDACT_PII`.

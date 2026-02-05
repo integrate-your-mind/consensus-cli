@@ -1,53 +1,58 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { shouldApplyCodexNotifyEnd } from "../../src/scan.ts";
+import { CodexLifecycleGraph } from "../../src/codex/lifecycleGraph.js";
 
-test("notify end does not override tail in-flight", () => {
-  const shouldEnd = shouldApplyCodexNotifyEnd({
-    tailAllowsNotifyEnd: true,
-    notifyEndIsFresh: true,
-    tailEndAt: undefined,
-    tailInFlight: true,
-  });
-  assert.equal(shouldEnd, false);
+test("lifecycle graph finalizes end after grace window", () => {
+  const previousGrace = process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS = "1000";
+  try {
+    const graph = new CodexLifecycleGraph();
+    const threadId = "thread-grace";
+
+    graph.ingestAgentStart(threadId, 1000, 1000);
+    graph.ingestNotifyEnd(threadId, 2000, 2000);
+
+    const pending = graph.getThreadSnapshot(threadId, 2500);
+    assert.equal(pending?.inFlight, true);
+    assert.equal(pending?.endedAt, undefined);
+
+    const ended = graph.getThreadSnapshot(threadId, 3100);
+    assert.equal(ended?.inFlight, false);
+    assert.equal(ended?.endedAt, 2000);
+  } finally {
+    if (previousGrace === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS = previousGrace;
+    }
+  }
 });
 
-test("notify end applies when tail is idle", () => {
-  const shouldEnd = shouldApplyCodexNotifyEnd({
-    tailAllowsNotifyEnd: true,
-    notifyEndIsFresh: true,
-    tailEndAt: undefined,
-    tailInFlight: false,
-  });
-  assert.equal(shouldEnd, true);
-});
+test("lifecycle graph does not finalize while tools are open", () => {
+  const previousGrace = process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS;
+  process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS = "0";
+  try {
+    const graph = new CodexLifecycleGraph();
+    const threadId = "thread-tools-open";
 
-test("notify end does not apply when tail has explicit end", () => {
-  const shouldEnd = shouldApplyCodexNotifyEnd({
-    tailAllowsNotifyEnd: true,
-    notifyEndIsFresh: true,
-    tailEndAt: Date.now(),
-    tailInFlight: false,
-  });
-  assert.equal(shouldEnd, false);
-});
+    graph.ingestToolStart(threadId, "call_1", 1000, 1000);
+    graph.ingestNotifyEnd(threadId, 2000, 2000);
+    const pendingWithTool = graph.getThreadSnapshot(threadId, 2000);
+    assert.equal(pendingWithTool?.openCallCount, 1);
+    assert.equal(pendingWithTool?.inFlight, true);
 
-test("notify end does not apply when tail disallows notify end", () => {
-  const shouldEnd = shouldApplyCodexNotifyEnd({
-    tailAllowsNotifyEnd: false,
-    notifyEndIsFresh: true,
-    tailEndAt: undefined,
-    tailInFlight: false,
-  });
-  assert.equal(shouldEnd, false);
-});
-
-test("notify end does not apply when notify end is not fresh", () => {
-  const shouldEnd = shouldApplyCodexNotifyEnd({
-    tailAllowsNotifyEnd: true,
-    notifyEndIsFresh: false,
-    tailEndAt: undefined,
-    tailInFlight: false,
-  });
-  assert.equal(shouldEnd, false);
+    graph.ingestToolEnd(threadId, "call_1", 2500, 2500);
+    // Simulate a later explicit turn end marker after tool output.
+    graph.ingestAgentStop(threadId, 2600, 2600);
+    const ended = graph.getThreadSnapshot(threadId, 2600);
+    assert.equal(ended?.openCallCount, 0);
+    assert.equal(ended?.inFlight, false);
+    assert.equal(ended?.endedAt, 2600);
+  } finally {
+    if (previousGrace === undefined) {
+      delete process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS;
+    } else {
+      process.env.CONSENSUS_CODEX_INFLIGHT_GRACE_MS = previousGrace;
+    }
+  }
 });
