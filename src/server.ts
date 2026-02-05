@@ -291,25 +291,50 @@ function runHttpEffect(
 }
 
 app.get("/api/snapshot", (req, res) => {
+  const mode =
+    typeof req.query.mode === "string"
+      ? req.query.mode
+      : Array.isArray(req.query.mode)
+        ? req.query.mode[0]
+        : undefined;
+  const wantsFull =
+    mode === "full" || req.query.full === "1" || req.query.full === "true";
+  const wantsRefresh =
+    req.query.refresh === "1" || req.query.refresh === "true";
+
+  if (wantsRefresh) {
+    requestTick(wantsFull ? "full" : "fast");
+  }
+
+  if (!wantsFull) {
+    res.setHeader("X-Consensus-Snapshot", "cached");
+    res.json(lastSnapshot);
+    return;
+  }
+
   const effect = Effect.tryPromise({
-    try: () => scanCodexProcesses({ mode: "full" }),
+    try: (signal) => scanCodexProcesses({ mode: "full", signal }),
     catch: (err) => err as Error,
-  }).pipe(
-    Effect.tap((snapshot) =>
-      Effect.sync(() => {
-        lastBaseSnapshot = snapshot;
-        lastSnapshot = applyTestOverrides(snapshot);
-        res.json(lastSnapshot);
-      })
-    ),
-    Effect.as(200),
-    Effect.tapError(() => recordError("http_snapshot")),
-    Effect.catchAll(() =>
-      Effect.sync(() => {
-        res.status(500).json({ error: "scan_failed" });
-      }).pipe(Effect.as(500))
-    )
-  );
+  })
+    .pipe(Effect.timeout(`${scanTimeoutMs} millis`))
+    .pipe(
+      Effect.tap((snapshot) =>
+        Effect.sync(() => {
+          lastBaseSnapshot = snapshot;
+          lastSnapshot = applyTestOverrides(snapshot);
+          res.setHeader("X-Consensus-Snapshot", "full");
+          res.json(lastSnapshot);
+        })
+      ),
+      Effect.as(200),
+      Effect.tapError(() => recordError("http_snapshot")),
+      Effect.catchAll(() =>
+        Effect.sync(() => {
+          res.setHeader("X-Consensus-Snapshot", "cached-fallback");
+          res.json(lastSnapshot);
+        }).pipe(Effect.as(200))
+      )
+    );
 
   runHttpEffect(req, res, "/api/snapshot", effect);
 });
@@ -856,8 +881,8 @@ function installCodexNotifyHook(): void {
 const runtime = runFork(
   Effect.scoped(
     Effect.gen(function* () {
-      // Note: Codex file watcher removed - using webhook-based events instead
-      // Legacy notify hook install kept for backward compatibility
+      // Legacy notify hook install kept for backward compatibility.
+      // Current Codex activity state comes from session JSONL tails; webhooks/watcher only trigger scans.
       yield* Effect.sync(() => installCodexNotifyHook());
       yield* Effect.acquireRelease(
         Effect.sync(() => startReloadWatcher()),

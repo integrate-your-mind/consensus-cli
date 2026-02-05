@@ -10,7 +10,7 @@ This document records how Consensus exposes HTTP/WS APIs today and how callers p
 ## Endpoint summary
 | Route | Method | Purpose | Authentication | Notes |
 |-------|--------|---------|----------------|-------|
-| `/api/snapshot` | `GET` | Returns the last snapshot emitted by the scan loop. The React-less canvas UI polls this endpoint to rebuild the agent map. | None | The handler runs `scanCodexProcesses` and pushes a JSON payload (ts + agents). |
+| `/api/snapshot` | `GET` | Returns the last snapshot emitted by the scan loop (cached). | None | Use `?mode=full` for a synchronous full scan (bounded by `CONSENSUS_SCAN_TIMEOUT_MS`). Use `?refresh=1` to request a scan tick without blocking the response. |
 | `/health` | `GET` | Basic JSON health check for monitoring. | None | Always responds `{ ok: true }`. |
 | `/api/codex-event` | `POST` | Codex notify hook triggers a fast scan. | None | Payload validated against `CodexEventSchema`; rejects with `400` on schema mismatch. Events are not merged into activity state. | 
 | `/api/claude-event` | `POST` | Claude Code hooks post lifecycle events. | None | Schema validated via `ClaudeEventSchema`; `dist/claudeHook.js` reads stdin and forwards to this endpoint. |
@@ -20,9 +20,9 @@ This document records how Consensus exposes HTTP/WS APIs today and how callers p
 The UI also opens a WebSocket (handled by `ws` in `src/server.ts`) but the WebSocket connection is only permitted from the same origin as the served static files.
 
 ## Client expectations
-- Codex notify hooks call `noun codex config set -g notify` with the Consensus endpoint (`/api/codex-event`) and expect no authentication steps beyond the default localhost requirement. Codex in-flight state is derived from session JSONL logs (e.g. `~/.codex/sessions/.../*.jsonl`); the webhook only triggers faster scans.
+- Codex notify hooks call `codex config set -g notify` with the Consensus endpoint (`/api/codex-event`) and expect no authentication steps beyond the default localhost requirement. Codex in-flight state is derived from session JSONL logs (e.g. `~/.codex/sessions/.../*.jsonl`); the webhook only triggers faster scans.
 - Claude Code hooks run `dist/claudeHook.js` which POSTs a minimal JSON event directly to `/api/claude-event` from the hook process; it neither signs the request nor retries if the hook fails.
-- The browser UI fetches `/api/snapshot` and opens the WebSocket without extra headers.
+- The browser UI connects over WebSocket for snapshots and deltas. `/api/snapshot` is primarily for polling tools and debugging.
 
 ## Hardening guidance
 1. Any time the server binds to a non-localhost address (custom `CONSENSUS_HOST`), add auth before enabling the port in `docs/constitution.md`'s sense. A simple opt-in token header (configured via an environment variable) or Mutual TLS would be appropriate.

@@ -182,8 +182,8 @@ export async function runSetup(): Promise<void> {
     console.log("");
   }
   
-  console.log("Consensus requires Codex's notify hook for accurate activity detection.");
-  console.log("Without it, session state will be unreliable or unavailable.");
+  console.log("Consensus can install Codex's notify hook to trigger faster UI updates.");
+  console.log("Activity state is still derived from Codex session JSONL logs.");
   console.log("");
   
   console.log("Installing Codex notify hook...");
