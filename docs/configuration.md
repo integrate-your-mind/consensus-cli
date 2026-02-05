@@ -9,9 +9,6 @@ All configuration is via environment variables.
 - `CONSENSUS_PORT`
   - Default: `8787`
   - Port for the HTTP server.
-- `CONSENSUS_UI_PORT`
-  - Default: `5173`
-  - Port for the Vite dev server when running `npm run dev`.
 - `CONSENSUS_POLL_MS`
   - Default: `250`
   - Poll interval for process presence scans.
@@ -56,6 +53,12 @@ All configuration is via environment variables.
   - Intended for wiring Codex TUI `notify` hook to consensus without manual setup.
   - Use `CONSENSUS_CODEX_NOTIFY_INSTALL_TIMEOUT_MS` to cap install time (default 5000).
   - Set to `0`, `false`, or `off` to disable the auto-install.
+- `CONSENSUS_CODEX_NOTIFY_INSTALL_TIMEOUT_MS`
+  - Default: `5000` (min `2000`)
+  - Timeout (ms) for the notify-hook auto-install attempt.
+- `CONSENSUS_CODEX_NOTIFY_DEBUG`
+  - Default: unset
+  - Set to `1` to append debug lines to `~/.consensus/codex-notify-debug.jsonl`.
 - `CONSENSUS_CODEX_WATCH_POLL`
   - Default: enabled
   - Set to `0` to disable polling for Codex JSONL watch events. Polling is the default because native FS events are unreliable for these files.
@@ -101,6 +104,15 @@ All configuration is via environment variables.
 - `CONSENSUS_PROCESS_MATCH`
   - Default: unset
   - Regex to match process name or command line.
+- `CONSENSUS_DEBUG_ACTIVITY`
+  - Default: unset
+  - Set to `1` to log scan decisions and activity transitions (debug only).
+- `CONSENSUS_DEBUG_SESSION`
+  - Default: unset
+  - Set to `1` to log Codex/OpenCode session selection decisions (debug only).
+- `CONSENSUS_DEBUG_DEDUPE`
+  - Default: unset
+  - Set to `1` to log agent de-duplication decisions (debug only).
 - `CONSENSUS_DEBUG_OPENCODE`
   - Default: unset
   - Set to `1` to log OpenCode server discovery (debug only).
@@ -110,9 +122,12 @@ All configuration is via environment variables.
 - `ACTIVITY_TEST_MODE`
   - Default: disabled
   - Set to `1` to enable test-only activity injection endpoints under `/__test`.
+- `CONSENSUS_CODEX_EVENT_IDLE_MS`
+  - Default: `20000`
+  - Codex event window (ms) before dropping to idle in the JSONL-tail scanner.
 - `CONSENSUS_CODEX_EVENT_ACTIVE_MS`
-  - Default: `30000`
-  - Codex event window before dropping to idle.
+  - Default: `30000` (typed config default; not used by the JSONL-tail scanner)
+  - Legacy Codex activity window (ms) for CPU/telemetry paths.
 - `CONSENSUS_CODEX_MTIME_ACTIVE_MS`
   - Default: `750`
   - Treat recent Codex JSONL file mtime as activity within this window (bridges log write lag).
@@ -120,8 +135,8 @@ All configuration is via environment variables.
   - Default: `2000`
   - Codex hold window after activity. Set to `0` to disable (immediate transitions may flicker).
 - `CONSENSUS_CODEX_INFLIGHT_GRACE_MS`
-  - Default: `750`
-  - Codex in-flight grace window after the last in-flight signal (prevents brief idle flicker).
+  - Default: `0`
+  - Grace window (ms) before finalizing an explicit end marker (lifecycle graph / notify path).
 - `CONSENSUS_CODEX_STRICT_INFLIGHT`
   - Default: disabled
   - Set to `1` to require explicit in-flight signals from logs (disables CPU/mtime bridging).
@@ -165,6 +180,9 @@ All configuration is via environment variables.
 - `CONSENSUS_CPU_ACTIVE`
   - Default: `1`
   - CPU threshold for marking an agent active.
+- `CONSENSUS_CODEX_CPU_ACTIVE`
+  - Default: `1` (fallback when `CONSENSUS_CPU_ACTIVE` is unset)
+  - Codex-specific CPU threshold for legacy CPU-based detection paths.
 - `CONSENSUS_CLAUDE_CPU_ACTIVE`
   - Default: `1`
   - Claude CPU threshold override.

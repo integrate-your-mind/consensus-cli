@@ -25,7 +25,7 @@ The UI also opens a WebSocket (handled by `ws` in `src/server.ts`) but the WebSo
 - The browser UI fetches `/api/snapshot` and opens the WebSocket without extra headers.
 
 ## Hardening guidance
-1. Any time the server binds to a non-localhost address (custom `CONSENSUS_HOST`), add auth before enabling the port in `docs/constitution.md`'s sense. A simple opt-in token header (e.g., `CONSENSUS_API_TOKEN`) or Mutual TLS would be appropriate.
+1. Any time the server binds to a non-localhost address (custom `CONSENSUS_HOST`), add auth before enabling the port in `docs/constitution.md`'s sense. A simple opt-in token header (configured via an environment variable) or Mutual TLS would be appropriate.
 2. When introducing authentication, keep the current schema validation for Codex/Claude events so that invalid or replayed payloads are rejected even before checking credentials.
 3. For debugging or automation endpoints (`/__debug/activity`, `/__dev/reload`), gate them behind the same token or a separate debug-only header to keep the trust boundary intact.
 4. Document the chosen auth pattern once implemented (update this file). If more than localhost access is required, pair it with firewall rules or SSH tunnels that still keep secrets off disk.
