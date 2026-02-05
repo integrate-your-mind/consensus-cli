@@ -13,7 +13,6 @@ import type {
   SnapshotPayload,
   WorkSummary,
 } from "./types.js";
-import { deriveCodexEventState } from "./codexState.js";
 import {
   listRecentSessions,
   findSessionById,
@@ -25,6 +24,11 @@ import {
   getTailState,
   getSessionStartMsFromPath,
 } from "./codexLogs.js";
+import {
+  deriveCodexSessionIdentity,
+  selectCodexSessionForProcess,
+  shouldDropPinnedSessionByMtime,
+} from "./codexSessionAssign.js";
 import { getOpenCodeSessions, getOpenCodeSessionActivity, type OpenCodeSessionResult } from "./opencodeApi.js";
 import { ensureOpenCodeServer } from "./opencodeServer.js";
 import {
@@ -1357,9 +1361,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       try {
         const stat = await fsp.stat(cachedEntry.path);
         if (
-          Number.isFinite(codexStaleFileMs) &&
-          codexStaleFileMs > 0 &&
-          now - stat.mtimeMs > codexStaleFileMs
+          shouldDropPinnedSessionByMtime({
+            now,
+            mtimeMs: stat.mtimeMs,
+            staleFileMs: codexStaleFileMs,
+          })
         ) {
           pidSessionCache.delete(proc.pid);
           cachedEntry = undefined;
@@ -1393,73 +1399,30 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const mappedSession = mappedJsonl
       ? { path: mappedJsonl, mtimeMs: jsonlMtimes.get(mappedJsonl) ?? now }
       : undefined;
-    const sessionFromId =
-      sessionId && sessions.find((item) => item.path.includes(sessionId));
+    const sessionFromId = sessionId
+      ? sessions.find((item) => item.path.includes(sessionId))
+      : undefined;
     const sessionFromFind = sessionId ? await findSessionById(codexHome, sessionId) : undefined;
-    const sessionFromMapped = mappedSession;
-    const sessionFromCwd = cwdSession;
-    const sessionFromCache = cachedSession;
-    let session =
-      sessionFromId ||
-      sessionFromFind ||
-      sessionFromMapped ||
-      sessionFromCwd ||
-      sessionFromCache;
-    let sessionSource: string =
-      (sessionFromId && "sessionId") ||
-      (sessionFromFind && "findSessionById") ||
-      (sessionFromMapped && "mapped") ||
-      (sessionFromCwd && "cwd") ||
-      (sessionFromCache && "cached") ||
-      "none";
-    const pinnedSession =
-      cachedSession && isCodexSessionPath(cachedSession.path)
-        ? cachedSession
-        : undefined;
-    if (pinnedSession) {
-      session = pinnedSession;
-      sessionSource = "pinned";
-    }
-    if (!pinnedSession && cwdSession && mappedSession) {
-      const mappedMtime = mappedSession.mtimeMs ?? 0;
-      const cwdMtime = cwdSession.mtimeMs ?? 0;
-      if (cwdMtime > mappedMtime + 1000) {
-        session = cwdSession;
-        sessionSource = "cwd-preferred";
-      }
-    }
-    const hasExplicitSession = !!sessionId || !!mappedJsonl || !!cwdSession;
-    const hasPinnedSession = !!pinnedSession;
-    const allowReuse = hasExplicitSession || /\bresume\b/i.test(cmdRaw);
-    const allowReusePinned = allowReuse || hasPinnedSession;
-    const initialSessionPath = normalizeSessionPath(session?.path);
-    let reuseBlocked = false;
-    if (
-      initialSessionPath &&
-      usedSessionPaths.has(initialSessionPath) &&
-      !allowReusePinned
-    ) {
-      const cwdSessionValue = cwdSession as SessionFile | undefined;
-      const alternatePath = normalizeSessionPath(cwdSessionValue?.path);
-      if (cwdSessionValue && alternatePath && alternatePath !== initialSessionPath) {
-        session = cwdSessionValue;
-        sessionSource = "cwd-alternate";
-      } else {
-        reuseBlocked = true;
-      }
-    }
-    if (!session) {
-      session = cwdSession;
-      reuseBlocked = false;
-      if (session) sessionSource = "cwd-fallback";
-    }
+    const selection = selectCodexSessionForProcess({
+      cmdRaw,
+      sessionId,
+      sessionFromId,
+      sessionFromFind,
+      mappedSession,
+      cwdSession,
+      cachedSession,
+      usedSessionPaths,
+    });
+    const session = selection.session as SessionFile | undefined;
+    const sessionSource = selection.source;
+    const reuseBlocked = selection.reuseBlocked;
     const sessionPath = normalizeSessionPath(session?.path);
     if (sessionPath) {
       usedSessionPaths.add(sessionPath);
     }
-    const pinnedPath = hasPinnedSession
-      ? normalizeSessionPath(cachedSession?.path)
-      : undefined;
+    const pinnedPath = selection.pinnedPath;
+    const hasExplicitSession = !!sessionId || !!mappedJsonl || !!cwdSession;
+    const hasPinnedSession = !!pinnedPath;
     if (isDebugSession()) {
       const cmdShort = shortenCmd(cmdRaw);
       const mappedLabel = mappedSession?.path ? path.basename(mappedSession.path) : "none";
@@ -1475,12 +1438,6 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
           `hasExplicit=${hasExplicitSession ? 1 : 0} hasPinned=${hasPinnedSession ? 1 : 0} ` +
           `pinned=${pinnedLabel} chosen=${chosenLabel} source=${sessionSource}`
       );
-      if (cachedSession && !pinnedSession) {
-        logSessionDecision(
-          `pid=${proc.pid} cachedSession ignored (non-session path) ` +
-            `cached=${cachedLabel}`
-        );
-      }
       if (!sessionPath && jsonlPaths.length > 0) {
         logSessionDecision(
           `pid=${proc.pid} missing sessionPath with jsonls=${jsonlPaths.length} `
@@ -1627,15 +1584,13 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     const repoName = repoRoot ? path.basename(repoRoot) : undefined;
 
     const redactedSessionPath = sessionPath ? redactText(sessionPath) || sessionPath : undefined;
-    // Use stable sessionId for identity to prevent flicker when pickBestJsonl changes the path
-    let sessionIdentity = `pid:${proc.pid}`;
-    if (!reuseBlocked) {
-      if (sessionId) {
-        sessionIdentity = `codex:${sessionId}`;
-      } else if (redactedSessionPath) {
-        sessionIdentity = `codex:${redactedSessionPath}`;
-      }
-    }
+    // Use stable sessionId/path for identity to prevent flicker when pickBestJsonl changes the path.
+    const sessionIdentity = deriveCodexSessionIdentity({
+      pid: proc.pid,
+      reuseBlocked: !!reuseBlocked,
+      sessionId,
+      sessionPath: redactedSessionPath,
+    });
     if (isDebugSession()) {
       const prevIdentity = pidIdentityCache.get(proc.pid);
       if (prevIdentity && prevIdentity !== sessionIdentity) {
@@ -1681,28 +1636,27 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     let state: AgentState;
     let reason: string;
     const effectiveHoldMs = codexHoldMs;
-    const effectiveIdleMs = inFlight ? 0 : codexEventIdleMs;
+    const effectiveEventWindowMs = codexEventIdleMs;
+    const previousActiveAt = cached?.lastActiveAt;
 
     if (!hasTail) {
       state = "idle";
       reason = "no_session";
     } else {
-      const eventState = deriveCodexEventState({
-        inFlight,
-        lastActivityAt: lastActivityAt,
+      const activity = deriveStateWithHold({
+        cpu: 0,
         hasError,
+        lastEventAt: activityAt,
+        inFlight,
+        previousActiveAt,
         now,
+        eventWindowMs: effectiveEventWindowMs,
         holdMs: effectiveHoldMs,
-        idleMs: effectiveIdleMs,
       });
-      state = eventState.state;
-      reason = eventState.reason || "event";
-      if (
-        eventState.reason === "event_hold" &&
-        typeof lastActivityAt === "number" &&
-        codexHoldMs > 0
-      ) {
-        bumpNextTickAt(lastActivityAt + codexHoldMs);
+      state = activity.state;
+      reason = activity.reason || "event";
+      if (activity.reason === "hold" && typeof activity.lastActiveAt === "number" && effectiveHoldMs > 0) {
+        bumpNextTickAt(activity.lastActiveAt + effectiveHoldMs);
       }
     }
     const prevState = cached?.lastState;
@@ -1718,7 +1672,12 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
     }
     // Don't track CPU for Codex - we're event-driven now
     activityCache.set(id, {
-      lastActiveAt: activityAt,
+      lastActiveAt:
+        state === "active"
+          ? now
+          : typeof previousActiveAt === "number"
+            ? previousActiveAt
+            : undefined,
       lastSeenAt: now,
       lastState: state,
       lastReason: reason,

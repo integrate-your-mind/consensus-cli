@@ -858,6 +858,19 @@ async function updateTailLegacy(
     const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
     if (state.pendingEndAt) {
       if (openCallCount > 0) return;
+      // Use event timestamps (not ingest time) so we don't cancel the end marker
+      // on the same tick it was observed.
+      const lastSignalAfterEnd =
+        state.lastToolSignalAt ?? state.lastActivityAt ?? state.lastEventAt;
+      // If anything new arrived after the end marker, cancel the pending end.
+      // This prevents active->idle->active flicker when tool output lands after response end.
+      if (
+        typeof lastSignalAfterEnd === "number" &&
+        lastSignalAfterEnd > state.pendingEndAt
+      ) {
+        clearEndMarkers();
+        return;
+      }
       const elapsed = nowMs - state.pendingEndAt;
       const forceEndMs = inflightTimeoutMs > 0 ? inflightTimeoutMs : defaultInflightTimeoutMs;
       if (elapsed >= forceEndMs) {
