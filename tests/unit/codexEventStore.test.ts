@@ -1,69 +1,90 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { CodexLifecycleGraph } from "../../src/codex/lifecycleGraph.js";
+import os from "node:os";
+import path from "node:path";
+import { mkdtemp, rm, writeFile, appendFile } from "node:fs/promises";
+import { updateTail, summarizeTail } from "../../src/codexLogs.ts";
 
-function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
-  const prior: Record<string, string | undefined> = {};
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const makeEvent = (event: Record<string, unknown>) => `${JSON.stringify(event)}\n`;
+
+async function setupSessionFile(): Promise<{
+  dir: string;
+  sessionPath: string;
+  cleanup: () => Promise<void>;
+}> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "consensus-codex-store-"));
+  const sessionPath = path.join(dir, "session.jsonl");
+  await writeFile(sessionPath, "", "utf8");
+  return {
+    dir,
+    sessionPath,
+    cleanup: async () => {
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+function withEnv(
+  vars: Record<string, string>,
+  fn: () => Promise<void> | void
+): Promise<void> {
+  const prev: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(vars)) {
-    prior[key] = process.env[key];
-    if (value === undefined) {
-      delete process.env[key];
-    } else {
-      process.env[key] = value;
-    }
+    prev[key] = process.env[key];
+    process.env[key] = value;
   }
-  try {
-    fn();
-  } finally {
-    for (const [key, value] of Object.entries(prior)) {
-      if (value === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = value;
-      }
+  const restore = () => {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
     }
+  };
+  try {
+    const result = fn();
+    if (result && typeof (result as Promise<void>).then === "function") {
+      return (result as Promise<void>).finally(restore);
+    }
+    restore();
+    return Promise.resolve();
+  } catch (err) {
+    restore();
+    return Promise.reject(err);
   }
 }
 
-test("lifecycle graph tracks open tool calls", () => {
-  const graph = new CodexLifecycleGraph();
-  const threadId = "thread-tools";
-
-  graph.ingestToolStart(threadId, "call_1", 1000, 1000);
-  let snap = graph.getThreadSnapshot(threadId, 1000);
-  assert.equal(snap?.openCallCount, 1);
-  assert.equal(snap?.inFlight, true);
-  assert.equal(snap?.reason, "tool_open");
-
-  graph.ingestToolEnd(threadId, "call_1", 1100, 1100);
-  snap = graph.getThreadSnapshot(threadId, 1100);
-  assert.equal(snap?.openCallCount, 0);
-  assert.equal(snap?.inFlight, true);
-  assert.equal(snap?.reason, "turn_open");
-});
-
-test("pending end finalizes only after grace and no open calls", () => {
-  withEnv(
+test("pending end expires when no new signals arrive (jsonl tail SSOT)", async () => {
+  await withEnv(
     {
-      CONSENSUS_CODEX_INFLIGHT_GRACE_MS: "1000",
-      CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS: "2500",
+      CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS: "60",
+      CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS: "0",
+      CONSENSUS_CODEX_FILE_FRESH_MS: "0",
+      CONSENSUS_CODEX_STALE_FILE_MS: "0",
     },
-    () => {
-      const graph = new CodexLifecycleGraph();
-      const threadId = "thread-pending-end";
+    async () => {
+      const { sessionPath, cleanup } = await setupSessionFile();
+      try {
+        const base = Date.now();
+        await appendFile(
+          sessionPath,
+          makeEvent({ type: "turn.started", ts: base }) +
+            makeEvent({ type: "turn.completed", ts: base + 1 }),
+          "utf8"
+        );
 
-      graph.ingestAgentStart(threadId, 1000, 1000);
-      graph.ingestAgentStop(threadId, 2000, 2000);
+        const first = await updateTail(sessionPath);
+        assert.ok(first);
+        assert.equal(typeof first.pendingEndAt, "number");
+        assert.equal(summarizeTail(first).inFlight, true);
 
-      const pending = graph.getThreadSnapshot(threadId, 2500);
-      assert.equal(pending?.inFlight, true);
-      assert.equal(pending?.reason, "pending_end");
-      assert.equal(pending?.endedAt, undefined);
-
-      const ended = graph.getThreadSnapshot(threadId, 3100);
-      assert.equal(ended?.inFlight, false);
-      assert.equal(ended?.reason, "ended");
-      assert.equal(ended?.endedAt, 2000);
+        await sleep(140);
+        const second = await updateTail(sessionPath);
+        assert.ok(second);
+        assert.equal(second.pendingEndAt, undefined);
+        assert.equal(summarizeTail(second).inFlight, undefined);
+      } finally {
+        await cleanup();
+      }
     }
   );
 });
