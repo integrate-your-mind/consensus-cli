@@ -71,11 +71,17 @@ const startedAt = Date.now();
 
 const server = http.createServer((req, res) => {
   const url = req.url || "/";
-  if (url === "/health") {
+  let pathname = url;
+  try {
+    pathname = new URL(url, "http://127.0.0.1").pathname;
+  } catch {
+    pathname = url.split("?")[0] || "/";
+  }
+  if (pathname === "/health") {
     json(res, 200, { ok: true });
     return;
   }
-  if (url === "/api/snapshot") {
+  if (pathname === "/api/snapshot") {
     const now = Date.now();
     json(res, 200, {
       ts: now,
@@ -93,4 +99,3 @@ server.listen(args.port, "127.0.0.1", () => {
     `mock-snapshot-server mode=${args.mode} listening http://127.0.0.1:${port}\n`
   );
 });
-
