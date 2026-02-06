@@ -318,3 +318,49 @@ test("pendingEnd clears when non-tool activity lands after pending end marker", 
     }
   );
 });
+
+test("token_count after assistant message does not cancel pending end", async () => {
+  await withEnv(
+    {
+      CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS: "80",
+      CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS: "0",
+      CONSENSUS_CODEX_FILE_FRESH_MS: "0",
+      CONSENSUS_CODEX_STALE_FILE_MS: "0",
+    },
+    async () => {
+      const { sessionPath, cleanup } = await setupSessionFile();
+      try {
+        const base = Date.now();
+        await appendFile(
+          sessionPath,
+          makeEvent({
+            type: "response_item",
+            ts: base,
+            payload: {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "done" }],
+            },
+          }) +
+            makeEvent({
+              type: "event_msg",
+              ts: base + 1,
+              payload: { type: "token_count", total: 123 },
+            }),
+          "utf8"
+        );
+
+        const first = await updateTail(sessionPath);
+        assert.ok(first);
+        assert.equal(typeof first.pendingEndAt, "number");
+
+        await sleep(120);
+        const second = await updateTail(sessionPath);
+        assert.ok(second);
+        assert.equal(summarizeTail(second).inFlight, undefined);
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+});

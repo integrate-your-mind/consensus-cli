@@ -862,15 +862,11 @@ async function updateTailLegacy(
       // on the same tick it was observed.
       const lastSignalAfterEnd = Math.max(
         typeof state.lastToolSignalAt === "number" ? state.lastToolSignalAt : 0,
-        typeof state.lastActivityAt === "number" ? state.lastActivityAt : 0,
-        typeof state.lastEventAt === "number" ? state.lastEventAt : 0
+        typeof state.lastActivityAt === "number" ? state.lastActivityAt : 0
       );
       // If anything new arrived after the end marker, cancel the pending end.
       // This prevents active->idle->active flicker when tool output lands after response end.
-      if (
-        typeof lastSignalAfterEnd === "number" &&
-        lastSignalAfterEnd > state.pendingEndAt
-      ) {
+      if (lastSignalAfterEnd > state.pendingEndAt) {
         clearEndMarkers();
         return;
       }
@@ -1219,7 +1215,6 @@ async function updateTailLegacy(
   if (payloadType === "token_count") {
     if (canSignal && (state.inFlight || state.turnOpen)) {
       markInFlightSignal();
-      state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
     }
   }
     if (type === "response_item") {
