@@ -108,6 +108,10 @@ test("live demo: 3 codex TUI sessions go idle -> active -> idle (30s capture)", 
 
     const demoStartedAt = Date.now();
 
+    // Filter the lane to only the demo Codex sessions, so OpenCode sessions in the
+    // developer environment do not interfere with the "empty -> 3 agents" capture.
+    await page.getByLabel("Search metadata").fill("consensus-tui-demo-");
+
     // Capture the "empty" state for a moment (requires CONSENSUS_PROCESS_MATCH to be set).
     await expect(page.locator("#active-list")).toBeVisible();
     await page.waitForFunction(() => {
