@@ -911,18 +911,19 @@ async function updateTailLegacy(
   };
 
   if (isStaleFile) {
-    if (state.inFlight) {
-      state.inFlight = false;
-      state.inFlightStart = false;
-      state.turnOpen = false;
-      state.reviewMode = false;
-      state.pendingEndAt = undefined;
-      state.lastEndAt = undefined;
-      state.lastToolSignalAt = undefined;
-      state.lastInFlightSignalAt = undefined;
-      if (state.openCallIds) state.openCallIds.clear();
-      state.openItemCount = 0;
-    }
+    // Clear all in-flight markers regardless of `state.inFlight`. These markers
+    // also contribute to `summarizeTail(...).inFlight`, so leaving them set can
+    // keep stale sessions ghost-active.
+    state.inFlight = false;
+    state.inFlightStart = false;
+    state.turnOpen = false;
+    state.reviewMode = false;
+    state.pendingEndAt = undefined;
+    state.lastEndAt = undefined;
+    state.lastToolSignalAt = undefined;
+    state.lastInFlightSignalAt = undefined;
+    if (state.openCallIds) state.openCallIds.clear();
+    state.openItemCount = 0;
     state.lastEventAt = undefined;
     state.lastActivityAt = undefined;
     state.lastIngestAt = undefined;

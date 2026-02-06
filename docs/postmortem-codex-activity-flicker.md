@@ -12,6 +12,14 @@ The primary root cause was inconsistent session log tailing caused by session fi
 
 Remediation standardized on a single source of truth (Codex session JSONL tails) for `inFlight` and `lastActivityAt`, added PID-to-session pinning with safe stale release, hardened grace/timeout behavior via tests, and added evidence tooling (flicker detector + video demo) to prevent regressions.
 
+## Timeline (Execution)
+
+- Symptom reproduced: active animation flickered off between tool calls during a single interactive Codex session.
+- Early iteration failure mode: multi-source merges (webhook + notify hook + JSONL) produced disagreement windows and flicker.
+- Stabilization changes landed: JSONL tail as SSOT, PID-to-session pinning, forced tail updates for pinned sessions, and stricter end-marker handling to avoid false idle transitions.
+- Validation added: a flicker poller (`scripts/flicker-detect.js`) plus env-gated Playwright demos that record a 30s video of interactive TUI sessions transitioning `idle -> active -> idle`.
+- Follow-up fix (review-driven): stale session cleanup now clears all end markers/open-call tracking even when `state.inFlight` is already false, preventing ghost in-flight state from lingering.
+
 ## Impact
 
 - UI: false negatives for "agent active" during long tool chains or during quiet gaps between tool events.
@@ -103,8 +111,16 @@ RUN_LIVE_CODEX=1 PW_VIDEO=1 CONSENSUS_PROCESS_MATCH=consensus-tui-demo- \
   npx playwright test e2e/ui/codexTuiLiveDemo.pw.ts
 ```
 
+### Example artifacts (local paths, gitignored)
+
+- Flicker summary:
+  - `tmp/flicker-summary.json`
+  - `tmp/flicker-summary.transitions.jsonl`
+- Demo video:
+  - Raw Playwright video under `test-results/**/video.webm`
+  - 30s share artifact under `tmp/` (example: `tmp/codexTuiLiveDemo-30s.mp4`)
+
 ## Follow-ups
 
 - Consider adding a CI lane that runs `scripts/flicker-detect.js` against mock mode (deterministic) to gate future flicker regressions.
 - Keep the "Completion protocol" in `AGENTS.md` enforced: evidence artifacts are required for state-change fixes.
-
