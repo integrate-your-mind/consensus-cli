@@ -54,6 +54,7 @@ import { getClaudeActivityByCwd, getClaudeActivityBySession } from "./services/c
 import { parseOpenCodeCommand, summarizeOpenCodeCommand } from "./opencodeCmd.js";
 import { redactText } from "./redact.js";
 import { dedupeAgents } from "./dedupe.js";
+import { resolveOpenCodeTimeoutMs, resolvePollMs } from "./config/intervals.js";
 import {
   recordActivityCount,
   recordActivityTransition,
@@ -784,7 +785,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       matchRe = undefined;
     }
   }
-  const pollMs = Math.max(250, Number(process.env.CONSENSUS_POLL_MS || 500));
+  const pollMs = resolvePollMs();
   const resolveMs = (value: string | undefined, fallback: number): number => {
     if (value === undefined) return fallback;
     const parsed = Number(value);
@@ -984,7 +985,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
   const codexHome = resolveCodexHome();
   const opencodeHost = process.env.CONSENSUS_OPENCODE_HOST || "127.0.0.1";
   const opencodePort = Number(process.env.CONSENSUS_OPENCODE_PORT || 4096);
-  const timeoutMs = Number(process.env.CONSENSUS_OPENCODE_TIMEOUT_MS || 1000);
+  const timeoutMs = resolveOpenCodeTimeoutMs();
   const opencodePollMs = Math.max(pollMs * 2, 2000);
   const shouldFetchOpenCode =
     !opencodeSessionCache || now - opencodeSessionCacheAt > opencodePollMs;

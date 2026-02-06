@@ -18,6 +18,7 @@ import { Schema, ParseResult } from "effect";
 import type { SnapshotPayload, AgentSnapshot, SnapshotMeta } from "./types.js";
 import { registerActivityTestRoutes } from "./server/activityTestRoutes.js";
 import { normalizeCodexNotifyInstall } from "./codexNotifyInstall.js";
+import { resolvePollMs } from "./config/intervals.js";
 import {
   annotateSpan,
   disposeObservability,
@@ -131,7 +132,7 @@ function sendDeltaEnvelope(socket: WebSocket, ops: DeltaOp[]): void {
 
 const port = Number(process.env.CONSENSUS_PORT || 8787);
 const host = process.env.CONSENSUS_HOST || "127.0.0.1";
-const pollMs = Math.max(50, Number(process.env.CONSENSUS_POLL_MS || 250));
+const pollMs = resolvePollMs();
 const scanTimeoutMs = Math.max(
   500,
   Number(process.env.CONSENSUS_SCAN_TIMEOUT_MS || 5000)
@@ -885,6 +886,10 @@ const runtime = runFork(
       // Current Codex activity state comes from session JSONL tails; webhooks/watcher only trigger scans.
       yield* Effect.sync(() => installCodexNotifyHook());
       yield* Effect.acquireRelease(
+        Effect.sync(() => startCodexWatcher()),
+        () => Effect.promise(() => Promise.resolve(stopCodexWatcher()))
+      );
+      yield* Effect.acquireRelease(
         Effect.sync(() => startReloadWatcher()),
         () => Effect.promise(() => Promise.resolve(stopReloadWatcher()))
       );
@@ -898,9 +903,7 @@ const runtime = runFork(
     }).pipe(
       Effect.catchAll((err) =>
         Effect.sync(() => {
-          process.stderr.write(
-            `[consensus] runtime error: ${String(err)}\n`
-          );
+          process.stderr.write(`[consensus] runtime error: ${String(err)}\n`);
         })
       )
     )
