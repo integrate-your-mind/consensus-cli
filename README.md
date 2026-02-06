@@ -70,7 +70,7 @@ consensus dev server running on http://127.0.0.1:8787
 ## Configuration
 - `CONSENSUS_HOST`: bind address (default `127.0.0.1`).
 - `CONSENSUS_PORT`: server port (default `8787`).
-- `CONSENSUS_POLL_MS`: process presence polling interval in ms (default `500`).
+- `CONSENSUS_POLL_MS`: process presence polling interval in ms (default `250`, min `50`).
 - `CONSENSUS_SCAN_TIMEOUT_MS`: scan timeout in ms (default `5000`).
 - `CONSENSUS_SCAN_STALL_MS`: scan stall warning threshold in ms (default `60%` of timeout, min `250`).
 - `CONSENSUS_SCAN_STALL_CHECK_MS`: scan stall check interval in ms (default `min(1000, stallMs)`, min `250`).
