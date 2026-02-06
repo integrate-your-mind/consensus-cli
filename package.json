@@ -35,9 +35,9 @@
     "scan": "node dist/scan.js",
     "tail": "node dist/tail.js",
     "test": "npm run test:unit && npm run test:integration",
-    "test:unit": "node --test --import tsx tests/unit/**/*.test.ts",
-    "test:integration": "node --test --import tsx tests/integration/**/*.test.ts",
-    "test:watch": "node --test --watch --import tsx tests/unit/**/*.test.ts tests/integration/**/*.test.ts",
+    "test:unit": "node scripts/run-node-tests.js tests/unit",
+    "test:integration": "node scripts/run-node-tests.js tests/integration",
+    "test:watch": "node scripts/run-node-tests.js --watch tests/unit tests/integration",
     "test:ui": "playwright test",
     "test:ui:watch": "playwright test --watch",
     "prepublishOnly": "npm run build"
