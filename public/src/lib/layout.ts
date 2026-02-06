@@ -9,9 +9,9 @@ const CELL_W = TILE_W;
 const CELL_H = TILE_H;
 const MAX_PULSE = 7;
 const MAX_LAYOUT_HEIGHT = 120 + MAX_PULSE;
-const CELL_OFFSET = 32768;
 
 type CellBucket = string | string[];
+export type CellKey = string;
 
 interface BoundsRect {
   left: number;
@@ -21,7 +21,7 @@ interface BoundsRect {
 }
 
 interface SpatialIndex {
-  cells: Map<number, CellBucket>;
+  cells: Map<CellKey, CellBucket>;
   bounds: Map<string, BoundsRect>;
 }
 
@@ -38,7 +38,7 @@ interface SpiralState {
 interface GroupState {
   anchor: Coordinate;
   spiral: SpiralState;
-  freeStack: number[];
+  freeStack: CellKey[];
 }
 
 export interface LayoutState {
@@ -95,26 +95,30 @@ function worldToCellY(y: number): number {
   return Math.floor(y / CELL_H);
 }
 
-function packCell(cx: number, cy: number): number {
-  const ux = (cx + CELL_OFFSET) & 0xffff;
-  const uy = (cy + CELL_OFFSET) & 0xffff;
-  return ((ux << 16) | uy) >>> 0;
+export function cellKey(cx: number, cy: number): CellKey {
+  // String keys avoid integer range wrapping/collisions as the layout grows.
+  return `${cx},${cy}`;
 }
 
-function unpackCell(key: number): { cx: number; cy: number } {
-  const ux = key >>> 16;
-  const uy = key & 0xffff;
-  return { cx: ux - CELL_OFFSET, cy: uy - CELL_OFFSET };
+export function unpackCell(key: CellKey): { cx: number; cy: number } {
+  const comma = key.indexOf(",");
+  if (comma === -1) return { cx: 0, cy: 0 };
+  const cx = Number.parseInt(key.slice(0, comma), 10);
+  const cy = Number.parseInt(key.slice(comma + 1), 10);
+  return {
+    cx: Number.isFinite(cx) ? cx : 0,
+    cy: Number.isFinite(cy) ? cy : 0,
+  };
 }
 
 function cellToWorld(cx: number, cy: number): Coordinate {
   return { x: cx * GRID_SCALE, y: cy * GRID_SCALE };
 }
 
-function gridKeyFromWorld(coord: Coordinate): number {
+function gridKeyFromWorld(coord: Coordinate): CellKey {
   const cx = Math.round(coord.x / GRID_SCALE);
   const cy = Math.round(coord.y / GRID_SCALE);
-  return packCell(cx, cy);
+  return cellKey(cx, cy);
 }
 
 function bucketAdd(bucket: CellBucket | undefined, id: string): CellBucket {
@@ -178,7 +182,7 @@ function indexAgent(id: string, coord: Coordinate, spatial: SpatialIndex): void 
   const range = cellRangeForBounds(bounds);
   for (let cx = range.minCx; cx <= range.maxCx; cx += 1) {
     for (let cy = range.minCy; cy <= range.maxCy; cy += 1) {
-      const key = packCell(cx, cy);
+      const key = cellKey(cx, cy);
       const bucket = spatial.cells.get(key);
       spatial.cells.set(key, bucketAdd(bucket, id));
     }
@@ -192,7 +196,7 @@ function unindexAgent(id: string, spatial: SpatialIndex): void {
   const range = cellRangeForBounds(bounds);
   for (let cx = range.minCx; cx <= range.maxCx; cx += 1) {
     for (let cy = range.minCy; cy <= range.maxCy; cy += 1) {
-      const key = packCell(cx, cy);
+      const key = cellKey(cx, cy);
       const bucket = spatial.cells.get(key);
       const next = bucketRemove(bucket, id);
       if (next === undefined) {
@@ -210,7 +214,7 @@ function hasCollision(bounds: BoundsRect, spatial: SpatialIndex): boolean {
   const range = cellRangeForBounds(bounds);
   for (let cx = range.minCx; cx <= range.maxCx; cx += 1) {
     for (let cy = range.minCy; cy <= range.maxCy; cy += 1) {
-      const key = packCell(cx, cy);
+      const key = cellKey(cx, cy);
       const bucket = spatial.cells.get(key);
       if (!bucket) continue;
       if (typeof bucket === 'string') {
