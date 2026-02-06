@@ -83,6 +83,44 @@ export async function setupCodexHook(): Promise<HookSetupResult> {
   const notifyLine = `notify = ["node", "${notifyScript}", "http://127.0.0.1:${consensusPort}/api/codex-event"] # consensus-cli`;
   const notificationsLine =
     'notifications = ["agent-turn-complete", "approval-requested"] # consensus-cli';
+  const requiredNotifications = ["agent-turn-complete", "approval-requested"];
+
+  function parseTomlStringArrayLine(line: string): string[] | null {
+    const beforeComment = line.split("#")[0] ?? "";
+    const match = beforeComment.match(/notifications\s*=\s*\[(.*)\]/);
+    if (!match) return null;
+    const inner = match[1]?.trim() ?? "";
+    if (!inner) return [];
+
+    // Parse quoted TOML strings. This intentionally ignores non-string entries.
+    const values: string[] = [];
+    const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(inner))) {
+      const raw = typeof m[1] === "string" ? m[1] : m[2];
+      values.push(raw.replace(/\\(["'\\])/g, "$1"));
+    }
+    if (values.length === 0) return null;
+    return values;
+  }
+
+  function mergeNotifications(existing: string[] | null): string {
+    const merged: string[] = [];
+    const seen = new Set<string>();
+    for (const value of existing ?? []) {
+      if (!seen.has(value)) {
+        seen.add(value);
+        merged.push(value);
+      }
+    }
+    for (const value of requiredNotifications) {
+      if (!seen.has(value)) {
+        seen.add(value);
+        merged.push(value);
+      }
+    }
+    return `notifications = [${merged.map((value) => JSON.stringify(value)).join(", ")}] # consensus-cli`;
+  }
 
   const rawLines = existingContent.split(/\r?\n/);
   const filtered: string[] = [];
@@ -133,8 +171,13 @@ export async function setupCodexHook(): Promise<HookSetupResult> {
     })();
     if (notificationsIndex === -1) {
       lines.splice(sectionEnd, 0, notificationsLine);
-    } else if (lines[notificationsIndex].includes("consensus-cli")) {
-      lines[notificationsIndex] = notificationsLine;
+    } else {
+      const parsed = parseTomlStringArrayLine(lines[notificationsIndex] ?? "");
+      if (parsed === null) {
+        lines[notificationsIndex] = mergeNotifications(null);
+      } else {
+        lines[notificationsIndex] = mergeNotifications(parsed);
+      }
     }
   }
 
