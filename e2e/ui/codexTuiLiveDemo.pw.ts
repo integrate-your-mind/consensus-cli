@@ -40,11 +40,6 @@ async function tmuxNewSession(session: string, command: string): Promise<void> {
   ]);
 }
 
-async function tmuxSend(session: string, text: string): Promise<void> {
-  // `send-keys` with Enter at end to submit the prompt.
-  await execFileAsync("tmux", ["send-keys", "-t", session, text, "Enter"]);
-}
-
 async function tmuxKill(session: string): Promise<void> {
   try {
     await execFileAsync("tmux", ["kill-session", "-t", session]);
@@ -57,12 +52,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function codexCommand(cwd: string): string {
+function codexCommand(cwd: string, prompt?: string): string {
   const bin = process.env.CODEX_BIN || "codex";
-  // Include `-C <cwd>` so CONSENSUS_PROCESS_MATCH can target these processes deterministically.
-  return `${bin} --dangerously-bypass-approvals-and-sandbox -C ${JSON.stringify(
-    cwd
-  )}`;
+  const parts = [
+    bin,
+    "--dangerously-bypass-approvals-and-sandbox",
+    // Include `-C <cwd>` so CONSENSUS_PROCESS_MATCH can target these processes deterministically.
+    "-C",
+    JSON.stringify(cwd),
+  ];
+  if (prompt) parts.push(JSON.stringify(prompt));
+  return parts.join(" ");
 }
 
 test("live demo: 3 codex TUI sessions go idle -> active -> idle (30s capture)", async ({ page }, testInfo) => {
@@ -106,14 +106,36 @@ test("live demo: 3 codex TUI sessions go idle -> active -> idle (30s capture)", 
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    // Capture the "empty" state for a moment.
-    await expect(page.locator("#active-list")).toBeVisible();
-    await sleep(1500);
+    const demoStartedAt = Date.now();
 
-    // Start three interactive Codex TUI sessions.
-    await tmuxNewSession(sessions.a, codexCommand(dirs.a));
-    await tmuxNewSession(sessions.b, codexCommand(dirs.b));
-    await tmuxNewSession(sessions.c, codexCommand(dirs.c));
+    // Capture the "empty" state for a moment (requires CONSENSUS_PROCESS_MATCH to be set).
+    await expect(page.locator("#active-list")).toBeVisible();
+    await page.waitForFunction(() => {
+      return document.querySelectorAll("#active-list .lane-item").length === 0;
+    }, undefined, { timeout: 15_000 });
+    await sleep(2000);
+
+    const promptA = [
+      "Run bash: sleep 2.",
+      "Then run bash: ls.",
+      'Then reply with exactly: "A done".',
+    ].join(" ");
+    const promptB = [
+      "Run bash: sleep 3.",
+      'Then run bash: echo "search 1 completed".',
+      'Then reply with exactly: "B done".',
+    ].join(" ");
+    const promptC = [
+      "Run bash: sleep 4.",
+      "Then run bash: pwd.",
+      'Then reply with exactly: "C done".',
+    ].join(" ");
+
+    // Start three interactive Codex TUI sessions with an initial prompt.
+    // This avoids relying on UI keybindings for "submit" in the TUI.
+    await tmuxNewSession(sessions.a, codexCommand(dirs.a, promptA));
+    await tmuxNewSession(sessions.b, codexCommand(dirs.b, promptB));
+    await tmuxNewSession(sessions.c, codexCommand(dirs.c, promptC));
 
     // Wait for agents to appear in the UI list (server side polling is 250ms).
     // Note: if OpenCode is enabled, this list may contain non-Codex sessions too.
@@ -121,39 +143,35 @@ test("live demo: 3 codex TUI sessions go idle -> active -> idle (30s capture)", 
       return document.querySelectorAll("#active-list .lane-item").length >= 3;
     }, undefined, { timeout: 30_000 });
 
-    // Give the TUIs a moment to settle before firing prompts.
-    await sleep(2000);
+    // Ensure each session becomes active at least once.
+    await page.evaluate(() => {
+      (window as any).__consensusBusySeen = new Set<number>();
+    });
+    await page.waitForFunction(() => {
+      const seen = (window as any).__consensusBusySeen as Set<number> | undefined;
+      if (!seen) return false;
+      const items = Array.from(document.querySelectorAll("#active-list .lane-item"));
+      for (let i = 0; i < items.length; i += 1) {
+        if (items[i]?.getAttribute("aria-busy") === "true") seen.add(i);
+      }
+      return seen.size >= 3;
+    }, undefined, { timeout: 90_000, polling: 500 });
 
-    // Trigger staggered tool-heavy work. `sleep` keeps a tool open long enough to visualize.
-    await tmuxSend(
-      sessions.a,
-      [
-        "Run bash: sleep 2.",
-        "Then run bash: ls.",
-        'Then reply with exactly: "A done".',
-      ].join(" ")
-    );
-    await sleep(600);
-    await tmuxSend(
-      sessions.b,
-      [
-        "Run bash: sleep 3.",
-        'Then run bash: echo "search 1 completed".',
-        'Then reply with exactly: "B done".',
-      ].join(" ")
-    );
-    await sleep(600);
-    await tmuxSend(
-      sessions.c,
-      [
-        "Run bash: sleep 4.",
-        "Then run bash: pwd.",
-        'Then reply with exactly: "C done".',
-      ].join(" ")
-    );
+    // Ensure sessions return to idle within the capture window.
+    await page.waitForFunction(() => {
+      return (
+        document.querySelectorAll('#active-list .lane-item[aria-busy="true"]')
+          .length === 0
+      );
+    }, undefined, { timeout: 120_000 });
 
-    // Let the scan loop observe activity and then settle back to idle.
-    await sleep(30_000);
+    // Keep the capture running long enough to visually confirm idle state.
+    await sleep(10_000);
+
+    const elapsed = Date.now() - demoStartedAt;
+    if (elapsed < 30_000) {
+      await sleep(30_000 - elapsed);
+    }
   } finally {
     await tmuxKill(sessions.a);
     await tmuxKill(sessions.b);

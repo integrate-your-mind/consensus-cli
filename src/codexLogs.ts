@@ -860,8 +860,11 @@ async function updateTailLegacy(
       if (openCallCount > 0) return;
       // Use event timestamps (not ingest time) so we don't cancel the end marker
       // on the same tick it was observed.
-      const lastSignalAfterEnd =
-        state.lastToolSignalAt ?? state.lastActivityAt ?? state.lastEventAt;
+      const lastSignalAfterEnd = Math.max(
+        typeof state.lastToolSignalAt === "number" ? state.lastToolSignalAt : 0,
+        typeof state.lastActivityAt === "number" ? state.lastActivityAt : 0,
+        typeof state.lastEventAt === "number" ? state.lastEventAt : 0
+      );
       // If anything new arrived after the end marker, cancel the pending end.
       // This prevents active->idle->active flicker when tool output lands after response end.
       if (
@@ -1290,6 +1293,12 @@ async function updateTailLegacy(
           if (canSignal && state.inFlight) {
             markInFlightSignal();
           }
+          // Codex TUI logs don't reliably emit turn/response completion events.
+          // Treat the assistant message as an "end marker" and finalize after a short timeout
+          // unless new activity lands after this point.
+          if (canSignal) {
+            deferEnd(ts);
+          }
         }
       }
       if (isAssistant && !isToolCall && payloadType !== "message") {
@@ -1339,6 +1348,9 @@ async function updateTailLegacy(
         state.inFlightStart = true;
       }
       markInFlightSignal();
+      // Same as the response_item assistant-message case above.
+      // For interactive TUI sessions, this provides a reliable end marker.
+      deferEnd(ts);
     }
   }
     if (itemTypeIsTurnAbort) {

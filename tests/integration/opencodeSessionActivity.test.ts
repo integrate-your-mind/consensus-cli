@@ -116,6 +116,46 @@ test("getOpenCodeSessionActivity treats pending tool as in-flight", async (t) =>
   }
 });
 
+test("getOpenCodeSessionActivity clears stale in-flight when pending tool has no part.time.start", async (t) => {
+  const previous = process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS;
+  process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS = "50";
+  const created = Date.now() - 10_000;
+
+  const started = await startServerOrSkip(t, (req, res) => {
+    if (req.url === "/session/s6/message") {
+      res.setHeader("Content-Type", "application/json");
+      res.end(
+        JSON.stringify([
+          {
+            info: { role: "assistant", time: { created, completed: created } },
+            parts: [{ type: "tool", state: { status: "running" } }],
+          },
+        ])
+      );
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  if (!started) {
+    process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS = previous;
+    return;
+  }
+  const { server, port } = started;
+
+  try {
+    const result = await getOpenCodeSessionActivity("s6", "127.0.0.1", port, {
+      timeoutMs: 2000,
+      silent: true,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.inFlight, false);
+  } finally {
+    process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS = previous;
+    await closeServer(server);
+  }
+});
+
 test("getOpenCodeSessionActivity treats recent user message as in-flight", async (t) => {
   const created = Date.now();
   const started = await startServerOrSkip(t, (req, res) => {

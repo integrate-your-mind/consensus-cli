@@ -223,3 +223,98 @@ test("turnOpen suppresses stale timeout until an explicit end marker arrives", a
   );
 });
 
+test("assistant message acts as an end marker for TUI sessions (no explicit completion events)", async () => {
+  await withEnv(
+    {
+      CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS: "80",
+      CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS: "0",
+      CONSENSUS_CODEX_FILE_FRESH_MS: "0",
+      CONSENSUS_CODEX_STALE_FILE_MS: "0",
+    },
+    async () => {
+      const { sessionPath, cleanup } = await setupSessionFile();
+      try {
+        const base = Date.now();
+        await appendFile(
+          sessionPath,
+          makeEvent({
+            type: "event_msg",
+            ts: base,
+            payload: { type: "agent_message", content: "done" },
+          }) +
+            makeEvent({
+              type: "response_item",
+              ts: base + 1,
+              payload: {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "done" }],
+              },
+            }),
+          "utf8"
+        );
+
+        const first = await updateTail(sessionPath);
+        assert.ok(first);
+        assert.equal(typeof first.pendingEndAt, "number");
+        assert.equal(summarizeTail(first).inFlight, true);
+
+        await sleep(120);
+        const second = await updateTail(sessionPath);
+        assert.ok(second);
+        assert.equal(second.pendingEndAt, undefined);
+        assert.equal(summarizeTail(second).inFlight, undefined);
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+});
+
+test("pendingEnd clears when non-tool activity lands after pending end marker", async () => {
+  await withEnv(
+    {
+      CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS: "200",
+      CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS: "0",
+      CONSENSUS_CODEX_FILE_FRESH_MS: "0",
+      CONSENSUS_CODEX_STALE_FILE_MS: "0",
+    },
+    async () => {
+      const { sessionPath, cleanup } = await setupSessionFile();
+      try {
+        const base = Date.now();
+        await appendFile(
+          sessionPath,
+          makeEvent({
+            type: "response_item",
+            ts: base,
+            payload: { type: "response.function_call_output", call_id: "call_1" },
+          }) +
+            makeEvent({ type: "response.completed", ts: base + 1 }),
+          "utf8"
+        );
+
+        const first = await updateTail(sessionPath);
+        assert.ok(first);
+        assert.equal(typeof first.pendingEndAt, "number");
+
+        await appendFile(
+          sessionPath,
+          makeEvent({
+            type: "event_msg",
+            ts: base + 2,
+            payload: { type: "agent_reasoning", content: "more work" },
+          }),
+          "utf8"
+        );
+
+        const second = await updateTail(sessionPath);
+        assert.ok(second);
+        assert.equal(second.pendingEndAt, undefined);
+        assert.equal(summarizeTail(second).inFlight, true);
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+});

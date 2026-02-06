@@ -409,11 +409,17 @@ export async function getOpenCodeSessionActivity(
     }
     
     if (inFlight && Number.isFinite(staleMs) && staleMs > 0) {
-      if (typeof inFlightSignalAt === "number") {
-        if (Date.now() - inFlightSignalAt > staleMs) {
+      const signalAt =
+        typeof inFlightSignalAt === "number"
+          ? inFlightSignalAt
+          : typeof latestActivityAt === "number"
+            ? latestActivityAt
+            : undefined;
+      if (typeof signalAt === "number") {
+        if (Date.now() - signalAt > staleMs) {
           inFlight = false;
         }
-      } else if (typeof latestActivityAt !== "number") {
+      } else {
         inFlight = false;
       }
     }
