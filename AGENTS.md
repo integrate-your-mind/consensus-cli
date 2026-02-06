@@ -199,7 +199,7 @@ SAFE ALTERNATIVE: Provide a legal, safe approach to the same goal.
 
 ## Verification
 - Default: `npm run build` for type-checking.
-- After any changes, run `npm test` and `npm run build`.
+- After any changes, run `npm run build` and `npm test`.
 
 ## Completion protocol (non-negotiable)
 - Gate order: 1) Build gate, 2) Evidence gate, 3) Regression gate.
@@ -211,6 +211,82 @@ SAFE ALTERNATIVE: Provide a legal, safe approach to the same goal.
 - If an artifact cannot be produced, report the blocker and do not claim the fix works.
 - Regression gate: Confirm that no previously-passing test now fails and no unrelated behavior changed.
 - If unrelated files are modified, flag them explicitly and do not commit them.
+
+## Feature verification workflow (step-by-step)
+This section applies to every feature and every behavior-changing bug fix.
+
+### 1) Define success criteria (before coding)
+1. Write down:
+   - What should change (user-visible behavior and/or API behavior).
+   - How to reproduce the old behavior.
+   - What artifact will prove the fix (log, snapshot diff, test, video).
+2. If the change is UI-visible, define what must be shown in the demo video:
+   - Start state
+   - Active state
+   - End state
+
+### 2) Tests-first (before implementation)
+1. Add or update tests that fail on the current behavior:
+   - Unit tests for pure state/logic.
+   - Integration tests for parsing (prefer real captured JSONL fixtures).
+   - E2E tests for UI invariants (fast, deterministic).
+2. Run:
+   - `npm run build`
+   - `npm test`
+3. Confirm the new/updated tests fail for the expected reason before implementing the fix.
+
+### 3) Implement the feature/fix
+1. Make the minimal code changes required to satisfy the tests and success criteria.
+2. Keep scope tight. If unrelated changes are discovered, isolate them or stop and report.
+
+### 4) Build gate (hard requirement)
+1. Run:
+   - `npm run build`
+   - `npm test`
+2. In the PR description or review comment, paste:
+   - The final `vite build` summary line (e.g. `✓ built in ...ms`).
+   - The final Node test summary lines (`# pass ... # fail 0`).
+
+### 5) Evidence gate (hard requirement)
+Produce artifacts that prove the change, not just that it compiles.
+
+#### 5a) Activity/flicker fixes (required when touching inFlight/lastActivity/session selection)
+1. Run the poller:
+   - `node scripts/flicker-detect.js --interval-ms 250 --duration-ms 120000 --window-ms 10000 --out tmp/flicker-summary.json`
+2. Required artifacts:
+   - `tmp/flicker-summary.json`
+   - `tmp/flicker-summary.transitions.jsonl` (written automatically, or via `--out-jsonl`)
+3. Required report fields:
+   - Polling parameters (interval, duration, window).
+   - `totalFlickerCount` from the JSON summary.
+   - File paths of the JSON and JSONL artifacts.
+
+#### 5b) Snapshot/state fixes (required when touching scan/tail logic)
+1. Capture a "before" and "after" snapshot (or a minimal diff) that shows the incorrect state and corrected state.
+2. Attach the diff as a PR comment or a file under `tmp/` (gitignored) and reference its path.
+
+### 6) Demo video gate (hard requirement for every feature PR)
+Every feature PR must include a 30-second demo video showing the feature working end-to-end.
+
+#### 6a) Deterministic UI demo (preferred default)
+1. Create or update an env-gated Playwright demo test under `e2e/ui/`:
+   - Example pattern: `e2e/ui/<feature>Demo.pw.ts`
+   - It must `test.skip` unless an explicit env var is set.
+2. Record video:
+   - `PW_VIDEO=1 RUN_CODEX_UI_DEMO=1 npx playwright test e2e/ui/codexActivityDemo.pw.ts`
+3. Locate the recorded `video.webm` under `test-results/` (gitignored).
+4. Trim/copy a 30-second share artifact into `tmp/` (gitignored). If `ffmpeg` is available:
+   - `ffmpeg -y -i <path/to/video.webm> -t 30 -c:v libx264 -pix_fmt yuv420p tmp/<feature>-demo-30s.mp4`
+5. Manually review the video and confirm it shows the intended start/active/end states with no regressions.
+
+#### 6b) Live Codex TUI demo (required for Codex activity work)
+1. Use the live demo harness:
+   - `PW_VIDEO=1 RUN_LIVE_CODEX=1 CONSENSUS_PROCESS_MATCH=consensus-tui-demo- CONSENSUS_OPENCODE_EVENTS=0 CONSENSUS_OPENCODE_AUTOSTART=0 npx playwright test e2e/ui/codexTuiLiveDemo.pw.ts`
+2. Produce a 30-second share artifact in `tmp/` (mp4 or webm) and review it.
+
+#### 6c) PR requirement
+1. Upload the video to the PR (GitHub comment attachment or equivalent).
+2. Also record the local path in the PR for traceability (e.g. `tmp/<feature>-demo-30s.mp4`).
 
 ## Completion rules
 - `npm test` success must include the summary line, not a claim.
@@ -228,7 +304,7 @@ SAFE ALTERNATIVE: Provide a legal, safe approach to the same goal.
 - `CONSENSUS_HOST`, `CONSENSUS_PORT`, `CONSENSUS_POLL_MS`, `CONSENSUS_CODEX_HOME`, `CONSENSUS_PROCESS_MATCH`, `CONSENSUS_REDACT_PII`.
 
 ## Do not
-- Add non-trivial tests unless explicitly requested.
+- Ship behavior changes without tests. Features and behavior-changing bug fixes must add or update tests.
 - Introduce large UI frameworks or build tooling.
 <!-- BEGIN BYTEROVER RULES -->
 
