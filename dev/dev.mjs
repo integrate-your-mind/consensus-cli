@@ -32,6 +32,15 @@ if (!fs.existsSync(vitePath)) {
 }
 
 const children = [];
+const OUTPUT_CAP = 32_768;
+
+const shutdown = (code = 0) => {
+  for (const child of children) {
+    if (child.killed) continue;
+    child.kill("SIGTERM");
+  }
+  process.exit(code);
+};
 
 const spawnChild = (label, args) => {
   const child = spawn(process.execPath, args, { stdio: "inherit" });
@@ -85,9 +94,12 @@ const startServer = async () => {
 
     let output = "";
     let running = false;
+    let settled = false;
     const onData = (chunk) => {
       const text = chunk.toString();
-      output += text;
+      if (!settled) {
+        output = (output + text).slice(-OUTPUT_CAP);
+      }
       process.stdout.write(text);
     };
     child.stdout?.on("data", onData);
@@ -101,7 +113,6 @@ const startServer = async () => {
     });
 
     const result = await new Promise((resolve) => {
-      let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -159,16 +170,18 @@ const startVite = async (serverPort) => {
     );
 
     let output = "";
+    let settled = false;
     const onData = (chunk) => {
       const text = chunk.toString();
-      output += text;
+      if (!settled) {
+        output = (output + text).slice(-OUTPUT_CAP);
+      }
       process.stdout.write(text);
     };
     child.stdout?.on("data", onData);
     child.stderr?.on("data", onData);
 
     const result = await new Promise((resolve) => {
-      let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -209,14 +222,6 @@ const main = async () => {
 };
 
 void main();
-
-const shutdown = (code = 0) => {
-  for (const child of children) {
-    if (child.killed) continue;
-    child.kill("SIGTERM");
-  }
-  process.exit(code);
-};
 
 tsc.on("exit", (code) => shutdown(code ?? 0));
 

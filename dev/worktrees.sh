@@ -180,7 +180,7 @@ gwt() {
 }
 
 gwe() {
-  local common main cur branch git_bin env_bin pwd_bin
+  local common main cur branch git_bin env_bin pwd_bin cwd
   common="$(_gwt_git_common_dir)" || {
     echo "gwe: not inside a git repository" >&2
     return 1
@@ -196,8 +196,9 @@ gwe() {
   pwd_bin="$(_gwt_pwd_bin)"
 
   main="$(cd "$common/.." && "$pwd_bin" -P)"
+  cwd="$("$pwd_bin" -P)"
   cur="$("$env_bin" -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
-    "$git_bin" -C "$main" rev-parse --show-toplevel 2>/dev/null)"
+    "$git_bin" -C "$cwd" rev-parse --show-toplevel 2>/dev/null)"
   if [ -z "$cur" ]; then
     return 1
   fi
