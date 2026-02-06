@@ -70,7 +70,7 @@ consensus dev server running on http://127.0.0.1:8787
 ## Configuration
 - `CONSENSUS_HOST`: bind address (default `127.0.0.1`).
 - `CONSENSUS_PORT`: server port (default `8787`).
-- `CONSENSUS_POLL_MS`: process presence polling interval in ms (default `500`).
+- `CONSENSUS_POLL_MS`: process presence polling interval in ms (default `250`, min `50`).
 - `CONSENSUS_SCAN_TIMEOUT_MS`: scan timeout in ms (default `5000`).
 - `CONSENSUS_SCAN_STALL_MS`: scan stall warning threshold in ms (default `60%` of timeout, min `250`).
 - `CONSENSUS_SCAN_STALL_CHECK_MS`: scan stall check interval in ms (default `min(1000, stallMs)`, min `250`).
@@ -85,18 +85,19 @@ consensus dev server running on http://127.0.0.1:8787
 - `CONSENSUS_OPENCODE_EVENT_ACTIVE_MS`: OpenCode active window after last event in ms (default `0`).
 - `CONSENSUS_OPENCODE_ACTIVE_HOLD_MS`: OpenCode hold window in ms (default `3000`).
 - `CONSENSUS_OPENCODE_INFLIGHT_IDLE_MS`: OpenCode in-flight idle timeout in ms (defaults to `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`).
-- `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`: OpenCode hard in-flight timeout in ms (default `15000`).
+- `CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS`: OpenCode hard in-flight timeout in ms (default `2500`).
+- `CONSENSUS_OPENCODE_INFLIGHT_STALE_MS`: OpenCode stale in-flight cutoff in ms (default `0`).
 - `CONSENSUS_PROCESS_MATCH`: regex to match codex processes.
 - `CONSENSUS_REDACT_PII`: set to `0` to disable redaction (default enabled).
 - `CONSENSUS_UI_PORT`: dev UI port for Vite when running `npm run dev` (default `5173`).
 - `CONSENSUS_DEBUG_OPENCODE`: set to `1` to log OpenCode server discovery.
 - `CONSENSUS_CODEX_EVENT_ACTIVE_MS`: Codex active window after last event in ms (default `30000`).
-- `CONSENSUS_CODEX_ACTIVE_HOLD_MS`: Codex hold window in ms (default `3000`).
+- `CONSENSUS_CODEX_ACTIVE_HOLD_MS`: Codex hold window in ms (default `2000`, set to `0` to disable).
 - `CONSENSUS_CODEX_INFLIGHT_IDLE_MS`: Codex in-flight idle timeout in ms (default `30000`, set to `0` to disable).
 - `CONSENSUS_CODEX_CPU_SUSTAIN_MS`: sustained CPU window before Codex becomes active without logs (default `500`).
 - `CONSENSUS_CODEX_CPU_SPIKE`: Codex CPU spike threshold for immediate activation (default derived).
-- `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`: Codex in-flight timeout in ms (default `3000`).
-- `CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS`: Codex max event age for in-flight signals (default `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`).
+- `CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS`: Codex in-flight timeout in ms (default `2500`).
+- `CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS`: Codex max event age for in-flight signals (default `max(CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS, 2500)`).
 - `CONSENSUS_PROCESS_CACHE_MS`: process cache TTL in ms for full scans (default `1000`).
 - `CONSENSUS_PROCESS_CACHE_FAST_MS`: process cache TTL in ms for fast scans (default `500`).
 - `CONSENSUS_SESSION_CACHE_MS`: Codex session list cache TTL in ms for full scans (default `1000`).

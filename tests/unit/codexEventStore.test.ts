@@ -1,162 +1,90 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { codexEventStore } from "../../src/services/codexEvents.js";
-import type { CodexEvent } from "../../src/codex/types.js";
+import os from "node:os";
+import path from "node:path";
+import { mkdtemp, rm, writeFile, appendFile } from "node:fs/promises";
+import { updateTail, summarizeTail } from "../../src/codexLogs.ts";
 
-test("event store tracks thread inFlight state", () => {
-  const threadId = "thread-abc-123";
-  
-  // Initial state - no events
-  let state = codexEventStore.getThreadState(threadId);
-  assert.strictEqual(state, undefined);
-  
-  // Turn started
-  codexEventStore.handleEvent({
-    type: "turn.started",
-    threadId,
-    turnId: "turn-1",
-    timestamp: Date.now()
-  } as CodexEvent);
-  
-  state = codexEventStore.getThreadState(threadId);
-  assert.ok(state);
-  assert.strictEqual(state?.inFlight, true);
-  
-  // Turn completed
-  codexEventStore.handleEvent({
-    type: "agent-turn-complete",
-    threadId,
-    turnId: "turn-1",
-    timestamp: Date.now()
-  } as CodexEvent);
-  
-  state = codexEventStore.getThreadState(threadId);
-  assert.ok(state);
-  assert.strictEqual(state?.inFlight, false);
-});
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const makeEvent = (event: Record<string, unknown>) => `${JSON.stringify(event)}\n`;
 
-test("event store tracks item-level activity", () => {
-  const threadId = "thread-def-456";
-  
-  // Multiple items started
-  codexEventStore.handleEvent({
-    type: "item.started",
-    threadId,
-    turnId: "item-1",
-    timestamp: Date.now()
-  } as CodexEvent);
-  
-  codexEventStore.handleEvent({
-    type: "item.started",
-    threadId,
-    turnId: "item-2",
-    timestamp: Date.now()
-  } as CodexEvent);
-  
-  let state = codexEventStore.getThreadState(threadId);
-  assert.strictEqual(state?.inFlight, true);
-  
-  // One item completes - still in flight
-  codexEventStore.handleEvent({
-    type: "item.completed",
-    threadId,
-    turnId: "item-1",
-    timestamp: Date.now()
-  } as CodexEvent);
-  
-  state = codexEventStore.getThreadState(threadId);
-  assert.strictEqual(state?.inFlight, true);
-  
-  // Last item completes - idle
-  codexEventStore.handleEvent({
-    type: "item.completed",
-    threadId,
-    turnId: "item-2",
-    timestamp: Date.now()
-  } as CodexEvent);
-  
-  state = codexEventStore.getThreadState(threadId);
-  assert.strictEqual(state?.inFlight, false);
-});
+async function setupSessionFile(): Promise<{
+  dir: string;
+  sessionPath: string;
+  cleanup: () => Promise<void>;
+}> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "consensus-codex-store-"));
+  const sessionPath = path.join(dir, "session.jsonl");
+  await writeFile(sessionPath, "", "utf8");
+  return {
+    dir,
+    sessionPath,
+    cleanup: async () => {
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
 
-test("event store updates lastActivityAt on every event", () => {
-  const threadId = "thread-ghi-789";
-  const ts1 = 1000000;
-  const ts2 = 2000000;
-  
-  codexEventStore.handleEvent({
-    type: "turn.started",
-    threadId,
-    turnId: "turn-1",
-    timestamp: ts1
-  } as CodexEvent);
-  
-  let state = codexEventStore.getThreadState(threadId);
-  assert.strictEqual(state?.lastActivityAt, ts1);
-  
-  codexEventStore.handleEvent({
-    type: "agent-turn-complete",
-    threadId,
-    turnId: "turn-1",
-    timestamp: ts2
-  } as CodexEvent);
-  
-  state = codexEventStore.getThreadState(threadId);
-  assert.strictEqual(state?.lastActivityAt, ts2);
-});
-
-test("event store handles multiple threads independently", () => {
-  const thread1 = "thread-1";
-  const thread2 = "thread-2";
-  
-  codexEventStore.handleEvent({
-    type: "turn.started",
-    threadId: thread1,
-    turnId: "turn-1",
-    timestamp: Date.now()
-  } as CodexEvent);
-  
-  codexEventStore.handleEvent({
-    type: "agent-turn-complete",
-    threadId: thread2,
-    turnId: "turn-2",
-    timestamp: Date.now()
-  } as CodexEvent);
-  
-  const state1 = codexEventStore.getThreadState(thread1);
-  const state2 = codexEventStore.getThreadState(thread2);
-  
-  assert.strictEqual(state1?.inFlight, true);
-  assert.strictEqual(state2?.inFlight, false);
-});
-
-test("event store thread isolation", () => {
-  const allThreads = codexEventStore.getAllThreads();
-  
-  // Clear any existing state
-  for (const [threadId, state] of allThreads) {
-    if (state) {
-      codexEventStore.handleEvent({
-        type: "agent-turn-complete",
-        threadId,
-        timestamp: Date.now()
-      } as CodexEvent);
-    }
+function withEnv(
+  vars: Record<string, string>,
+  fn: () => Promise<void> | void
+): Promise<void> {
+  const prev: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(vars)) {
+    prev[key] = process.env[key];
+    process.env[key] = value;
   }
-  
-  const threadA = "isolated-thread-a";
-  const threadB = "isolated-thread-b";
-  
-  codexEventStore.handleEvent({
-    type: "turn.started",
-    threadId: threadA,
-    turnId: "turn-a",
-    timestamp: Date.now()
-  } as CodexEvent);
-  
-  const stateA = codexEventStore.getThreadState(threadA);
-  const stateB = codexEventStore.getThreadState(threadB);
-  
-  assert.strictEqual(stateA?.inFlight, true);
-  assert.strictEqual(stateB, undefined);
+  const restore = () => {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  try {
+    const result = fn();
+    if (result && typeof (result as Promise<void>).then === "function") {
+      return (result as Promise<void>).finally(restore);
+    }
+    restore();
+    return Promise.resolve();
+  } catch (err) {
+    restore();
+    return Promise.reject(err);
+  }
+}
+
+test("pending end expires when no new signals arrive (jsonl tail SSOT)", async () => {
+  await withEnv(
+    {
+      CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS: "60",
+      CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS: "0",
+      CONSENSUS_CODEX_FILE_FRESH_MS: "0",
+      CONSENSUS_CODEX_STALE_FILE_MS: "0",
+    },
+    async () => {
+      const { sessionPath, cleanup } = await setupSessionFile();
+      try {
+        const base = Date.now();
+        await appendFile(
+          sessionPath,
+          makeEvent({ type: "turn.started", ts: base }) +
+            makeEvent({ type: "turn.completed", ts: base + 1 }),
+          "utf8"
+        );
+
+        const first = await updateTail(sessionPath);
+        assert.ok(first);
+        assert.equal(typeof first.pendingEndAt, "number");
+        assert.equal(summarizeTail(first).inFlight, true);
+
+        await sleep(140);
+        const second = await updateTail(sessionPath);
+        assert.ok(second);
+        assert.equal(second.pendingEndAt, undefined);
+        assert.equal(summarizeTail(second).inFlight, undefined);
+      } finally {
+        await cleanup();
+      }
+    }
+  );
 });

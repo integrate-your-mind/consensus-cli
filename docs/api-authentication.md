@@ -10,9 +10,9 @@ This document records how Consensus exposes HTTP/WS APIs today and how callers p
 ## Endpoint summary
 | Route | Method | Purpose | Authentication | Notes |
 |-------|--------|---------|----------------|-------|
-| `/api/snapshot` | `GET` | Returns the last snapshot emitted by the scan loop. The React-less canvas UI polls this endpoint to rebuild the agent map. | None | The handler runs `scanCodexProcesses` and pushes a JSON payload (ts + agents). |
+| `/api/snapshot` | `GET` | Returns the last snapshot emitted by the scan loop (cached). | None | Use `?mode=full` for a synchronous full scan (bounded by `CONSENSUS_SCAN_TIMEOUT_MS`). Use `?refresh=1` to request a scan tick without blocking the response. |
 | `/health` | `GET` | Basic JSON health check for monitoring. | None | Always responds `{ ok: true }`. |
-| `/api/codex-event` | `POST` | Codex notify hook forwards Codex events into the server. | None | Payload validated against `CodexEventSchema`; rejects with `400` on schema mismatch. | 
+| `/api/codex-event` | `POST` | Codex notify hook triggers a fast scan. | None | Payload validated against `CodexEventSchema`; rejects with `400` on schema mismatch. Events are not merged into activity state. | 
 | `/api/claude-event` | `POST` | Claude Code hooks post lifecycle events. | None | Schema validated via `ClaudeEventSchema`; `dist/claudeHook.js` reads stdin and forwards to this endpoint. |
 | `/__debug/activity` | `POST` | Toggles extra activity logging (guarded by localhost). | None | Accepts `enable` via query or JSON body. |
 | `/__dev/reload` | `GET (SSE)` | Development reload stream for browser clients. | None | Only available when `CONSENSUS_LIVE_RELOAD=1`. |
@@ -20,12 +20,12 @@ This document records how Consensus exposes HTTP/WS APIs today and how callers p
 The UI also opens a WebSocket (handled by `ws` in `src/server.ts`) but the WebSocket connection is only permitted from the same origin as the served static files.
 
 ## Client expectations
-- Codex notify hooks call `noun codex config set -g notify` with the Consensus endpoint (`/api/codex-event`) and expect no authentication steps beyond the default localhost requirement.
+- Codex notify hooks call `codex config set -g notify` with the Consensus endpoint (`/api/codex-event`) and expect no authentication steps beyond the default localhost requirement. Codex in-flight state is derived from session JSONL logs (e.g. `~/.codex/sessions/.../*.jsonl`); the webhook only triggers faster scans.
 - Claude Code hooks run `dist/claudeHook.js` which POSTs a minimal JSON event directly to `/api/claude-event` from the hook process; it neither signs the request nor retries if the hook fails.
-- The browser UI fetches `/api/snapshot` and opens the WebSocket without extra headers.
+- The browser UI connects over WebSocket for snapshots and deltas. `/api/snapshot` is primarily for polling tools and debugging.
 
 ## Hardening guidance
-1. Any time the server binds to a non-localhost address (custom `CONSENSUS_HOST`), add auth before enabling the port in `docs/constitution.md`'s sense. A simple opt-in token header (e.g., `CONSENSUS_API_TOKEN`) or Mutual TLS would be appropriate.
+1. Any time the server binds to a non-localhost address (custom `CONSENSUS_HOST`), add auth before enabling the port in `docs/constitution.md`'s sense. A simple opt-in token header (configured via an environment variable) or Mutual TLS would be appropriate.
 2. When introducing authentication, keep the current schema validation for Codex/Claude events so that invalid or replayed payloads are rejected even before checking credentials.
 3. For debugging or automation endpoints (`/__debug/activity`, `/__dev/reload`), gate them behind the same token or a separate debug-only header to keep the trust boundary intact.
 4. Document the chosen auth pattern once implemented (update this file). If more than localhost access is required, pair it with firewall rules or SSH tunnels that still keep secrets off disk.

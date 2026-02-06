@@ -3,7 +3,7 @@
 ## Data flow
 1) `scan.ts` enumerates OS processes and collects CPU/memory stats.
 2) `codexLogs.ts` scans `CODEX_HOME/sessions/` for recent JSONL logs.
-3) `server.ts` ingests Codex notify + Claude hook events into in-memory stores.
+3) `server.ts` accepts Codex notify hooks to trigger fast scans and ingests Claude hook events into in-memory stores.
 4) `server.ts` polls snapshots and pushes updates over WebSocket.
 5) `public/src` renders the isometric map in a canvas (see `public/src/components/CanvasScene.tsx`).
 

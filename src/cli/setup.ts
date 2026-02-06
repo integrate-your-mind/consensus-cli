@@ -80,49 +80,108 @@ export async function setupCodexHook(): Promise<HookSetupResult> {
   // Generate notify script path (compiled JS in dist)
   const notifyScript = path.resolve(__dirname, "..", "codexNotify.js");
   
-  const notifyLine = `notify = ["node", "${notifyScript}", "http://127.0.0.1:${consensusPort}/api/codex-event"]`;
+  const notifyLine = `notify = ["node", "${notifyScript}", "http://127.0.0.1:${consensusPort}/api/codex-event"] # consensus-cli`;
   const notificationsLine =
-    'notifications = ["thread.started", "turn.started", "agent-turn-complete", "item.started", "item.completed"]';
+    'notifications = ["agent-turn-complete", "approval-requested"] # consensus-cli';
+  const requiredNotifications = ["agent-turn-complete", "approval-requested"];
 
-  // Remove old consensus notify lines
-  const filtered = existingContent
-    .split("\n")
-    .filter((line) => {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("notify =")) return true;
-      if (trimmed.includes("/api/codex-event")) return false;
-      return true;
-    });
+  function parseTomlStringArrayLine(line: string): string[] | null {
+    const beforeComment = line.split("#")[0] ?? "";
+    const match = beforeComment.match(/notifications\s*=\s*\[(.*)\]/);
+    if (!match) return null;
+    const inner = match[1]?.trim() ?? "";
+    if (!inner) return [];
 
-  const hasTuiSection = filtered.some((line) => line.trim() === "[tui]");
+    // Parse quoted TOML strings. This intentionally ignores non-string entries.
+    const values: string[] = [];
+    const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(inner))) {
+      const raw = typeof m[1] === "string" ? m[1] : m[2];
+      values.push(raw.replace(/\\(["'\\])/g, "$1"));
+    }
+    if (values.length === 0) return null;
+    return values;
+  }
 
-  const withoutNotifications = filtered.filter(
-    (line) => !line.trim().startsWith("notifications =")
-  );
-  const lines: string[] = withoutNotifications.filter((line) => line.trim() !== "");
-  lines.push("");
-  lines.push("# Added by consensus-cli");
-  lines.push(notifyLine);
-  if (!hasTuiSection) {
+  function mergeNotifications(existing: string[] | null): string {
+    const merged: string[] = [];
+    const seen = new Set<string>();
+    for (const value of existing ?? []) {
+      if (!seen.has(value)) {
+        seen.add(value);
+        merged.push(value);
+      }
+    }
+    for (const value of requiredNotifications) {
+      if (!seen.has(value)) {
+        seen.add(value);
+        merged.push(value);
+      }
+    }
+    return `notifications = [${merged.map((value) => JSON.stringify(value)).join(", ")}] # consensus-cli`;
+  }
+
+  const rawLines = existingContent.split(/\r?\n/);
+  const filtered: string[] = [];
+  for (let i = 0; i < rawLines.length; i += 1) {
+    const line = rawLines[i];
+    const trimmed = line.trim();
+    const nextTrimmed = rawLines[i + 1]?.trim() ?? "";
+    const isConsensusComment =
+      trimmed.startsWith("#") && trimmed.includes("Added by consensus-cli");
+    const isNotifyLine = trimmed.startsWith("notify =") && trimmed.includes("/api/codex-event");
+    if (isNotifyLine) continue;
+    if (isConsensusComment && nextTrimmed.startsWith("notify =") && nextTrimmed.includes("/api/codex-event")) {
+      continue;
+    }
+    filtered.push(line);
+  }
+
+  const hasNotifyHook = filtered.some((line) => {
+    const trimmed = line.trim();
+    return trimmed.startsWith("notify =") && trimmed.includes("/api/codex-event");
+  });
+
+  const lines = [...filtered];
+  if (!hasNotifyHook) {
+    if (lines.length && lines[lines.length - 1].trim() !== "") lines.push("");
+    lines.push("# Added by consensus-cli");
+    lines.push(notifyLine);
+  }
+
+  const tuiIndex = lines.findIndex((line) => line.trim() === "[tui]");
+  if (tuiIndex === -1) {
     lines.push("");
     lines.push("[tui]");
     lines.push(notificationsLine);
   } else {
-    const tuiIndex = lines.findIndex((line) => line.trim() === "[tui]");
-    const insertAt = (() => {
-      if (tuiIndex === -1) return lines.length;
+    const sectionEnd = (() => {
       for (let i = tuiIndex + 1; i < lines.length; i += 1) {
         const trimmed = lines[i].trim();
-        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-          return i;
-        }
+        if (trimmed.startsWith("[") && trimmed.endsWith("]")) return i;
       }
       return lines.length;
     })();
-    lines.splice(insertAt, 0, notificationsLine);
+    const notificationsIndex = (() => {
+      for (let i = tuiIndex + 1; i < sectionEnd; i += 1) {
+        if (lines[i].trim().startsWith("notifications =")) return i;
+      }
+      return -1;
+    })();
+    if (notificationsIndex === -1) {
+      lines.splice(sectionEnd, 0, notificationsLine);
+    } else {
+      const parsed = parseTomlStringArrayLine(lines[notificationsIndex] ?? "");
+      if (parsed === null) {
+        lines[notificationsIndex] = mergeNotifications(null);
+      } else {
+        lines[notificationsIndex] = mergeNotifications(parsed);
+      }
+    }
   }
 
-  const newContent = lines.join("\n") + "\n";
+  const newContent = lines.join("\n").replace(/\n*$/, "\n");
   
   // Write config
   await fs.writeFile(configPath, newContent, "utf-8");
@@ -166,8 +225,8 @@ export async function runSetup(): Promise<void> {
     console.log("");
   }
   
-  console.log("Consensus requires Codex's notify hook for accurate activity detection.");
-  console.log("Without it, session state will be unreliable or unavailable.");
+  console.log("Consensus can install Codex's notify hook to trigger faster UI updates.");
+  console.log("Activity state is still derived from Codex session JSONL logs.");
   console.log("");
   
   console.log("Installing Codex notify hook...");

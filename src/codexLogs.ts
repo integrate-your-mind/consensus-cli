@@ -2,13 +2,19 @@ import fs from "fs";
 import fsp from "fs/promises";
 import os from "os";
 import path from "path";
+import { StringDecoder } from "node:string_decoder";
 import type { EventSummary, WorkSummary } from "./types.js";
 import { redactText } from "./redact.js";
 
 const SESSION_WINDOW_MS = 30 * 60 * 1000;
 const SESSION_SCAN_INTERVAL_MS = 500;
 const SESSION_ID_SCAN_INTERVAL_MS = 60000;
-const MAX_READ_BYTES = 512 * 1024;
+const TAIL_CHUNK_BYTES = 64 * 1024;
+const TAIL_MAX_BYTES_PER_UPDATE = 2 * 1024 * 1024;
+const MAX_READ_BYTES = TAIL_MAX_BYTES_PER_UPDATE;
+const TAIL_PARSE_ERROR_MAX_BYTES = 16 * 1024;
+const FAST_TYPE_BYTES = 256;
+const FAST_PREFIX_BYTES = 512;
 const MAX_EVENTS = 50;
 const SESSION_META_READ_BYTES = 16 * 1024;
 const SESSION_META_RESYNC_MS = 10000;
@@ -16,6 +22,91 @@ const NOTIFY_MAX_EVENTS = 100;
 const NOTIFY_POLL_MS = 1000;
 const SESSION_CWD_CHECK_MAX = 256;
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
+
+const RESPONSE_START_RE = /(?:turn|response)\.(started|in_progress|running)/i;
+const RESPONSE_END_RE =
+  /response\.(completed|failed|errored|canceled|cancelled|aborted|interrupted|stopped)/i;
+const TURN_END_RE =
+  /turn\.(completed|failed|errored|canceled|cancelled|aborted|interrupted|stopped)/i;
+const RESPONSE_ITEM_DELTA_TYPES = [
+  "response.output_text.delta",
+  "response.function_call_arguments.delta",
+  "response.content_part.delta",
+  "response.text.delta",
+] as const;
+const ITEM_START_WORK_TYPES = new Set([
+  "command_execution",
+  "mcp_tool_call",
+  "tool_call",
+  "file_change",
+  "file_edit",
+  "file_write",
+]);
+const ITEM_END_STATUSES = new Set([
+  "completed",
+  "failed",
+  "errored",
+  "canceled",
+  "cancelled",
+  "aborted",
+  "interrupted",
+  "stopped",
+]);
+const WORK_KINDS = new Set(["command", "edit", "tool", "message"]);
+
+function fastExtractTopType(line: string): string | undefined {
+  const prefix = line.slice(0, FAST_TYPE_BYTES);
+  const typeIndex = prefix.indexOf('"type"');
+  if (typeIndex === -1) return undefined;
+  const colon = prefix.indexOf(":", typeIndex);
+  if (colon === -1) return undefined;
+  const quote = prefix.indexOf('"', colon);
+  if (quote === -1) return undefined;
+  const end = prefix.indexOf('"', quote + 1);
+  if (end === -1) return undefined;
+  return prefix.slice(quote + 1, end);
+}
+
+function shouldParseJsonLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (!trimmed.startsWith("{")) return false;
+  const prefix = trimmed.slice(0, FAST_PREFIX_BYTES);
+  const topType = fastExtractTopType(prefix);
+  if (!topType) {
+    return trimmed.length <= TAIL_PARSE_ERROR_MAX_BYTES && prefix.includes('"error"');
+  }
+  const typeLower = topType.toLowerCase();
+  if (typeLower.includes(".delta")) return false;
+  if (typeLower === "response_item") {
+    for (const deltaType of RESPONSE_ITEM_DELTA_TYPES) {
+      if (prefix.includes(deltaType)) return false;
+    }
+    return true;
+  }
+  if (typeLower === "event_msg") {
+    const lower = prefix.toLowerCase();
+    return (
+      lower.includes("token_count") ||
+      lower.includes("agent_reasoning") ||
+      lower.includes("agent_message") ||
+      lower.includes("user_message") ||
+      lower.includes("entered_review_mode") ||
+      lower.includes("exited_review_mode") ||
+      lower.includes("approval")
+    );
+  }
+  if (typeLower === "session_meta") return true;
+  if (
+    typeLower.startsWith("thread.") ||
+    typeLower.startsWith("turn.") ||
+    typeLower.startsWith("response.") ||
+    typeLower.startsWith("item.")
+  ) {
+    return true;
+  }
+  return trimmed.length <= TAIL_PARSE_ERROR_MAX_BYTES && prefix.includes('"error"');
+}
 
 function logDebug(message: string): void {
   if (!isDebugActivity()) return;
@@ -31,6 +122,8 @@ interface TailState {
   path: string;
   offset: number;
   partial: string;
+  decoder?: StringDecoder;
+  needsCatchUp?: boolean;
   events: EventSummary[];
   recentEvents?: CodexEventLite[];
   lastEventAt?: number;
@@ -42,6 +135,10 @@ interface TailState {
   lastInFlightSignalAt?: number;
   turnOpen?: boolean;
   reviewMode?: boolean;
+  pendingEndAt?: number;
+  lastEndAt?: number;
+  lastToolSignalAt?: number;
+  openItemCount?: number;
   openCallIds?: Set<string>;
   lastCommand?: EventSummary;
   lastEdit?: EventSummary;
@@ -176,13 +273,17 @@ export function hydrateTailNotify(sessionPath: string, codexHome?: string): void
 export async function findSessionByCwd(
   sessions: SessionFile[],
   cwd?: string,
-  startMs?: number
+  startMs?: number,
+  excludePaths?: Set<string>
 ): Promise<SessionFile | undefined> {
   if (!cwd) return undefined;
   const target = path.resolve(cwd);
   let best: SessionFile | undefined;
   let bestDelta = Number.POSITIVE_INFINITY;
   for (const session of sessions.slice(0, SESSION_CWD_CHECK_MAX)) {
+    if (excludePaths && excludePaths.has(path.resolve(session.path))) {
+      continue;
+    }
     const meta = await getSessionMeta(session.path);
     if (!meta?.cwd) continue;
     if (path.resolve(meta.cwd) !== target) continue;
@@ -656,10 +757,14 @@ function summarizeEvent(ev: any): {
   return { kind: "other", isError, model, type };
 }
 
-export async function updateTail(sessionPath: string): Promise<TailState | null> {
+async function updateTailLegacy(
+  sessionPath: string,
+  options?: { keepStale?: boolean }
+): Promise<TailState | null> {
   const nowMs = Date.now();
+  const keepStale = options?.keepStale === true;
   const inflightEnv = process.env.CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS;
-  const defaultInflightTimeoutMs = 3000;
+  const defaultInflightTimeoutMs = 2500;
   const inflightTimeoutMs = (() => {
     if (inflightEnv === undefined || inflightEnv.trim() === "") {
       return defaultInflightTimeoutMs;
@@ -669,16 +774,17 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     if (parsed <= 0) return 0;
     return parsed;
   })();
+  const defaultSignalFreshMs = Math.max(inflightTimeoutMs, 2500);
   const signalFreshMs = (() => {
     const raw = process.env.CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS;
-    if (raw === undefined || raw.trim() === "") return inflightTimeoutMs;
+    if (raw === undefined || raw.trim() === "") return defaultSignalFreshMs;
     const parsed = Number(raw);
-    if (!Number.isFinite(parsed)) return inflightTimeoutMs;
+    if (!Number.isFinite(parsed)) return defaultSignalFreshMs;
     if (parsed <= 0) return 0;
     return parsed;
   })();
   const fileFreshMs = Number(
-    process.env.CONSENSUS_CODEX_FILE_FRESH_MS || 1500
+    process.env.CONSENSUS_CODEX_FILE_FRESH_MS || 2500
   );
   const staleFileMs = Number(process.env.CONSENSUS_CODEX_STALE_FILE_MS || 120000);
   let stat: fs.Stats;
@@ -692,7 +798,10 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     fileFreshMs > 0 &&
     nowMs - stat.mtimeMs <= fileFreshMs;
   const isStaleFile =
-    Number.isFinite(staleFileMs) && staleFileMs > 0 && nowMs - stat.mtimeMs > staleFileMs;
+    !keepStale &&
+    Number.isFinite(staleFileMs) &&
+    staleFileMs > 0 &&
+    nowMs - stat.mtimeMs > staleFileMs;
 
   const prev = tailStates.get(sessionPath);
   const state: TailState =
@@ -712,14 +821,70 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     state.lastInFlightSignalAt = undefined;
     state.lastIngestAt = undefined;
   };
+  const clearEndMarkers = () => {
+    state.pendingEndAt = undefined;
+    state.lastEndAt = undefined;
+  };
+  const recordToolSignal = (ts: number) => {
+    state.lastToolSignalAt = Math.max(state.lastToolSignalAt || 0, ts);
+  };
+  const finalizeEnd = (ts: number, { clearReview = false }: { clearReview?: boolean } = {}) => {
+    if (process.env.CODEX_TEST_HOOKS === "1") {
+      "TEST_HOOK_FINALIZE_END";
+    }
+    if (clearReview) state.reviewMode = false;
+    state.turnOpen = false;
+    state.inFlight = false;
+    state.inFlightStart = false;
+    state.pendingEndAt = undefined;
+    state.lastEndAt = ts;
+    clearActivitySignals();
+    if (state.openCallIds) state.openCallIds.clear();
+    state.openItemCount = 0;
+  };
+  const deferEnd = (ts: number) => {
+    state.pendingEndAt = Math.max(state.pendingEndAt || 0, ts);
+    if (process.env.CODEX_TEST_HOOKS === "1") {
+      "TEST_HOOK_PENDING_END";
+    }
+  };
 
   const expireInFlight = () => {
-    if (!state.inFlight) return;
+    if (process.env.CODEX_TEST_HOOKS === "1") {
+      "TEST_HOOK_EXPIRE_CHECK";
+    }
+    if (!state.inFlight && !state.pendingEndAt) return;
     if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
-    if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
+    const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
+    if (state.pendingEndAt) {
+      if (openCallCount > 0) return;
+      // Use event timestamps (not ingest time) so we don't cancel the end marker
+      // on the same tick it was observed.
+      const lastSignalAfterEnd = Math.max(
+        typeof state.lastToolSignalAt === "number" ? state.lastToolSignalAt : 0,
+        typeof state.lastActivityAt === "number" ? state.lastActivityAt : 0
+      );
+      // If anything new arrived after the end marker, cancel the pending end.
+      // This prevents active->idle->active flicker when tool output lands after response end.
+      if (lastSignalAfterEnd > state.pendingEndAt) {
+        clearEndMarkers();
+        return;
+      }
+      const elapsed = nowMs - state.pendingEndAt;
+      const forceEndMs = inflightTimeoutMs > 0 ? inflightTimeoutMs : defaultInflightTimeoutMs;
+      if (elapsed >= forceEndMs) {
+        finalizeEnd(state.pendingEndAt);
+      }
+      return;
+    }
     if (state.reviewMode) return;
-    if (state.openCallIds && state.openCallIds.size > 0) return;
-    if (fileFresh) {
+    if (state.turnOpen) return;
+    if (openCallCount > 0) return;
+    if (state.lastEndAt) {
+      state.inFlight = false;
+      state.inFlightStart = false;
+      state.pendingEndAt = undefined;
+      clearActivitySignals();
       return;
     }
     const lastSignal =
@@ -729,22 +894,36 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       state.lastEventAt;
     if (
       typeof lastSignal === "number" &&
-      nowMs - lastSignal > inflightTimeoutMs
+      nowMs - lastSignal >= inflightTimeoutMs
     ) {
+      if (process.env.CODEX_TEST_HOOKS === "1") {
+        "TEST_HOOK_EXPIRE_TIMEOUT";
+      }
       state.inFlight = false;
       state.inFlightStart = false;
+      state.turnOpen = false;
+      state.pendingEndAt = undefined;
+      state.lastEndAt = nowMs;
       clearActivitySignals();
+      if (state.openCallIds) state.openCallIds.clear();
+      state.openItemCount = 0;
     }
   };
 
   if (isStaleFile) {
-    if (state.inFlight) {
-      state.inFlight = false;
-      state.inFlightStart = false;
-      state.turnOpen = false;
-      state.lastInFlightSignalAt = undefined;
-      if (state.openCallIds) state.openCallIds.clear();
-    }
+    // Clear all in-flight markers regardless of `state.inFlight`. These markers
+    // also contribute to `summarizeTail(...).inFlight`, so leaving them set can
+    // keep stale sessions ghost-active.
+    state.inFlight = false;
+    state.inFlightStart = false;
+    state.turnOpen = false;
+    state.reviewMode = false;
+    state.pendingEndAt = undefined;
+    state.lastEndAt = undefined;
+    state.lastToolSignalAt = undefined;
+    state.lastInFlightSignalAt = undefined;
+    if (state.openCallIds) state.openCallIds.clear();
+    state.openItemCount = 0;
     state.lastEventAt = undefined;
     state.lastActivityAt = undefined;
     state.lastIngestAt = undefined;
@@ -753,8 +932,14 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
   if (stat.size < state.offset) {
     state.offset = 0;
     state.partial = "";
+    state.decoder = new StringDecoder("utf8");
+    state.needsCatchUp = false;
     state.events = [];
     state.lastEventAt = undefined;
+    state.reviewMode = false;
+    state.pendingEndAt = undefined;
+    state.lastEndAt = undefined;
+    state.lastToolSignalAt = undefined;
     state.lastCommand = undefined;
     state.lastEdit = undefined;
     state.lastMessage = undefined;
@@ -766,30 +951,29 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     state.turnOpen = undefined;
     state.openCallIds = undefined;
     state.lastInFlightSignalAt = undefined;
+    state.lastToolSignalAt = undefined;
+    state.openItemCount = undefined;
   }
 
   if (stat.size === state.offset) {
+    state.needsCatchUp = false;
     expireInFlight();
     tailStates.set(sessionPath, state);
     return state;
   }
 
   const prevOffset = state.offset;
-  let readStart = prevOffset;
-  let trimmed = false;
-  const delta = stat.size - prevOffset;
-  if (delta > MAX_READ_BYTES) {
-    readStart = Math.max(0, stat.size - MAX_READ_BYTES);
-    trimmed = true;
-    state.partial = "";
-  }
+  const readStart = prevOffset;
+  const delta = stat.size - readStart;
+  const readLength = Math.min(delta, MAX_READ_BYTES);
+  state.needsCatchUp = delta > MAX_READ_BYTES;
 
-  if (stat.size <= readStart) {
+  if (readLength <= 0) {
+    state.needsCatchUp = false;
     tailStates.set(sessionPath, state);
     return state;
   }
 
-  const readLength = stat.size - readStart;
   const buffer = Buffer.alloc(readLength);
   try {
     const handle = await fsp.open(sessionPath, "r");
@@ -799,13 +983,8 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     return null;
   }
 
-  let text = buffer.toString("utf8");
-  if (trimmed) {
-    const firstNewline = text.indexOf("\n");
-    if (firstNewline !== -1) {
-      text = text.slice(firstNewline + 1);
-    }
-  }
+  if (!state.decoder) state.decoder = new StringDecoder("utf8");
+  const text = state.decoder.write(buffer);
 
   const combined = state.partial + text;
   const lines = combined.split(/\r?\n/);
@@ -822,7 +1001,7 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
   ]);
   const workKinds = new Set(["command", "edit", "tool", "message"]);
   const processLine = (line: string): boolean => {
-    if (!line.trim()) return false;
+    if (!shouldParseJsonLine(line)) return false;
     let ev: any;
     try {
       ev = JSON.parse(line);
@@ -885,6 +1064,8 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     const itemId = typeof itemIdRaw === "string" ? itemIdRaw : undefined;
     const itemStatusRaw = item?.status || item?.state;
     const itemStatus = typeof itemStatusRaw === "string" ? itemStatusRaw : undefined;
+    const itemStatusLower = itemStatus ? itemStatus.toLowerCase() : undefined;
+    const openCallId = callId || itemId;
     state.recentEvents?.push({
       ts,
       type: typeStrRaw || "event",
@@ -905,9 +1086,11 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     const isTurnEnd = /turn\.(completed|failed|errored|canceled|cancelled|aborted|interrupted|stopped)/i.test(
       combinedType
     );
-    const isTurnStart = combinedType.includes("turn.started");
+    const isTurnStart =
+      combinedType.includes("turn.started") || combinedType.includes("thread.started");
     const isResponseDelta = responseDeltaTypes.has(typeStr) || responseDeltaTypes.has(payloadType);
     const isItemStarted = typeStr === "item.started" || payloadType === "item.started";
+    const isItemCompleted = typeStr === "item.completed" || payloadType === "item.completed";
     const isReviewEnter = payloadType === "entered_review_mode";
     const isReviewExit = payloadType === "exited_review_mode";
     const itemStartWorkTypes = new Set([
@@ -918,8 +1101,19 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       "file_edit",
       "file_write",
     ]);
+    const itemEndStatuses = new Set([
+      "completed",
+      "failed",
+      "errored",
+      "canceled",
+      "cancelled",
+      "aborted",
+      "interrupted",
+      "stopped",
+    ]);
     if (typeof type === "string") {
       if (isTurnStart) {
+        clearEndMarkers();
         state.turnOpen = true;
         if (canSignal) {
           state.inFlight = true;
@@ -929,6 +1123,7 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
       if (isResponseStart) {
+        clearEndMarkers();
         state.turnOpen = true;
         if (canSignal) {
           state.inFlight = true;
@@ -938,15 +1133,41 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
       if (isItemStarted && itemStartWorkTypes.has(itemTypeLower)) {
+        clearEndMarkers();
+        if (openCallId) {
+          if (!state.openCallIds) state.openCallIds = new Set();
+          state.openCallIds.add(openCallId);
+        } else {
+          state.openItemCount = (state.openItemCount ?? 0) + 1;
+        }
         if (canSignal) {
           state.turnOpen = true;
           state.inFlight = true;
           state.inFlightStart = true;
           markInFlightSignal();
         }
+        if (process.env.CODEX_TEST_HOOKS === "1") {
+          "TEST_HOOK_WORK_START";
+        }
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
+      const itemEnded =
+        (isItemCompleted || (itemStatusLower && itemEndStatuses.has(itemStatusLower))) &&
+        itemStartWorkTypes.has(itemTypeLower);
+      if (itemEnded) {
+        if (openCallId) {
+          if (state.openCallIds) {
+            state.openCallIds.delete(openCallId);
+          }
+        } else if ((state.openItemCount ?? 0) > 0) {
+          state.openItemCount = (state.openItemCount ?? 0) - 1;
+        }
+        if (process.env.CODEX_TEST_HOOKS === "1") {
+          "TEST_HOOK_WORK_END";
+        }
+      }
       if (isResponseDelta) {
+        clearEndMarkers();
         state.turnOpen = true;
         if (canSignal) {
           state.inFlight = true;
@@ -956,26 +1177,26 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
       if (isReviewEnter) {
+        clearEndMarkers();
         state.reviewMode = true;
         state.turnOpen = true;
+        state.inFlight = true;
+        state.inFlightStart = true;
         if (canSignal) {
-          state.inFlight = true;
-          state.inFlightStart = true;
           markInFlightSignal();
         }
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
       if (isReviewExit) {
         state.reviewMode = false;
+        deferEnd(ts);
         state.turnOpen = false;
-        state.inFlight = false;
-        state.inFlightStart = false;
-        clearActivitySignals();
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
     }
   if (payloadType.includes("agent_reasoning") || payloadType === "reasoning") {
     if (canSignal) {
+      clearEndMarkers();
       state.turnOpen = true;
       state.inFlight = true;
       state.inFlightStart = true;
@@ -983,23 +1204,18 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
     }
   }
   if (payloadType.includes("user_message") || payloadRole === "user") {
+    state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
     if (canSignal) {
+      clearEndMarkers();
       state.turnOpen = true;
-      state.inFlight = true;
-      state.inFlightStart = true;
-      markInFlightSignal();
-      state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
+      if (state.inFlight) {
+        markInFlightSignal();
+      }
     }
   }
   if (payloadType === "token_count") {
-    if (canSignal) {
-      state.turnOpen = true;
-      if (!state.inFlight) {
-        state.inFlight = true;
-        state.inFlightStart = true;
-      }
+    if (canSignal && (state.inFlight || state.turnOpen)) {
       markInFlightSignal();
-      state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
     }
   }
     if (type === "response_item") {
@@ -1020,8 +1236,17 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
           payloadType === "tool");
       if (isToolCall) {
         if (!state.openCallIds) state.openCallIds = new Set();
-        if (callId) state.openCallIds.add(callId);
+        if (callId) {
+          state.openCallIds.add(callId);
+        } else {
+          state.openItemCount = (state.openItemCount ?? 0) + 1;
+        }
+        if (process.env.CODEX_TEST_HOOKS === "1") {
+          "TEST_HOOK_TOOL_START";
+        }
+        recordToolSignal(ts);
         if (canSignal) {
+          clearEndMarkers();
           state.turnOpen = true;
           state.inFlight = true;
           state.inFlightStart = true;
@@ -1040,7 +1265,16 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       if (isToolOutput) {
         if (state.openCallIds && callId) {
           state.openCallIds.delete(callId);
+        } else if (state.openCallIds && state.openCallIds.size > 0) {
+          const first = state.openCallIds.values().next().value as string | undefined;
+          if (first) state.openCallIds.delete(first);
+        } else if ((state.openItemCount ?? 0) > 0) {
+          state.openItemCount = (state.openItemCount ?? 0) - 1;
         }
+        if (process.env.CODEX_TEST_HOOKS === "1") {
+          "TEST_HOOK_TOOL_END";
+        }
+        recordToolSignal(ts);
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
       if (payloadType === "reasoning") {
@@ -1055,6 +1289,12 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
           if (canSignal && state.inFlight) {
             markInFlightSignal();
           }
+          // Codex TUI logs don't reliably emit turn/response completion events.
+          // Treat the assistant message as an "end marker" and finalize after a short timeout
+          // unless new activity lands after this point.
+          if (canSignal) {
+            deferEnd(ts);
+          }
         }
       }
       if (isAssistant && !isToolCall && payloadType !== "message") {
@@ -1065,11 +1305,8 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       }
     }
     if (isResponseEnd) {
-      if (state.openCallIds) state.openCallIds.clear();
+      deferEnd(ts);
       state.turnOpen = false;
-      state.inFlight = false;
-      state.inFlightStart = false;
-      clearActivitySignals();
     }
   const itemTypeIsAgentReasoning = itemTypeLower.includes("agent_reasoning");
   const itemTypeIsAgentMessage = itemTypeLower.includes("agent_message");
@@ -1092,10 +1329,11 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
   if (itemTypeIsUserMessage || payloadIsUserMessage) {
     state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
     if (canSignal) {
+      clearEndMarkers();
       state.turnOpen = true;
-      state.inFlight = true;
-      state.inFlightStart = true;
-      markInFlightSignal();
+      if (state.inFlight) {
+        markInFlightSignal();
+      }
     }
   }
   if (itemTypeIsAgentMessage || payloadIsAgentMessage) {
@@ -1106,20 +1344,18 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
         state.inFlightStart = true;
       }
       markInFlightSignal();
+      // Same as the response_item assistant-message case above.
+      // For interactive TUI sessions, this provides a reliable end marker.
+      deferEnd(ts);
     }
   }
     if (itemTypeIsTurnAbort) {
-      if (state.openCallIds) state.openCallIds.clear();
-      state.inFlight = false;
-      state.inFlightStart = false;
-      clearActivitySignals();
+      deferEnd(ts);
+      state.turnOpen = false;
     }
     if (isTurnEnd) {
-      if (state.openCallIds) state.openCallIds.clear();
+      deferEnd(ts);
       state.turnOpen = false;
-      state.inFlight = false;
-      state.inFlightStart = false;
-      clearActivitySignals();
     }
 
     if (summary) {
@@ -1137,6 +1373,9 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
       if (kind === "tool") state.lastTool = entry;
       if (kind === "prompt") state.lastPrompt = entry;
       if (kind && workKinds.has(kind) && !isItemStarted) {
+        if (process.env.CODEX_TEST_HOOKS === "1") {
+          "TEST_HOOK_WORK_END";
+        }
         state.lastActivityAt = Math.max(state.lastActivityAt || 0, ts);
       }
       if (kind === "message") {
@@ -1179,26 +1418,31 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
   };
 
   const prevInFlight = state.inFlight;
+  let ingestedAny = false;
   let parsedAny = false;
   for (const line of lines) {
+    if (line.trim()) ingestedAny = true;
     if (processLine(line)) parsedAny = true;
   }
   const candidate = state.partial.trim();
   if (candidate.startsWith("{") && candidate.endsWith("}")) {
     if (processLine(candidate)) {
       parsedAny = true;
+      ingestedAny = true;
       state.partial = "";
     }
   }
 
-  if (parsedAny) {
+  if (ingestedAny) {
     state.lastIngestAt = nowMs;
     if (state.inFlight) {
       markInFlightSignal();
     }
   }
 
-  state.offset = stat.size;
+
+  state.offset = readStart + readLength;
+  state.needsCatchUp = state.offset < stat.size;
   expireInFlight();
   tailStates.set(sessionPath, state);
   if (prevInFlight !== state.inFlight) {
@@ -1215,6 +1459,13 @@ export async function updateTail(sessionPath: string): Promise<TailState | null>
   return state;
 }
 
+export async function updateTail(
+  sessionPath: string,
+  options?: { keepStale?: boolean }
+): Promise<TailState | null> {
+  return updateTailLegacy(sessionPath, options);
+}
+
 export function summarizeTail(state: TailState): {
   doing?: string;
   title?: string;
@@ -1227,6 +1478,10 @@ export function summarizeTail(state: TailState): {
   lastPromptAt?: number;
   lastInFlightSignalAt?: number;
   lastIngestAt?: number;
+  lastEndAt?: number;
+  reviewMode?: boolean;
+  openCallCount?: number;
+  lastToolSignalAt?: number;
   inFlight?: boolean;
   notifyLastAt?: number;
   notifyLastIngestAt?: number;
@@ -1248,6 +1503,28 @@ export function summarizeTail(state: TailState): {
     lastTool: state.lastTool?.summary,
     lastPrompt: state.lastPrompt?.summary,
   };
+  const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
+  const hasOpenCalls = openCallCount > 0;
+  const hasPendingEnd = typeof state.pendingEndAt === "number";
+  const inFlight =
+    state.inFlight || state.reviewMode || hasOpenCalls || hasPendingEnd || state.turnOpen;
+  if (isDebugActivity()) {
+    if (state.turnOpen || state.inFlight || hasOpenCalls || hasPendingEnd) {
+      logDebug(
+        `summary session=${path.basename(state.path)} ` +
+          `turnOpen=${state.turnOpen ? 1 : 0} ` +
+          `inFlight=${state.inFlight ? 1 : 0} ` +
+          `openCalls=${openCallCount} pendingEnd=${hasPendingEnd ? 1 : 0} ` +
+          `lastActivity=${state.lastActivityAt ?? "?"}`
+      );
+    }
+    if (state.turnOpen && !inFlight) {
+      logDebug(
+        `summary mismatch session=${path.basename(state.path)} turnOpen=1 inFlight=0`
+      );
+    }
+  }
+  const lastActivityAt = state.lastActivityAt;
   return {
     doing,
     title,
@@ -1256,11 +1533,15 @@ export function summarizeTail(state: TailState): {
     hasError,
     summary,
     lastEventAt,
-    lastActivityAt: state.lastActivityAt,
+    lastActivityAt,
     lastPromptAt: state.lastPrompt?.ts,
     lastInFlightSignalAt: state.lastInFlightSignalAt,
     lastIngestAt: state.lastIngestAt,
-    inFlight: state.inFlight,
+    lastEndAt: state.lastEndAt,
+    lastToolSignalAt: state.lastToolSignalAt,
+    reviewMode: state.reviewMode,
+    openCallCount,
+    inFlight: inFlight ? true : undefined,
     notifyLastAt: state.notifyLastAt,
     notifyLastIngestAt: state.notifyLastIngestAt,
   };

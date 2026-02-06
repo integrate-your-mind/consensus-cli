@@ -5,6 +5,7 @@ export type AgentKind =
   | "app-server"
   | "opencode-tui"
   | "opencode-cli"
+  | "opencode-session"
   | "opencode-server"
   | "claude-tui"
   | "claude-cli"
@@ -29,7 +30,9 @@ export interface WorkSummary {
 export interface AgentSnapshot {
   identity?: string;
   id: string;
-  pid: number;
+  pid?: number;
+  sessionId?: string;
+  parentSessionId?: string;
   startedAt?: number;
   lastEventAt?: number;
   lastActivityAt?: number;

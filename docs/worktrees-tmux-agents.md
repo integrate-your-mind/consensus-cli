@@ -36,9 +36,10 @@ These must be shell functions (not standalone executables) because they `cd` int
 `dev/tmux.conf` enables automatic window renaming so Ctrl+B W shows `command:path`:
 
 ```
+set -ga update-environment "PATH"
 setw -g automatic-rename on
 setw -g automatic-rename-format '#{pane_current_command}:#{b:pane_current_path}'
-bind c new-window -c "#{env:SCOUT_DIR}"
+bind c new-window -c "#{?env:SCOUT_DIR,#{env:SCOUT_DIR},#{pane_current_path}}"
 ```
 
 ## Start tmux the same way every time

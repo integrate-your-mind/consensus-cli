@@ -7,11 +7,10 @@ import chokidar from "chokidar";
 import type { FSWatcher } from "chokidar";
 import { WebSocketServer, WebSocket } from "ws";
 import { fileURLToPath } from "url";
-import { Effect, Fiber } from "effect";
+import { Effect, Exit, Fiber } from "effect";
 import { scanCodexProcesses, markSessionDirty } from "./scan.js";
 import { resolveCodexHome } from "./codexLogs.js";
 import { onOpenCodeEvent, stopOpenCodeEventStream } from "./opencodeEvents.js";
-import { codexEventStore } from "./services/codexEvents.js";
 import { CodexEventSchema } from "./codex/types.js";
 import { ClaudeEventSchema } from "./claude/types.js";
 import { handleClaudeEventEffect } from "./services/claudeEvents.js";
@@ -19,6 +18,7 @@ import { Schema, ParseResult } from "effect";
 import type { SnapshotPayload, AgentSnapshot, SnapshotMeta } from "./types.js";
 import { registerActivityTestRoutes } from "./server/activityTestRoutes.js";
 import { normalizeCodexNotifyInstall } from "./codexNotifyInstall.js";
+import { resolvePollMs } from "./config/intervals.js";
 import {
   annotateSpan,
   disposeObservability,
@@ -132,7 +132,7 @@ function sendDeltaEnvelope(socket: WebSocket, ops: DeltaOp[]): void {
 
 const port = Number(process.env.CONSENSUS_PORT || 8787);
 const host = process.env.CONSENSUS_HOST || "127.0.0.1";
-const pollMs = Math.max(50, Number(process.env.CONSENSUS_POLL_MS || 250));
+const pollMs = resolvePollMs();
 const scanTimeoutMs = Math.max(
   500,
   Number(process.env.CONSENSUS_SCAN_TIMEOUT_MS || 5000)
@@ -292,25 +292,50 @@ function runHttpEffect(
 }
 
 app.get("/api/snapshot", (req, res) => {
+  const mode =
+    typeof req.query.mode === "string"
+      ? req.query.mode
+      : Array.isArray(req.query.mode)
+        ? req.query.mode[0]
+        : undefined;
+  const wantsFull =
+    mode === "full" || req.query.full === "1" || req.query.full === "true";
+  const wantsRefresh =
+    req.query.refresh === "1" || req.query.refresh === "true";
+
+  if (wantsRefresh) {
+    requestTick(wantsFull ? "full" : "fast");
+  }
+
+  if (!wantsFull) {
+    res.setHeader("X-Consensus-Snapshot", "cached");
+    res.json(lastSnapshot);
+    return;
+  }
+
   const effect = Effect.tryPromise({
-    try: () => scanCodexProcesses({ mode: "full" }),
+    try: (signal) => scanCodexProcesses({ mode: "full", signal }),
     catch: (err) => err as Error,
-  }).pipe(
-    Effect.tap((snapshot) =>
-      Effect.sync(() => {
-        lastBaseSnapshot = snapshot;
-        lastSnapshot = applyTestOverrides(snapshot);
-        res.json(lastSnapshot);
-      })
-    ),
-    Effect.as(200),
-    Effect.tapError(() => recordError("http_snapshot")),
-    Effect.catchAll(() =>
-      Effect.sync(() => {
-        res.status(500).json({ error: "scan_failed" });
-      }).pipe(Effect.as(500))
-    )
-  );
+  })
+    .pipe(Effect.timeout(`${scanTimeoutMs} millis`))
+    .pipe(
+      Effect.tap((snapshot) =>
+        Effect.sync(() => {
+          lastBaseSnapshot = snapshot;
+          lastSnapshot = applyTestOverrides(snapshot);
+          res.setHeader("X-Consensus-Snapshot", "full");
+          res.json(lastSnapshot);
+        })
+      ),
+      Effect.as(200),
+      Effect.tapError(() => recordError("http_snapshot")),
+      Effect.catchAll(() =>
+        Effect.sync(() => {
+          res.setHeader("X-Consensus-Snapshot", "cached-fallback");
+          res.json(lastSnapshot);
+        }).pipe(Effect.as(200))
+      )
+    );
 
   runHttpEffect(req, res, "/api/snapshot", effect);
 });
@@ -353,17 +378,17 @@ app.post("/api/codex-event", express.json(), (req, res) => {
   const effect = Effect.gen(function* () {
     // Decode and validate event
     const decodeResult = Schema.decodeUnknownEither(CodexEventSchema)(req.body);
-    
+
     if (decodeResult._tag === "Left") {
       const error = ParseResult.TreeFormatter.formatErrorSync(decodeResult.left);
-      res.status(400).json({ 
-        ok: false, 
+      res.status(400).json({
+        ok: false,
         error: "Invalid event schema",
-        details: error 
+        details: error
       });
       return 400;
     }
-    
+
     const event = decodeResult.right;
 
     if (process.env.CONSENSUS_CODEX_NOTIFY_DEBUG === "1") {
@@ -371,18 +396,23 @@ app.post("/api/codex-event", express.json(), (req, res) => {
         `[consensus] codex event type=${event.type} thread=${event.threadId}\n`
       );
     }
-    
-    // Store event (sync for immediate availability)
-    codexEventStore.handleEvent(event);
-    
+
     // Trigger fast scan to update UI
     requestTick("fast");
-    
+
     res.json({ ok: true, received: event.type });
     return 200;
   });
-  
+
   runHttpEffect(req, res, "/api/codex-event", effect);
+});
+
+app.get("/api/codex-event", (_req, res) => {
+  res.status(405).json({
+    ok: false,
+    error: "Method Not Allowed",
+    message: "This endpoint expects a POST request with an event payload.",
+  });
 });
 
 // Claude webhook endpoint - receives events from Claude hooks
@@ -409,6 +439,14 @@ app.post("/api/claude-event", express.json(), (req, res) => {
   });
 
   runHttpEffect(req, res, "/api/claude-event", effect);
+});
+
+app.get("/api/claude-event", (_req, res) => {
+  res.status(405).json({
+    ok: false,
+    error: "Method Not Allowed",
+    message: "This endpoint expects a POST request with an event payload.",
+  });
 });
 
 let lastSnapshot: SnapshotPayload = { ts: Date.now(), agents: [] };
@@ -485,8 +523,8 @@ function logStateChanges(prev: SnapshotPayload, next: SnapshotPayload): void {
     if (!prevAgent || prevAgent.state !== agent.state) {
       logDebug(
         `state ${key} ${prevAgent?.state ?? "none"} -> ${agent.state} ` +
-          `pid=${agent.pid ?? "?"} lastEventAt=${agent.lastEventAt ?? "?"} ` +
-          `doing=${agent.doing ?? "?"}`
+        `pid=${agent.pid ?? "?"} lastEventAt=${agent.lastEventAt ?? "?"} ` +
+        `doing=${agent.doing ?? "?"}`
       );
     }
   }
@@ -617,7 +655,7 @@ async function tick(): Promise<void> {
       .pipe(
         Effect.andThen(
           Effect.tryPromise({
-            try: () => scanCodexProcesses({ mode, includeActivity }),
+            try: (signal) => scanCodexProcesses({ mode, includeActivity, signal }),
             catch: (err) => err as Error,
           }).pipe(Effect.timeout(`${scanTimeoutMs} millis`))
         )
@@ -655,8 +693,12 @@ async function tick(): Promise<void> {
         )
       );
 
-    const snapshot = await runPromise(scanEffect);
-    if (snapshot) emitSnapshot(snapshot);
+    const fiber = runFork(scanEffect);
+    const exit = await runPromise(fiber.await);
+    if (Exit.isSuccess(exit)) {
+      const snapshot = exit.value;
+      if (snapshot) emitSnapshot(snapshot);
+    }
   } catch (err) {
     // Keep server alive on scan errors.
     logRuntimeError("scan crashed", err);
@@ -733,11 +775,11 @@ function startCodexWatcher(): void {
   if (!fs.existsSync(codexSessionsDir)) return;
   const watchOptions = codexWatchPoll
     ? {
-        ignoreInitial: true,
-        usePolling: true,
-        interval: codexWatchInterval,
-        binaryInterval: codexWatchBinaryInterval,
-      }
+      ignoreInitial: true,
+      usePolling: true,
+      interval: codexWatchInterval,
+      binaryInterval: codexWatchBinaryInterval,
+    }
     : { ignoreInitial: true };
   codexWatcher = chokidar.watch(
     path.join(codexSessionsDir, "**/*.jsonl"),
@@ -840,9 +882,13 @@ function installCodexNotifyHook(): void {
 const runtime = runFork(
   Effect.scoped(
     Effect.gen(function* () {
-      // Note: Codex file watcher removed - using webhook-based events instead
-      // Legacy notify hook install kept for backward compatibility
+      // Legacy notify hook install kept for backward compatibility.
+      // Current Codex activity state comes from session JSONL tails; webhooks/watcher only trigger scans.
       yield* Effect.sync(() => installCodexNotifyHook());
+      yield* Effect.acquireRelease(
+        Effect.sync(() => startCodexWatcher()),
+        () => Effect.promise(() => Promise.resolve(stopCodexWatcher()))
+      );
       yield* Effect.acquireRelease(
         Effect.sync(() => startReloadWatcher()),
         () => Effect.promise(() => Promise.resolve(stopReloadWatcher()))
@@ -857,9 +903,7 @@ const runtime = runFork(
     }).pipe(
       Effect.catchAll((err) =>
         Effect.sync(() => {
-          process.stderr.write(
-            `[consensus] runtime error: ${String(err)}\n`
-          );
+          process.stderr.write(`[consensus] runtime error: ${String(err)}\n`);
         })
       )
     )
