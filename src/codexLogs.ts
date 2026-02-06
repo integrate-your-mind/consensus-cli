@@ -932,6 +932,8 @@ async function updateTailLegacy(
   if (stat.size < state.offset) {
     state.offset = 0;
     state.partial = "";
+    state.decoder = new StringDecoder("utf8");
+    state.needsCatchUp = false;
     state.events = [];
     state.lastEventAt = undefined;
     state.reviewMode = false;
@@ -954,27 +956,24 @@ async function updateTailLegacy(
   }
 
   if (stat.size === state.offset) {
+    state.needsCatchUp = false;
     expireInFlight();
     tailStates.set(sessionPath, state);
     return state;
   }
 
   const prevOffset = state.offset;
-  let readStart = prevOffset;
-  let trimmed = false;
-  const delta = stat.size - prevOffset;
-  if (delta > MAX_READ_BYTES) {
-    readStart = Math.max(0, stat.size - MAX_READ_BYTES);
-    trimmed = true;
-    state.partial = "";
-  }
+  const readStart = prevOffset;
+  const delta = stat.size - readStart;
+  const readLength = Math.min(delta, MAX_READ_BYTES);
+  state.needsCatchUp = delta > MAX_READ_BYTES;
 
-  if (stat.size <= readStart) {
+  if (readLength <= 0) {
+    state.needsCatchUp = false;
     tailStates.set(sessionPath, state);
     return state;
   }
 
-  const readLength = stat.size - readStart;
   const buffer = Buffer.alloc(readLength);
   try {
     const handle = await fsp.open(sessionPath, "r");
@@ -984,13 +983,8 @@ async function updateTailLegacy(
     return null;
   }
 
-  let text = buffer.toString("utf8");
-  if (trimmed) {
-    const firstNewline = text.indexOf("\n");
-    if (firstNewline !== -1) {
-      text = text.slice(firstNewline + 1);
-    }
-  }
+  if (!state.decoder) state.decoder = new StringDecoder("utf8");
+  const text = state.decoder.write(buffer);
 
   const combined = state.partial + text;
   const lines = combined.split(/\r?\n/);
@@ -1007,7 +1001,7 @@ async function updateTailLegacy(
   ]);
   const workKinds = new Set(["command", "edit", "tool", "message"]);
   const processLine = (line: string): boolean => {
-    if (!line.trim()) return false;
+    if (!shouldParseJsonLine(line)) return false;
     let ev: any;
     try {
       ev = JSON.parse(line);
@@ -1416,19 +1410,22 @@ async function updateTailLegacy(
   };
 
   const prevInFlight = state.inFlight;
+  let ingestedAny = false;
   let parsedAny = false;
   for (const line of lines) {
+    if (line.trim()) ingestedAny = true;
     if (processLine(line)) parsedAny = true;
   }
   const candidate = state.partial.trim();
   if (candidate.startsWith("{") && candidate.endsWith("}")) {
     if (processLine(candidate)) {
       parsedAny = true;
+      ingestedAny = true;
       state.partial = "";
     }
   }
 
-  if (parsedAny) {
+  if (ingestedAny) {
     state.lastIngestAt = nowMs;
     if (state.inFlight) {
       markInFlightSignal();
@@ -1436,7 +1433,8 @@ async function updateTailLegacy(
   }
 
 
-  state.offset = stat.size;
+  state.offset = readStart + readLength;
+  state.needsCatchUp = state.offset < stat.size;
   expireInFlight();
   tailStates.set(sessionPath, state);
   if (prevInFlight !== state.inFlight) {
