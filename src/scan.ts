@@ -476,6 +476,21 @@ function maxMs(...values: Array<number | undefined>): number | undefined {
   return max;
 }
 
+function deriveStatusFlags(value: unknown): {
+  status?: string;
+  isError: boolean;
+  isIdle: boolean;
+  isActive: boolean;
+} {
+  const status = typeof value === "string" ? value.toLowerCase() : undefined;
+  return {
+    status,
+    isError: !!status && /error|failed|failure/.test(status),
+    isIdle: !!status && /idle|stopped|paused/.test(status),
+    isActive: !!status && /running|active|processing|busy|retry/.test(status),
+  };
+}
+
 function deriveTitle(
   doing: string | undefined,
   repo: string | undefined,
@@ -1864,15 +1879,15 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
       statusAuthorityFresh && typeof statusAuthority === "string"
         ? statusAuthority.toLowerCase()
         : undefined;
-    const statusAuthorityIsIdle =
-      !!statusAuthorityLower && /idle|stopped|paused/.test(statusAuthorityLower);
-    const statusAuthorityIsBusy = !!statusAuthorityLower && !statusAuthorityIsIdle;
-
+    const statusAuthorityFlags = deriveStatusFlags(statusAuthorityLower);
+    const statusAuthorityIsIdle = statusAuthorityFlags.isIdle;
+    const statusAuthorityIsBusy = !!statusAuthorityFlags.status && !statusAuthorityIsIdle;
     const statusRaw = typeof session?.status === "string" ? session.status : undefined;
-    const status = statusAuthorityLower ?? statusRaw?.toLowerCase();
-    const statusIsError = !!status && /error|failed|failure/.test(status);
-    const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
-    const statusIsActive = !!status && /running|active|processing|busy|retry/.test(status);
+    const statusFlags = deriveStatusFlags(statusAuthorityLower ?? statusRaw);
+    const status = statusFlags.status;
+    const statusIsError = statusFlags.isError;
+    const statusIsIdle = statusFlags.isIdle;
+    const statusIsActive = statusFlags.isActive;
     let hasError = statusIsError;
     const model = typeof session?.model === "string" ? session.model : undefined;
     const includeOpenCode = shouldIncludeOpenCodeProcess({
@@ -2212,10 +2227,11 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
           ? (session as { status?: string }).status
           : undefined;
         const statusCandidate = eventActivity?.lastStatus ?? statusRaw;
-        const status = typeof statusCandidate === "string" ? statusCandidate.toLowerCase() : undefined;
-        const statusIsError = !!status && /error|failed|failure/.test(status);
-        const statusIsIdle = !!status && /idle|stopped|paused/.test(status);
-        const statusIsActive = !!status && /running|active|processing|busy|retry/.test(status);
+        const statusFlags = deriveStatusFlags(statusCandidate);
+        const status = statusFlags.status;
+        const statusIsError = statusFlags.isError;
+        const statusIsIdle = statusFlags.isIdle;
+        const statusIsActive = statusFlags.isActive;
         const sessionUpdatedAt = opencodeSessionTimestamp(session);
         const lastActivityAt = maxMs(
           toMs(eventActivity?.lastActivityAt),
