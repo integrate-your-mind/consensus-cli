@@ -78,3 +78,12 @@ export function formatDateFull(timestamp: number | undefined): string | null {
   if (!timestamp) return null;
   return new Date(timestamp * 1000).toLocaleString();
 }
+
+export function formatRelativeTime(ts: number | undefined): string | null {
+  if (!ts) return null;
+  const ageMs = Date.now() - ts;
+  if (ageMs < 60_000) return 'just now';
+  if (ageMs < 3_600_000) return `${Math.floor(ageMs / 60_000)}m ago`;
+  if (ageMs < 86_400_000) return `${Math.floor(ageMs / 3_600_000)}h ago`;
+  return `${Math.floor(ageMs / 86_400_000)}d ago`;
+}

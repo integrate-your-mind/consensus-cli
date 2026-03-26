@@ -23,6 +23,7 @@ import {
   updateTail,
   getTailState,
   getSessionStartMsFromPath,
+  evictStaleTails,
 } from "./codexLogs.js";
 import {
   deriveCodexSessionIdentity,
@@ -2478,6 +2479,7 @@ export async function scanCodexProcesses(options: ScanOptions = {}): Promise<Sna
         activityCache.delete(id);
       }
     }
+    evictStaleTails(tailTargets);
   }
   for (const pid of pidSessionCache.keys()) {
     if (!codexPidSet.has(pid)) {

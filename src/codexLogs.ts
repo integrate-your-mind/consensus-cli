@@ -191,6 +191,14 @@ export function getTailState(sessionPath: string): TailState | undefined {
   return tailStates.get(sessionPath);
 }
 
+export function evictStaleTails(activePaths: Set<string>): void {
+  for (const key of tailStates.keys()) {
+    if (!activePaths.has(key)) {
+      tailStates.delete(key);
+    }
+  }
+}
+
 export function consumeRecentEvents(sessionPath: string): CodexEventLite[] {
   const state = tailStates.get(sessionPath);
   if (!state?.recentEvents || state.recentEvents.length === 0) return [];

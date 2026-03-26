@@ -85,6 +85,7 @@ function App() {
       
       <AgentLane
         agents={displayAgents}
+        status={status}
         selectedId={selectedId}
         searchQuery={searchQuery}
         onSelect={select}
