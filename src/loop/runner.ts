@@ -57,7 +57,10 @@ export const executeCommandNode: NodeExecutor = async (
       child = spawn(command, args, {
         cwd,
         env: { ...process.env, ...node.env },
-        stdio: "inherit",
+        stdio:
+          context.outputMode === "stderr"
+            ? ["inherit", process.stderr, process.stderr]
+            : "inherit",
         shell: process.platform === "win32",
         windowsHide: true,
       });
@@ -249,6 +252,7 @@ export async function runGraph(
       step: steps,
       baseDirectory,
       signal: runController.signal,
+      outputMode: options.outputMode ?? "inherit",
     });
 
     await publish({
