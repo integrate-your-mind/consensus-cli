@@ -8,40 +8,38 @@ npx consensus-cli
 
 The server prints the local browser URL. Use `npx consensus-cli --help` for server flags.
 
-## Configure hooks
+## Configure Codex
 
 ```bash
 npx consensus-cli setup
 ```
 
-This configures the recommended Codex notify hook.
+Setup writes the notify command to the user-level `~/.codex/config.toml`. It does not rely on project-local Codex config, where the current Codex contract does not support `notify`.
 
 ## Inspect graphs and loops
 
-Build a provider-neutral execution graph from live local sessions:
-
 ```bash
 npx consensus-cli graph
-```
-
-Print the full versioned graph payload:
-
-```bash
 npx consensus-cli graph --json
-```
-
-Analyze a saved Consensus snapshot:
-
-```bash
 npx consensus-cli graph --snapshot snapshot.json
-```
-
-Read a snapshot from stdin:
-
-```bash
 cat snapshot.json | npx consensus-cli graph --snapshot -
 ```
 
-The graph command is read-only. It detects observed phase cycles but does not start, stop, retry, or route agent work.
+Live graph inspection is read-only. It sets OpenCode autostart off before loading the scanner, restores the environment afterward, and never calls `opencode serve` itself.
 
-See `docs/graphs-and-loops.md` for the graph model and current limits.
+Snapshot input must contain:
+
+- finite numeric `ts`
+- an `agents` array
+- valid agent `id`, `pid`, provider `kind`, and state
+- structurally valid retained events when `events` is present
+
+Malformed JSON, unknown provider kinds, invalid states, and malformed events fail with a non-zero exit code.
+
+## One-shot snapshot
+
+```bash
+npm run scan
+```
+
+This wrapper hydrates bounded Claude hook metadata before scanning, so one-shot output can include Claude phase history captured by the local server.

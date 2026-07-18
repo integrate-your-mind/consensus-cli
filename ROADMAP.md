@@ -2,29 +2,33 @@
 
 ## Current direction: graphs and loops
 
-Consensus is moving from a process atlas toward a local-first view of agent execution graphs and loops. The product remains read-only: it observes runs but does not control agent processes.
+Consensus is moving from a process atlas toward a local-first view of coding-agent execution graphs. It remains an observability product, not an orchestrator.
 
 ### Now
 
-- Build a provider-neutral execution graph from retained Codex, OpenCode, and Claude Code events.
-- Expose graph nodes, transition counts, and detected cycles through `consensus graph`.
-- Keep graph output versioned and explicit about its observed event window.
+- Produce privacy-safe, turn-scoped graphs for Codex, OpenCode, and Claude Code.
+- Keep loop state and counts semantically exact.
+- Maintain bounded provider metadata and clear data-retention controls.
+- Get full unit, integration, UI, and build checks green on supported platforms.
 
 ### Next
 
-- Add parent, subagent, delegation, approval, retry, and handoff edges when providers expose them.
-- Stream graph deltas through the server and render graph structure in the isometric UI.
-- Add loop health signals: duration, retry count, stop-rule status, budget use, and stuck-loop warnings.
-- Compare declared workflow graphs with the task graph created at runtime.
+- Add explicit parent and child edges where provider contracts expose them.
+  - OpenCode currently exposes `parentID` and `/session/:id/children`.
+  - Claude hooks expose subagent and task lifecycle events.
+- Stream graph deltas through the server.
+- Render turn segments, edges, and loop state in the browser.
+- Add traversal-aware loop iterations, duration, stop-rule status, and stuck-loop warnings.
 
 ### Later
 
-- Compact mini-map and graph grouping controls.
-- Multi-device aggregation through an optional cloud relay with one graph and timeline.
-- Run comparison, graph replay, and export for audit and evaluation.
-- Basic performance profiling and render budget notes.
+- Compare declared workflow graphs with runtime-created task graphs.
+- Add graph replay and run comparison.
+- Add an optional multi-device relay while keeping local-only mode complete.
+- Add compact graph grouping and performance profiling.
 
-## Existing reliability work
+## Reliability work
 
-- Improve session-to-process matching with PID metadata when available.
-- Keep provider activity parsing stable across Codex, OpenCode, and Claude Code.
+- Improve process-to-session matching when providers expose stable metadata.
+- Keep activity parsing stable across provider releases.
+- Maintain Windows and shell-portable test and setup paths.

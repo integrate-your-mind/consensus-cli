@@ -32,7 +32,7 @@
     "build": "tsc && npm run build:client",
     "build:client": "cd public && vite build",
     "start": "node dist/server.js",
-    "scan": "node dist/scan.js",
+    "scan": "node dist/scanSnapshot.js",
     "graph": "tsx src/cli.ts graph",
     "tail": "node dist/tail.js",
     "test": "npm run test:unit && npm run test:integration",

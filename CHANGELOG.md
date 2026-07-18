@@ -4,67 +4,56 @@ All notable changes to this project will be documented in this file.
 This project follows Semantic Versioning.
 
 ## Unreleased
-- Add: `consensus graph` builds an observed execution graph, counts phase transitions, and detects loops from retained session events.
+
+- Add: `consensus graph` builds a versioned, provider-neutral execution graph from retained events.
+- Add: turn-scoped step nodes and lifecycle filtering prevent ordinary multi-turn sessions from appearing as loops.
+- Add: bounded metadata-only Claude hook history for one-shot scan and graph inspection.
+- Add: current Claude hook coverage for `MessageDisplay`, `PostToolBatch`, `PermissionDenied`, task events, and `StopFailure`.
+- Fix: treat `UserPromptSubmit` as the sole retained Claude turn boundary so slash-command expansion does not create a duplicate turn.
+- Fix: graph IDs use opaque agent keys instead of reversible raw session paths.
+- Fix: historical loops no longer inherit an agent's unrelated current state.
+- Fix: live graph inspection disables OpenCode server autostart.
+- Fix: loop edge evidence is named `transitionObservations` rather than implied iteration count.
+- Fix: graph snapshot input now rejects malformed agents, provider kinds, states, and events.
 - Fix: normalize OpenCode detection for mixed-case binary paths to keep servers in the correct lane.
-- Fix: OpenCode activity now uses work-only timestamps (not heartbeat events) and decays in-flight after idle.
+- Fix: OpenCode activity uses work-only timestamps and decays stale in-flight state.
 - Fix: Claude CLI prompts use a short pulse instead of sticking active indefinitely.
-- Fix: prevent OpenCode “server” misclassification when prompts include “server” text (tokenized subcommand parsing).
-- Fix: reduce OpenCode server idle flicker with a higher CPU threshold for servers.
-- Fix: avoid Codex in-flight flicker by clearing on explicit assistant completion (tool call tracking + assistant message end).
-- Fix: remove short in-flight idle clearing by default (configurable via `CONSENSUS_CODEX_INFLIGHT_IDLE_MS`).
-- Fix: stabilize Codex activation with prompt pulse + file-growth activity and longer event/hold defaults.
-- Fix: Codex prompt pulse for instant activation without waiting on streaming events.
-- Fix: ignore OpenCode helper processes without sessions to avoid false active tiles.
-- Fix: reduce OpenCode active/hold defaults for faster idle transitions.
-- Fix Codex session matching by using `session_meta` cwd when session IDs are missing.
-- Add sustained CPU fallback for Codex active detection when log signals lag.
-- Use OpenCode API/storage activity timestamps to reduce activation lag.
-- Harden WebSocket override handling for UI tests.
-- Switch to event-driven updates (Codex log watch + OpenCode SSE) with slow PID polling.
-- Surface OpenCode API failures in the UI status line.
-- Do not treat Codex prompts as activity (avoid false active state).
-- Deduplicate by PID to avoid hiding live agents when session association drifts.
-- Cache process/session scans for fast event-driven refreshes.
-- Expand Codex in-flight detection for response created/delta events.
-- Reduce Codex idle lag by shortening default active + hold windows.
-- Clear Codex in-flight state when activity is stale.
-- Fix: keep Codex in-flight active until timeout to prevent active/idle flicker mid-run.
-- Parallelize Codex tail reads to reduce pickup lag.
-- Lower Codex active windows for sub-second idle transitions.
+- Fix: prevent OpenCode server misclassification when prompts include server text.
+- Fix: reduce OpenCode server idle flicker with a higher CPU threshold.
+- Fix: stabilize Codex in-flight activity across tool calls and assistant completion.
+- Fix: improve Codex session matching, event-driven updates, and bounded caches.
 
 ## 0.1.6 - 2026-01-25
-- Treat Codex response items as activity only for assistant output/tool work (not user prompts).
+
+- Treat Codex response items as activity only for assistant output and tool work.
 - Reduce false active state by using activity timestamps instead of generic event timestamps.
 
 ## 0.1.5 - 2026-01-25
-- Add Claude Code process detection with prompt/resume parsing.
-- Apply CLI-specific palettes (Codex/OpenCode/Claude Code) across tiles and lane items.
-- Add Claude CLI parsing unit tests.
-- Update README with Claude Code support.
+
+- Add Claude Code process detection with prompt and resume parsing.
+- Apply provider palettes across tiles and lane items.
+- Add Claude CLI parsing tests.
 
 ## 0.1.4 - 2026-01-24
-- Fix OpenCode event tracking build error (pid activity typing).
+
+- Fix OpenCode event tracking build error.
 
 ## 0.1.3 - 2026-01-24
-- Add OpenCode integration (API sessions, event stream, storage fallback).
-- Autostart OpenCode server with opt-out and CLI flags.
-- Split servers into a dedicated lane with distinct palette.
-- Improve layout keys to prevent tile overlap.
-- Add OpenCode unit/integration tests and configuration docs.
+
+- Add OpenCode sessions, event stream, and storage fallback.
+- Add optional OpenCode server autostart.
+- Split servers into a dedicated lane.
 
 ## 0.1.2 - 2026-01-24
-- Lower CPU threshold for active detection.
-- Increase activity window defaults for long-running turns.
-- Skip vendor codex helper processes to avoid duplicate tiles.
-- Improve session mapping for active-state detection.
+
+- Improve activity thresholds and session mapping.
+- Skip duplicate Codex vendor helper processes.
 
 ## 0.1.1 - 2026-01-24
-- Smooth active state to prevent animation flicker.
-- Add `consensus-cli` binary alias so `npx consensus-cli` works.
-- Extend active window to match Codex event cadence.
+
+- Smooth active-state rendering.
+- Add the `consensus-cli` binary alias.
 
 ## 0.1.0 - 2026-01-24
-- Initial public release.
-- Improve work summaries and recent events (latest-first, event-only fallback).
-- Mark agents active based on recent events (not just CPU).
-- License: Apache-2.0.
+
+- Initial public release under Apache-2.0.

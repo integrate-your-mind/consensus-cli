@@ -144,10 +144,10 @@ export function parseSnapshot(input: string, source: string): SnapshotPayload {
   return parsed as unknown as SnapshotPayload;
 }
 
-const defaultScanLoader: GraphScanLoader = async () =>
-  (await import("../scan.js")) as {
-    scanCodexProcesses: SnapshotScanner;
-  };
+const defaultScanLoader: GraphScanLoader = async () => {
+  const { scanSnapshot } = await import("../scanSnapshot.js");
+  return { scanCodexProcesses: scanSnapshot };
+};
 
 async function loadLiveSnapshot(
   loadScan: GraphScanLoader = defaultScanLoader
@@ -170,9 +170,7 @@ export async function loadSnapshot(
   snapshotPath: string | undefined,
   loadScan: GraphScanLoader = defaultScanLoader
 ): Promise<SnapshotPayload> {
-  if (!snapshotPath) {
-    return loadLiveSnapshot(loadScan);
-  }
+  if (!snapshotPath) return loadLiveSnapshot(loadScan);
 
   const input =
     snapshotPath === "-" ? await readStdin() : await readFile(snapshotPath, "utf8");
