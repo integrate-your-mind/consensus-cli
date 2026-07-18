@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 This project follows Semantic Versioning.
 
 ## Unreleased
+- Add: `consensus graph` builds an observed execution graph, counts phase transitions, and detects loops from retained session events.
 - Fix: normalize OpenCode detection for mixed-case binary paths to keep servers in the correct lane.
 - Fix: OpenCode activity now uses work-only timestamps (not heartbeat events) and decays in-flight after idle.
 - Fix: Claude CLI prompts use a short pulse instead of sticking active indefinitely.
