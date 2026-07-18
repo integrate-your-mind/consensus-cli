@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   AgentKind,
   AgentSnapshot,
@@ -7,23 +8,29 @@ import type {
 } from "./types.js";
 import { detectGraphLoops } from "./graphLoops.js";
 import type {
+  AgentGraphCoverage,
   AgentGraphEdge,
   AgentGraphInput,
   AgentGraphLoop,
   AgentGraphNode,
+  AgentGraphProviderCoverage,
   AgentGraphSnapshot,
   GraphEdgeKind,
+  GraphHistoryStatus,
 } from "./graphTypes.js";
 
 export type {
+  AgentGraphCoverage,
   AgentGraphEdge,
   AgentGraphInput,
   AgentGraphLoop,
   AgentGraphNode,
+  AgentGraphProviderCoverage,
   AgentGraphSnapshot,
   AgentGraphStats,
   AgentGraphWindow,
   GraphEdgeKind,
+  GraphHistoryStatus,
   GraphLoopKind,
   GraphNodeKind,
 } from "./graphTypes.js";
@@ -45,16 +52,26 @@ function providerForKind(kind: AgentKind): string {
   return "codex";
 }
 
+function opaqueAgentKey(provider: string, identity: string): string {
+  const digest = createHash("sha256")
+    .update(provider)
+    .update("\0")
+    .update(identity)
+    .digest("hex")
+    .slice(0, 20);
+  return `${provider}:${digest}`;
+}
+
 function idPart(value: string): string {
   return encodeURIComponent(value);
 }
 
-function agentNodeId(identity: string): string {
-  return `agent:${idPart(identity)}`;
+function agentNodeId(agentKey: string): string {
+  return `agent:${agentKey}`;
 }
 
-function stepNodeId(identity: string, phase: string): string {
-  return `step:${idPart(identity)}:${idPart(phase)}`;
+function stepNodeId(agentKey: string, segment: number, phase: string): string {
+  return `step:${agentKey}:s${segment}:${idPart(phase)}`;
 }
 
 function edgeId(kind: GraphEdgeKind, source: string, target: string): string {
@@ -66,32 +83,127 @@ function normalizedEventType(event: EventSummary): string {
   return type || "event";
 }
 
-function phaseForEvent(event: EventSummary): string {
-  const summary = event.summary?.trim().toLowerCase() || "";
+function normalizedSummary(event: EventSummary): string {
+  return event.summary?.trim().toLowerCase() || "";
+}
+
+function compactEventName(value: string): string {
+  return value.replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function isLifecycleOrMetaEvent(event: EventSummary): boolean {
+  const eventType = normalizedEventType(event).toLowerCase();
+  const compact = compactEventName(eventType);
+  const summary = normalizedSummary(event);
+
+  if (
+    /^(thread|turn|response|run|session)\.(started|start|in_progress|running|completed|complete|failed|failure|errored|error|canceled|cancelled|aborted|interrupted|stopped|stop|idle|status|created|updated|ended|end)$/.test(
+      eventType
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    new Set([
+      "agentturncomplete",
+      "sessionstart",
+      "sessionend",
+      "setup",
+      "stop",
+      "stopfailure",
+      "precompact",
+      "postcompact",
+      "notification",
+      "instructionsloaded",
+      "configchange",
+      "cwdchanged",
+      "filechanged",
+      "worktreecreate",
+      "worktreeremove",
+      "teammateidle",
+      "serverconnected",
+      "serverdisconnected",
+      "heartbeat",
+      "connected",
+      "ready",
+      "ping",
+      "pong",
+      "snapshot",
+      "history",
+      "tokencount",
+    ]).has(compact)
+  ) {
+    return true;
+  }
+
+  return (
+    summary.startsWith("event:") &&
+    /(heartbeat|connected|ready|snapshot|history|token_count|compaction)/.test(
+      `${eventType} ${summary}`
+    )
+  );
+}
+
+function phaseForEvent(event: EventSummary): string | undefined {
+  const summary = normalizedSummary(event);
   const eventType = normalizedEventType(event);
   const lowerType = eventType.toLowerCase();
+  const compact = compactEventName(eventType);
 
   if (summary.startsWith("cmd:")) return "command";
   if (summary.startsWith("edit:")) return "edit";
   if (summary.startsWith("tool:")) return "tool";
   if (summary.startsWith("prompt:")) return "prompt";
   if (/file_(change|edit|write)|patch/.test(lowerType)) return "edit";
-  if (/tool|function_call|mcp/.test(lowerType)) return "tool";
+  if (/tool|function_call|mcp|permission|subagent|task/.test(lowerType)) {
+    return "tool";
+  }
   if (/command|(?:^|[._-])exec(?:ute|ution)?(?:[._-]|$)/.test(lowerType)) {
     return "command";
   }
-  if (/prompt|user_message/.test(lowerType)) return "prompt";
+  if (/prompt|user_message/.test(lowerType) || compact === "userpromptsubmit") {
+    return "prompt";
+  }
   if (
     summary === "thinking" ||
     summary === "message" ||
-    /reasoning|assistant|agent_message|response/.test(lowerType)
+    compact === "messagedisplay" ||
+    /reasoning|assistant|agent_message|message\.part\.updated|response\..*delta/.test(
+      lowerType
+    )
   ) {
     return "model";
   }
+  if (isLifecycleOrMetaEvent(event)) return undefined;
   if (summary && !summary.startsWith("event:") && !summary.startsWith("compaction:")) {
     return "model";
   }
   return eventType;
+}
+
+function isTurnStartEvent(event: EventSummary): boolean {
+  const type = normalizedEventType(event).toLowerCase();
+  const compact = compactEventName(type);
+  return (
+    /^(turn|run)\.(started|start)$/.test(type) ||
+    compact === "userpromptsubmit"
+  );
+}
+
+function isTurnEndEvent(event: EventSummary): boolean {
+  const type = normalizedEventType(event).toLowerCase();
+  const compact = compactEventName(type);
+  return (
+    /^(turn|response|run)\.(completed|complete|failed|failure|errored|error|canceled|cancelled|aborted|interrupted|stopped|stop|ended|end)$/.test(
+      type
+    ) ||
+    type === "session.idle" ||
+    compact === "agentturncomplete" ||
+    compact === "stop" ||
+    compact === "stopfailure" ||
+    compact === "sessionend"
+  );
 }
 
 function maxDefined(values: Array<number | undefined>): number | undefined {
@@ -166,6 +278,92 @@ function addTransitionEdge(
   });
 }
 
+function historyStatusForProvider(
+  provider: string,
+  agents: number,
+  agentsWithEvents: number
+): { history: GraphHistoryStatus; note?: string } {
+  if (agentsWithEvents === agents && agents > 0) {
+    return { history: "available" };
+  }
+  if (agentsWithEvents > 0) {
+    return {
+      history: "partial",
+      note: "Only some observed agents included retained events.",
+    };
+  }
+  if (provider === "claude") {
+    return {
+      history: "unavailable",
+      note:
+        "Claude activity is visible, but Claude hook history is not yet retained in SnapshotPayload.events.",
+    };
+  }
+  if (provider === "codex" || provider === "opencode") {
+    return {
+      history: "available",
+      note: "No retained graph events were present in this snapshot window.",
+    };
+  }
+  return {
+    history: "unavailable",
+    note: "This provider does not expose retained graph events in the current adapter.",
+  };
+}
+
+function normalizeCoverage(
+  coverage: Map<
+    string,
+    { agents: number; agentsWithEvents: number; retainedEvents: number }
+  >
+): AgentGraphCoverage {
+  const providers: Record<string, AgentGraphProviderCoverage> = {};
+  for (const provider of [...coverage.keys()].sort()) {
+    const current = coverage.get(provider);
+    if (!current) continue;
+    const status = historyStatusForProvider(
+      provider,
+      current.agents,
+      current.agentsWithEvents
+    );
+    providers[provider] = {
+      ...current,
+      ...status,
+    };
+  }
+  return { providers };
+}
+
+function deriveCoverageFromNodes(nodes: AgentGraphNode[]): AgentGraphCoverage {
+  const coverage = new Map<
+    string,
+    { agents: number; agentsWithEvents: number; retainedEvents: number }
+  >();
+  const agentKeysByProvider = new Map<string, Set<string>>();
+  const eventAgentsByProvider = new Map<string, Set<string>>();
+  for (const node of nodes) {
+    const agentSet = agentKeysByProvider.get(node.provider) ?? new Set<string>();
+    agentSet.add(node.agentKey);
+    agentKeysByProvider.set(node.provider, agentSet);
+    if (node.kind === "step") {
+      const eventSet =
+        eventAgentsByProvider.get(node.provider) ?? new Set<string>();
+      eventSet.add(node.agentKey);
+      eventAgentsByProvider.set(node.provider, eventSet);
+    }
+  }
+  for (const [provider, agentKeys] of agentKeysByProvider) {
+    coverage.set(provider, {
+      agents: agentKeys.size,
+      agentsWithEvents: eventAgentsByProvider.get(provider)?.size ?? 0,
+      retainedEvents: nodes
+        .filter((node) => node.provider === provider && node.kind === "step")
+        .reduce((total, node) => total + (node.observations ?? 0), 0),
+    });
+  }
+  return normalizeCoverage(coverage);
+}
+
 export function analyzeAgentGraph(input: AgentGraphInput): AgentGraphSnapshot {
   const nodes = [...input.nodes].sort((a, b) => a.id.localeCompare(b.id));
   const edges = [...input.edges].sort((a, b) => a.id.localeCompare(b.id));
@@ -177,6 +375,7 @@ export function analyzeAgentGraph(input: AgentGraphInput): AgentGraphSnapshot {
     source: input.source,
     ts: input.ts,
     window: input.window,
+    coverage: input.coverage ?? deriveCoverageFromNodes(nodes),
     nodes,
     edges,
     loops,
@@ -200,6 +399,11 @@ export function buildAgentGraph(snapshot: SnapshotPayload): AgentGraphSnapshot {
   const nodes = new Map<string, AgentGraphNode>();
   const edges = new Map<string, AgentGraphEdge>();
   const retainedEventTimes: number[] = [];
+  let graphEvents = 0;
+  const coverage = new Map<
+    string,
+    { agents: number; agentsWithEvents: number; retainedEvents: number }
+  >();
   const agents = [...snapshot.agents].sort((a, b) =>
     identityForAgent(a).localeCompare(identityForAgent(b))
   );
@@ -207,14 +411,25 @@ export function buildAgentGraph(snapshot: SnapshotPayload): AgentGraphSnapshot {
   for (const agent of agents) {
     const identity = identityForAgent(agent);
     const provider = providerForKind(agent.kind);
-    const rootNodeId = agentNodeId(identity);
+    const agentKey = opaqueAgentKey(provider, identity);
+    const rootNodeId = agentNodeId(agentKey);
+    const events = sortedEvents(agent.events);
+    const providerCoverage = coverage.get(provider) ?? {
+      agents: 0,
+      agentsWithEvents: 0,
+      retainedEvents: 0,
+    };
+    providerCoverage.agents += 1;
+    providerCoverage.retainedEvents += events.length;
+    if (events.length > 0) providerCoverage.agentsWithEvents += 1;
+    coverage.set(provider, providerCoverage);
+
     nodes.set(rootNodeId, {
       id: rootNodeId,
       kind: "agent",
-      label: agent.title || agent.doing || `${provider}:${agent.id}`,
+      label: agent.title || agent.doing || `${provider} agent`,
       state: agent.state,
-      agentId: agent.id,
-      agentIdentity: identity,
+      agentKey,
       provider,
       repo: agent.repo,
       firstSeenAt:
@@ -223,45 +438,104 @@ export function buildAgentGraph(snapshot: SnapshotPayload): AgentGraphSnapshot {
       observations: 1,
     });
 
+    let segmentCounter = 0;
+    let activeSegment: number | undefined;
+    let activeTurnId: string | undefined;
     let previousStepNodeId: string | undefined;
-    for (const event of sortedEvents(agent.events)) {
+    let segmentHasPhase = false;
+    let latestStepNodeId: string | undefined;
+
+    const startSegment = (turnId?: string): number => {
+      segmentCounter += 1;
+      activeSegment = segmentCounter;
+      activeTurnId = turnId;
+      previousStepNodeId = undefined;
+      segmentHasPhase = false;
+      return activeSegment;
+    };
+
+    const closeSegment = (): void => {
+      activeSegment = undefined;
+      activeTurnId = undefined;
+      previousStepNodeId = undefined;
+      segmentHasPhase = false;
+    };
+
+    for (const event of events) {
       retainedEventTimes.push(event.ts);
-      const eventType = normalizedEventType(event);
       const phase = phaseForEvent(event);
-      const currentStepNodeId = stepNodeId(identity, phase);
-      const current = nodes.get(currentStepNodeId);
+      const turnId =
+        typeof event.turnId === "number"
+          ? String(event.turnId)
+          : event.turnId?.trim() || undefined;
+      const turnStart = isTurnStartEvent(event);
+      const turnEnd = isTurnEndEvent(event);
 
-      if (current) {
-        current.observations = (current.observations ?? 0) + 1;
-        current.firstSeenAt = Math.min(current.firstSeenAt ?? event.ts, event.ts);
-        current.lastSeenAt = Math.max(current.lastSeenAt ?? event.ts, event.ts);
-        current.eventTypes = Array.from(
-          new Set([...(current.eventTypes ?? []), eventType])
-        ).sort();
-        if (event.isError) current.state = "error";
-      } else {
-        nodes.set(currentStepNodeId, {
-          id: currentStepNodeId,
-          kind: "step",
-          label: phase,
-          state: event.isError ? "error" : agent.state,
-          agentId: agent.id,
-          agentIdentity: identity,
-          provider,
-          repo: agent.repo,
-          phase,
-          eventTypes: [eventType],
-          firstSeenAt: event.ts,
-          lastSeenAt: event.ts,
-          observations: 1,
-        });
+      if (turnId) {
+        if (activeSegment === undefined || activeTurnId !== turnId) {
+          startSegment(turnId);
+        }
+      } else if (
+        phase === "prompt" &&
+        (activeSegment === undefined || segmentHasPhase)
+      ) {
+        startSegment();
+      } else if (turnStart && activeSegment === undefined) {
+        startSegment();
+      } else if (phase && activeSegment === undefined) {
+        startSegment();
       }
 
-      addContainsEdge(edges, rootNodeId, currentStepNodeId, event.ts);
-      if (previousStepNodeId && previousStepNodeId !== currentStepNodeId) {
-        addTransitionEdge(edges, previousStepNodeId, currentStepNodeId, event.ts);
+      if (phase && activeSegment !== undefined) {
+        graphEvents += 1;
+        const currentStepNodeId = stepNodeId(agentKey, activeSegment, phase);
+        const current = nodes.get(currentStepNodeId);
+
+        if (current) {
+          current.observations = (current.observations ?? 0) + 1;
+          current.firstSeenAt = Math.min(current.firstSeenAt ?? event.ts, event.ts);
+          current.lastSeenAt = Math.max(current.lastSeenAt ?? event.ts, event.ts);
+          current.eventTypes = Array.from(
+            new Set([...(current.eventTypes ?? []), normalizedEventType(event)])
+          ).sort();
+          if (event.isError) current.hadError = true;
+        } else {
+          nodes.set(currentStepNodeId, {
+            id: currentStepNodeId,
+            kind: "step",
+            label: phase,
+            state: "idle",
+            agentKey,
+            provider,
+            repo: agent.repo,
+            phase,
+            segment: activeSegment,
+            hadError: !!event.isError,
+            eventTypes: [normalizedEventType(event)],
+            firstSeenAt: event.ts,
+            lastSeenAt: event.ts,
+            observations: 1,
+          });
+        }
+
+        addContainsEdge(edges, rootNodeId, currentStepNodeId, event.ts);
+        if (previousStepNodeId && previousStepNodeId !== currentStepNodeId) {
+          addTransitionEdge(edges, previousStepNodeId, currentStepNodeId, event.ts);
+        }
+        previousStepNodeId = currentStepNodeId;
+        latestStepNodeId = currentStepNodeId;
+        segmentHasPhase = true;
       }
-      previousStepNodeId = currentStepNodeId;
+
+      if (turnEnd) closeSegment();
+    }
+
+    if (latestStepNodeId) {
+      const latest = nodes.get(latestStepNodeId);
+      if (latest) {
+        latest.current = true;
+        latest.state = agent.state;
+      }
     }
   }
 
@@ -270,9 +544,11 @@ export function buildAgentGraph(snapshot: SnapshotPayload): AgentGraphSnapshot {
     ts: snapshot.ts,
     window: {
       retainedEvents: retainedEventTimes.length,
+      graphEvents,
       oldestEventAt: minDefined(retainedEventTimes),
       newestEventAt: maxDefined(retainedEventTimes),
     },
+    coverage: normalizeCoverage(coverage),
     nodes: Array.from(nodes.values()),
     edges: Array.from(edges.values()),
   });
@@ -282,13 +558,24 @@ function graphStateLabel(state: AgentState): string {
   return state.toUpperCase().padEnd(6, " ");
 }
 
-function formatLoop(loop: AgentGraphLoop, nodeById: Map<string, AgentGraphNode>): string {
+function formatLoop(
+  loop: AgentGraphLoop,
+  nodeById: Map<string, AgentGraphNode>
+): string {
   const labels = loop.nodeIds.map(
     (nodeId) => nodeById.get(nodeId)?.label || nodeId
   );
-  if (loop.kind === "self") return `${labels[0]} -> ${labels[0]}`;
-  if (labels.length === 2) return `${labels[0]} -> ${labels[1]} -> ${labels[0]}`;
-  return `cycle{${labels.join(", ")}}`;
+  const path =
+    loop.kind === "self"
+      ? `${labels[0]} -> ${labels[0]}`
+      : labels.length === 2
+        ? `${labels[0]} -> ${labels[1]} -> ${labels[0]}`
+        : `cycle{${labels.join(", ")}}`;
+  const segmentLabel =
+    loop.segments.length === 1
+      ? `segment=${loop.segments[0]}`
+      : `segments=${loop.segments.join(",")}`;
+  return `${path} ${segmentLabel}`;
 }
 
 export function formatAgentGraph(graph: AgentGraphSnapshot): string {
@@ -300,15 +587,15 @@ export function formatAgentGraph(graph: AgentGraphSnapshot): string {
   for (const node of graph.nodes) {
     if (node.kind !== "step") continue;
     stepCountByAgent.set(
-      node.agentIdentity,
-      (stepCountByAgent.get(node.agentIdentity) ?? 0) + 1
+      node.agentKey,
+      (stepCountByAgent.get(node.agentKey) ?? 0) + 1
     );
   }
   for (const loop of graph.loops) {
-    for (const agentIdentity of loop.agentIds) {
+    for (const agentKey of loop.agentKeys) {
       loopCountByAgent.set(
-        agentIdentity,
-        (loopCountByAgent.get(agentIdentity) ?? 0) + 1
+        agentKey,
+        (loopCountByAgent.get(agentKey) ?? 0) + 1
       );
     }
   }
@@ -317,17 +604,32 @@ export function formatAgentGraph(graph: AgentGraphSnapshot): string {
     "consensus graph",
     `agents=${graph.stats.agents} steps=${graph.stats.steps} ` +
       `transition_edges=${graph.stats.transitionEdges} transitions=${graph.stats.transitions} ` +
-      `loops=${graph.stats.loops} window_events=${graph.window.retainedEvents}`,
+      `loops=${graph.stats.loops} window_events=${graph.window.retainedEvents} ` +
+      `graph_events=${graph.window.graphEvents}`,
     "",
-    "AGENTS",
+    "COVERAGE",
   ];
 
+  const coverageEntries = Object.entries(graph.coverage.providers);
+  if (coverageEntries.length === 0) {
+    lines.push("  none observed");
+  } else {
+    for (const [provider, coverage] of coverageEntries) {
+      const suffix = coverage.note ? ` — ${coverage.note}` : "";
+      lines.push(
+        `  ${provider} history=${coverage.history} agents=${coverage.agents} ` +
+          `agents_with_events=${coverage.agentsWithEvents} events=${coverage.retainedEvents}${suffix}`
+      );
+    }
+  }
+
+  lines.push("", "AGENTS");
   if (agentNodes.length === 0) {
     lines.push("  none observed");
   } else {
     for (const node of agentNodes) {
-      const steps = stepCountByAgent.get(node.agentIdentity) ?? 0;
-      const loops = loopCountByAgent.get(node.agentIdentity) ?? 0;
+      const steps = stepCountByAgent.get(node.agentKey) ?? 0;
+      const loops = loopCountByAgent.get(node.agentKey) ?? 0;
       lines.push(
         `  ${graphStateLabel(node.state)} ${node.label} ` +
           `[${node.provider}] steps=${steps} loops=${loops}`
@@ -342,7 +644,7 @@ export function formatAgentGraph(graph: AgentGraphSnapshot): string {
     for (const loop of graph.loops) {
       lines.push(
         `  ${graphStateLabel(loop.state)} ${formatLoop(loop, nodeById)} ` +
-          `observations=${loop.observations}`
+          `transition_observations=${loop.transitionObservations}`
       );
     }
   }

@@ -120,20 +120,28 @@ export function detectGraphLoops(
     const memberNodes = component
       .map((nodeId) => stepNodeById.get(nodeId))
       .filter((node): node is AgentGraphNode => !!node);
+    const currentMemberNodes = memberNodes.filter((node) => node.current);
 
     loops.push({
       id: `loop:${component.join("|")}`,
       kind: isSelfLoop ? "self" : "cycle",
       nodeIds: component,
       edgeIds: loopEdges.map((edge) => edge.id).sort(),
-      agentIds: Array.from(
-        new Set(memberNodes.map((node) => node.agentIdentity))
+      agentKeys: Array.from(
+        new Set(memberNodes.map((node) => node.agentKey))
       ).sort(),
       providers: Array.from(
         new Set(memberNodes.map((node) => node.provider))
       ).sort(),
-      state: strongestState(memberNodes.map((node) => node.state)),
-      observations: loopEdges.reduce(
+      segments: Array.from(
+        new Set(
+          memberNodes
+            .map((node) => node.segment)
+            .filter((segment): segment is number => typeof segment === "number")
+        )
+      ).sort((a, b) => a - b),
+      state: strongestState(currentMemberNodes.map((node) => node.state)),
+      transitionObservations: loopEdges.reduce(
         (total, edge) => total + edge.observations,
         0
       ),

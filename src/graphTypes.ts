@@ -3,17 +3,20 @@ import type { AgentState } from "./types.js";
 export type GraphNodeKind = "agent" | "step";
 export type GraphEdgeKind = "contains" | "transition";
 export type GraphLoopKind = "self" | "cycle";
+export type GraphHistoryStatus = "available" | "partial" | "unavailable";
 
 export interface AgentGraphNode {
   id: string;
   kind: GraphNodeKind;
   label: string;
   state: AgentState;
-  agentId: string;
-  agentIdentity: string;
+  agentKey: string;
   provider: string;
   repo?: string;
   phase?: string;
+  segment?: number;
+  current?: boolean;
+  hadError?: boolean;
   eventTypes?: string[];
   firstSeenAt?: number;
   lastSeenAt?: number;
@@ -34,17 +37,31 @@ export interface AgentGraphLoop {
   kind: GraphLoopKind;
   nodeIds: string[];
   edgeIds: string[];
-  agentIds: string[];
+  agentKeys: string[];
   providers: string[];
+  segments: number[];
   state: AgentState;
-  observations: number;
+  transitionObservations: number;
   lastSeenAt?: number;
 }
 
 export interface AgentGraphWindow {
   retainedEvents: number;
+  graphEvents: number;
   oldestEventAt?: number;
   newestEventAt?: number;
+}
+
+export interface AgentGraphProviderCoverage {
+  agents: number;
+  agentsWithEvents: number;
+  retainedEvents: number;
+  history: GraphHistoryStatus;
+  note?: string;
+}
+
+export interface AgentGraphCoverage {
+  providers: Record<string, AgentGraphProviderCoverage>;
 }
 
 export interface AgentGraphStats {
@@ -63,6 +80,7 @@ export interface AgentGraphSnapshot {
   source: "observed-events";
   ts: number;
   window: AgentGraphWindow;
+  coverage: AgentGraphCoverage;
   nodes: AgentGraphNode[];
   edges: AgentGraphEdge[];
   loops: AgentGraphLoop[];
@@ -73,6 +91,7 @@ export interface AgentGraphInput {
   source: AgentGraphSnapshot["source"];
   ts: number;
   window: AgentGraphWindow;
+  coverage?: AgentGraphCoverage;
   nodes: AgentGraphNode[];
   edges: AgentGraphEdge[];
 }

@@ -15,6 +15,7 @@ export interface EventSummary {
   type: string;
   summary: string;
   isError?: boolean;
+  turnId?: string | number;
 }
 
 export interface WorkSummary {

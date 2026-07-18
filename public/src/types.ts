@@ -12,7 +12,10 @@ export interface AgentSummary {
 
 export interface AgentEvent {
   ts: number;
+  type?: string;
   summary: string;
+  isError?: boolean;
+  turnId?: string | number;
 }
 
 export interface AgentSnapshot {
@@ -118,10 +121,10 @@ export interface WsPongMessage {
 }
 
 export type WsClientMessage = WsHelloMessage | WsPongMessage;
-export type WsServerMessage = 
-  | WsWelcomeMessage 
-  | WsSnapshotMessage 
-  | WsDeltaMessage 
+export type WsServerMessage =
+  | WsWelcomeMessage
+  | WsSnapshotMessage
+  | WsDeltaMessage
   | WsPingMessage;
 
 export interface TileColors {
