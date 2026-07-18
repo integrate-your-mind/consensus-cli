@@ -1,6 +1,7 @@
 import type { ConsensusGraph, GraphEdge, GraphNode } from "../graph/types.js";
 
 export type NodeOutcome = "success" | "failure";
+export type NodeOutputMode = "inherit" | "stderr";
 export type GraphRunStatus = "completed" | "failed" | "budget_exhausted" | "cancelled";
 
 export interface NodeExecutionResult {
@@ -18,6 +19,7 @@ export interface NodeExecutionContext {
   step: number;
   baseDirectory: string;
   signal?: AbortSignal;
+  outputMode?: NodeOutputMode;
 }
 
 export type NodeExecutor = (
@@ -85,6 +87,7 @@ export interface GraphRunOptions {
   baseDirectory?: string;
   runId?: string;
   signal?: AbortSignal;
+  outputMode?: NodeOutputMode;
   executeNode?: NodeExecutor;
   onEvent?: (event: GraphRunEvent) => void | Promise<void>;
   now?: () => number;
