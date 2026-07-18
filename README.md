@@ -4,15 +4,17 @@
 [![GitHub release](https://img.shields.io/github/v/release/integrate-your-mind/consensus-cli?display_name=tag&color=2563eb)](https://github.com/integrate-your-mind/consensus-cli/releases)
 [![License](https://img.shields.io/npm/l/consensus-cli.svg?color=6b7280)](LICENSE)
 
-Live isometric atlas for Codex, OpenCode, and Claude Code sessions, rendered in a local browser.
+Local-first observability for coding-agent graphs, loops, and live activity across Codex, OpenCode, and Claude Code.
 
 ## Status
 Beta. Local-only, no hosted service.
 
 ## Who it's for
-Developers running multiple Codex, OpenCode, or Claude Code sessions who want a visual, at-a-glance view of activity.
+Developers running multiple Codex, OpenCode, or Claude Code sessions who need a clear view of live activity and the execution paths inside each run.
 
 ## Core use cases
+- Inspect observed model, tool, command, edit, and prompt transitions.
+- Detect cycles in the retained event window.
 - Track which agents are active right now.
 - Spot errors or idle processes quickly.
 - Inspect recent activity without digging through logs.
@@ -52,6 +54,25 @@ consensus dev server running on http://127.0.0.1:8787
 - Best-effort "doing" summary from Codex session JSONL, OpenCode events, or Claude CLI flags.
 - Click a tile for details and recent events.
 - Active lane for agents plus a dedicated lane for servers.
+- A versioned observed execution graph with transition counts and detected loops.
+
+## Graphs and loops (preview)
+
+Run a one-shot graph inspection against live local sessions:
+
+```bash
+npx consensus-cli graph
+```
+
+Print the full graph payload for scripts, storage, or later visualization:
+
+```bash
+npx consensus-cli graph --json
+```
+
+Consensus normalizes retained provider events into `prompt`, `model`, `tool`, `command`, and `edit` phases. It creates transition edges for each observed phase change and reports cycles in that graph. Adjacent stream fragments collapse so token and message deltas do not create false self-loops.
+
+The preview is read-only and bounded by the retained event window. It does not yet infer parent, subagent, delegation, approval, retry, or cross-agent causal edges. See `docs/graphs-and-loops.md`.
 
 ## How it works
 1) Scan OS process list for Codex + OpenCode + Claude Code.
@@ -59,7 +80,8 @@ consensus dev server running on http://127.0.0.1:8787
 3) Query the OpenCode local server API and event stream (with storage fallback).
 4) Ingest Claude Code hook events to infer activity (CLI flags only for "doing").
 5) Poll and push snapshots over WebSocket.
-6) Render tiles on a canvas with isometric projection.
+6) Derive a provider-neutral phase graph and detect cycles from retained snapshot events.
+7) Render live agent tiles on a canvas with isometric projection.
 
 ## Install options
 - Local dev: `npm install` + `npm run dev`
@@ -114,7 +136,7 @@ consensus dev server running on http://127.0.0.1:8787
 - `CONSENSUS_IDLE_HOLD_MS`: hold idle state briefly after spans end (default `200`).
 - `CONSENSUS_SPAN_STALE_MS`: span stale timeout for event progress (default `15000`).
 
-Full config details: `docs/configuration.md`
+Full config details: `docs/configuration.md`
 
 ## Claude hooks (required for activity)
 Claude Code hooks are configured in `~/.claude/settings.json`, `.claude/settings.json`, or
@@ -182,6 +204,7 @@ Recommended events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `Permissio
 
 ## Utilities
 - `npm run scan` prints a one-shot JSON snapshot.
+- `npm run graph` prints the observed execution graph and detected loops.
 - `npm run tail -- <session.jsonl>` tails a session file.
 
 ## Tests
@@ -202,6 +225,7 @@ More: `docs/troubleshooting.md`
 - `docs/install.md`
 - `docs/examples.md`
 - `docs/cli.md`
+- `docs/graphs-and-loops.md`
 - `docs/decisions/`
 - `docs/audience.md`
 - `docs/promises.md`
