@@ -11,6 +11,7 @@ import {
   runPromise,
   withSpan,
 } from "./observability/index.js";
+import { runGraph } from "./cli/graph.js";
 import { runSetup } from "./cli/setup.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -18,7 +19,7 @@ const __dirname = path.dirname(__filename);
 
 const args = process.argv.slice(2);
 
-// Handle setup command
+// Handle one-shot commands before starting the server.
 if (args[0] === "setup") {
   runSetup()
     .then(() => {
@@ -27,7 +28,17 @@ if (args[0] === "setup") {
     .catch(() => {
       process.exit(1);
     });
-  // Exit early - don't start server
+} else if (args[0] === "graph") {
+  runGraph(args.slice(1))
+    .then(async () => {
+      await disposeObservability().catch(() => undefined);
+      process.exit(0);
+    })
+    .catch(async (err) => {
+      process.stderr.write(`[consensus] graph error: ${String(err)}\n`);
+      await disposeObservability().catch(() => undefined);
+      process.exit(1);
+    });
 } else {
 
 function readArg(name: string): string | undefined {
@@ -49,6 +60,7 @@ function printHelp(): void {
   process.stdout.write(`Usage:\n  consensus [command] [options]\n\n`);
   process.stdout.write(`Commands:\n`);
   process.stdout.write(`  setup                Configure Codex notify hook (recommended first step)\n`);
+  process.stdout.write(`  graph                Inspect agent transitions and detect loops\n`);
   process.stdout.write(`  (default)            Start the consensus server\n\n`);
   process.stdout.write(`Options:\n`);
   process.stdout.write(`  --host <host>        Bind address (default 127.0.0.1)\n`);

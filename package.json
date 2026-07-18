@@ -33,6 +33,7 @@
     "build:client": "cd public && vite build",
     "start": "node dist/server.js",
     "scan": "node dist/scan.js",
+    "graph": "tsx src/cli.ts graph",
     "tail": "node dist/tail.js",
     "test": "npm run test:unit && npm run test:integration",
     "test:unit": "node --test --import tsx tests/unit/**/*.test.ts",
