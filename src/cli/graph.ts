@@ -6,6 +6,7 @@ import type {
   AgentState,
   EventSummary,
   SnapshotPayload,
+  WorkSummary,
 } from "../types.js";
 
 type SnapshotScanner = (options?: {
@@ -29,6 +30,12 @@ const agentKinds = new Set<AgentKind>([
   "unknown",
 ]);
 const agentStates = new Set<AgentState>(["active", "idle", "error"]);
+const MAX_AGENTS = 10_000;
+const MAX_EVENTS_PER_AGENT = 10_000;
+const MAX_TEXT_LENGTH = 16_384;
+const MAX_EVENT_TYPE_LENGTH = 256;
+const MAX_EVENT_SUMMARY_LENGTH = 4_096;
+const CONTROL_CHARACTER_RE = /[\u0000-\u001f\u007f]/;
 
 function graphHelp(): string {
   return [
@@ -66,24 +73,67 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-function isOptionalString(value: unknown): boolean {
-  return value === undefined || typeof value === "string";
+function isNonNegativeFiniteNumber(value: unknown): value is number {
+  return isFiniteNumber(value) && value >= 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 0;
+}
+
+function isSafeString(value: unknown, maxLength: number = MAX_TEXT_LENGTH): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= maxLength &&
+    !CONTROL_CHARACTER_RE.test(value)
+  );
+}
+
+function isNonEmptySafeString(
+  value: unknown,
+  maxLength: number = MAX_TEXT_LENGTH
+): value is string {
+  return isSafeString(value, maxLength) && value.length > 0;
+}
+
+function isOptionalSafeString(
+  value: unknown,
+  maxLength: number = MAX_TEXT_LENGTH
+): boolean {
+  return value === undefined || isSafeString(value, maxLength);
+}
+
+function isOptionalTimestamp(value: unknown): boolean {
+  return value === undefined || isNonNegativeFiniteNumber(value);
 }
 
 function isOptionalTurnId(value: unknown): boolean {
   return (
     value === undefined ||
-    typeof value === "string" ||
+    isNonEmptySafeString(value, MAX_EVENT_TYPE_LENGTH) ||
     (typeof value === "number" && Number.isFinite(value))
   );
+}
+
+function isWorkSummary(value: unknown): value is WorkSummary | undefined {
+  if (value === undefined) return true;
+  if (!isRecord(value)) return false;
+  return [
+    value.current,
+    value.lastCommand,
+    value.lastEdit,
+    value.lastMessage,
+    value.lastTool,
+    value.lastPrompt,
+  ].every((entry) => isOptionalSafeString(entry, MAX_EVENT_SUMMARY_LENGTH));
 }
 
 function isEventSummary(value: unknown): value is EventSummary {
   if (!isRecord(value)) return false;
   return (
-    isFiniteNumber(value.ts) &&
-    typeof value.type === "string" &&
-    typeof value.summary === "string" &&
+    isNonNegativeFiniteNumber(value.ts) &&
+    isNonEmptySafeString(value.type, MAX_EVENT_TYPE_LENGTH) &&
+    isSafeString(value.summary, MAX_EVENT_SUMMARY_LENGTH) &&
     (value.isError === undefined || typeof value.isError === "boolean") &&
     isOptionalTurnId(value.turnId)
   );
@@ -92,32 +142,45 @@ function isEventSummary(value: unknown): value is EventSummary {
 function isAgentSnapshot(value: unknown): value is AgentSnapshot {
   if (!isRecord(value)) return false;
   if (
-    typeof value.id !== "string" ||
-    !isFiniteNumber(value.pid) ||
-    typeof value.cmd !== "string" ||
-    typeof value.cmdShort !== "string" ||
+    !isNonEmptySafeString(value.id) ||
+    !isNonNegativeInteger(value.pid) ||
+    !isNonEmptySafeString(value.cmd) ||
+    !isNonEmptySafeString(value.cmdShort) ||
     typeof value.kind !== "string" ||
     !agentKinds.has(value.kind as AgentKind) ||
     typeof value.state !== "string" ||
     !agentStates.has(value.state as AgentState) ||
-    !isFiniteNumber(value.cpu) ||
-    !isFiniteNumber(value.mem)
+    !isNonNegativeFiniteNumber(value.cpu) ||
+    !isNonNegativeFiniteNumber(value.mem)
   ) {
     return false;
   }
   if (
-    !isOptionalString(value.identity) ||
-    !isOptionalString(value.title) ||
-    !isOptionalString(value.doing) ||
-    !isOptionalString(value.sessionPath) ||
-    !isOptionalString(value.repo) ||
-    !isOptionalString(value.cwd) ||
-    !isOptionalString(value.model)
+    !isOptionalSafeString(value.identity) ||
+    !isOptionalSafeString(value.title) ||
+    !isOptionalSafeString(value.doing) ||
+    !isOptionalSafeString(value.sessionPath) ||
+    !isOptionalSafeString(value.repo) ||
+    !isOptionalSafeString(value.cwd) ||
+    !isOptionalSafeString(value.model) ||
+    !isOptionalSafeString(value.activityReason)
+  ) {
+    return false;
+  }
+  if (
+    !isOptionalTimestamp(value.startedAt) ||
+    !isOptionalTimestamp(value.lastEventAt) ||
+    !isOptionalTimestamp(value.lastActivityAt) ||
+    !isWorkSummary(value.summary)
   ) {
     return false;
   }
   if (value.events !== undefined) {
-    if (!Array.isArray(value.events) || !value.events.every(isEventSummary)) {
+    if (
+      !Array.isArray(value.events) ||
+      value.events.length > MAX_EVENTS_PER_AGENT ||
+      !value.events.every(isEventSummary)
+    ) {
       return false;
     }
   }
@@ -134,8 +197,9 @@ export function parseSnapshot(input: string, source: string): SnapshotPayload {
 
   if (
     !isRecord(parsed) ||
-    !isFiniteNumber(parsed.ts) ||
+    !isNonNegativeFiniteNumber(parsed.ts) ||
     !Array.isArray(parsed.agents) ||
+    parsed.agents.length > MAX_AGENTS ||
     !parsed.agents.every(isAgentSnapshot)
   ) {
     throw new Error(`invalid snapshot payload from ${source}`);
