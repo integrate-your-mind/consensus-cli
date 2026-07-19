@@ -93,6 +93,36 @@ describe("harness event state", () => {
     assert.equal(state.inFlight, true);
   });
 
+  it("keeps prompt expansion as activity without adding a graph event", () => {
+    const map = applyHarnessEvent(
+      new Map(),
+      event("UserPromptExpansion", 10)
+    );
+    const state = [...map.values()][0];
+
+    assert.equal(state.inFlight, true);
+    assert.equal(state.lastActivityAt, 10);
+    assert.equal(state.events.length, 0);
+  });
+
+  it("marks Copilot errorOccurred metadata as an error without ending the turn", () => {
+    let map = applyHarnessEvent(
+      new Map(),
+      event("UserPromptSubmit", 1, { harnessId: "copilot" })
+    );
+    map = applyHarnessEvent(
+      map,
+      event("ErrorOccurred", 2, { harnessId: "copilot" })
+    );
+    const state = [...map.values()][0];
+
+    assert.equal(state.hasError, true);
+    assert.equal(state.inFlight, true);
+    assert.equal(state.lastEventType, "ErrorOccurred");
+    assert.equal(state.events.at(-1)?.type, "error.occurred");
+    assert.equal(state.events.at(-1)?.isError, true);
+  });
+
   it("expires an in-flight session after the configured timeout", () => {
     const previous = process.env.CONSENSUS_HARNESS_INFLIGHT_TIMEOUT_MS;
     process.env.CONSENSUS_HARNESS_INFLIGHT_TIMEOUT_MS = "10";
