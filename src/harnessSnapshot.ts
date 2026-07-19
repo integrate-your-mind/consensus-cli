@@ -2,7 +2,10 @@ import {
   harnessIdForKind,
   type HarnessId,
 } from "./harnesses.js";
-import { isHookHarnessId } from "./harnessHookModel.js";
+import {
+  isHookHarnessId,
+  type HookHarnessId,
+} from "./harnessHookModel.js";
 import {
   listHarnessActivity,
   type HarnessSessionState,
@@ -105,19 +108,21 @@ function attachState(
 ): AgentSnapshot {
   const events = mergeEvents(agent.events, state.events);
   const summary = summaryFromEvents(agent.summary, events);
-  const nextState = stateForHarnessSession(state);
+  const hookIsCurrent = state.lastSeenAt >= (agent.lastEventAt ?? 0);
+  const nextState = hookIsCurrent ? stateForHarnessSession(state) : agent.state;
   return {
     ...agent,
     state: nextState,
-    activityReason:
-      nextState === "error"
+    activityReason: hookIsCurrent
+      ? nextState === "error"
         ? "harness_hook_error"
         : nextState === "active"
           ? "harness_hook_in_flight"
-          : "harness_hook_idle",
+          : "harness_hook_idle"
+      : agent.activityReason,
     lastEventAt: maxDefined(agent.lastEventAt, state.lastSeenAt),
     lastActivityAt:
-      nextState === "idle"
+      hookIsCurrent && nextState === "idle"
         ? undefined
         : maxDefined(agent.lastActivityAt, state.lastActivityAt),
     doing: summary?.current ?? agent.doing,
@@ -129,9 +134,9 @@ function attachState(
 }
 
 export function attachHarnessEvents(snapshot: SnapshotPayload): SnapshotPayload {
-  const agentsByHarness = new Map<HarnessId, AgentSnapshot[]>();
+  const agentsByHarness = new Map<HookHarnessId, AgentSnapshot[]>();
   for (const agent of snapshot.agents) {
-    const harnessId = harnessIdForKind(agent.kind);
+    const harnessId: HarnessId = harnessIdForKind(agent.kind);
     if (!isHookHarnessId(harnessId)) continue;
     const current = agentsByHarness.get(harnessId) ?? [];
     current.push(agent);
