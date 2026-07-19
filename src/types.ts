@@ -42,6 +42,8 @@ export interface AgentSnapshot {
   model?: string;
   summary?: WorkSummary;
   events?: EventSummary[];
+  harnessSessionKey?: string;
+  harnessCwdKey?: string;
 }
 
 export interface SnapshotMeta {
