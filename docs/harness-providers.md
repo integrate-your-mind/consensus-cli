@@ -1,11 +1,11 @@
 # Harness providers
 
-Consensus models the **agent harness or runtime** separately from the model provider.
+Consensus models the **agent harness or runtime** separately from the model or tool provider.
 
 Examples:
 
 - `openai`, `anthropic`, `minimax`, and `moonshot` may provide models or tools.
-- Codex, Claude Code, OpenClaw, Hermes, Kimi Code, Cursor Agent, Factory Droid, and Warp Oz provide execution loops or agent surfaces.
+- Codex, Claude Code, OpenClaw, Hermes, Kimi Code, Cursor Agent, Factory Droid, Gemini CLI, GitHub Copilot CLI, and Warp Oz provide execution loops or agent surfaces.
 
 This distinction prevents a MiniMax model used inside OpenClaw from being reported as a separate agent loop unless a distinct MiniMax runtime is actually running.
 
@@ -29,16 +29,16 @@ Consensus reports coverage by evidence source rather than a single supported fla
 | OpenCode | Local server/TUI | HTTP API and SSE event streams | Event graph |
 | Claude Code | Local CLI | Lifecycle hooks | Event graph |
 | OpenClaw | Local server/runtime | Gateway RPC run, tool, assistant, and lifecycle streams | Process discovery; native adapter next |
-| Hermes Agent | Local CLI/gateway | Gateway, plugin, and shell hooks | Process discovery; hook adapter next |
-| Kimi Code | Local CLI | Lifecycle hooks | Process discovery; hook adapter next |
+| Hermes Agent | Local CLI/gateway | Gateway, plugin, and shell hooks | Process discovery plus shared hook graph |
+| Kimi Code | Local CLI | Lifecycle hooks | Process discovery plus shared hook graph |
 | MiniMax CLI | Tool/model integration | CLI invocation inside another harness | Tool-only discovery |
 | Cursor Agent | Local CLI/remote agent | Partial hooks and `stream-json` CLI output | Process discovery; stream adapter next |
 | Warp Oz | Local and remote agent | Oz API/SDK run status and transcripts | Process discovery; remote API adapter next |
-| Factory Droid | Local CLI | Lifecycle hooks | Process discovery; hook adapter next |
-| Qwen Code | Local CLI | Command or HTTP lifecycle hooks | Process discovery; hook adapter next |
-| Gemini CLI | Local CLI | No Consensus event adapter yet | Process discovery |
+| Factory Droid | Local CLI | Lifecycle hooks | Process discovery plus shared hook graph |
+| Qwen Code | Local CLI | Command or HTTP lifecycle hooks | Process discovery plus shared hook graph |
+| Gemini CLI | Local CLI | Lifecycle hooks | Process discovery plus shared hook graph |
+| GitHub Copilot CLI | Local CLI | Lifecycle hooks | Process discovery plus shared hook graph |
 | Antigravity CLI | Local CLI | No Consensus event adapter yet | Process discovery |
-| GitHub Copilot CLI | Local CLI | No Consensus event adapter yet | Process discovery |
 | Aider | Local CLI | No Consensus event adapter yet | Process discovery |
 | Goose | Local CLI | No Consensus event adapter yet | Process discovery |
 | Amp | Local CLI | No Consensus event adapter yet | Process discovery |
@@ -54,7 +54,7 @@ Consensus reports coverage by evidence source rather than a single supported fla
 
 ## Process discovery contract
 
-The one-shot snapshot and graph commands detect exact executable names. They do not search arbitrary prompt text for provider names.
+The snapshot and graph scanners detect exact executable names. They do not search arbitrary prompt text for provider names.
 
 Examples:
 
@@ -64,12 +64,58 @@ Examples:
 - `oz agent run` becomes `warp-cli`; unrelated `oz` commands are ignored.
 - `q chat` becomes `amazon-q-cli`; unrelated `q` processes are ignored.
 - Cursor detection uses `cursor-agent`; the generic executable name `agent` is not matched.
+- Windows `.exe` names receive the same exact-token matching as Unix executables.
 
-Generic detections carry no synthetic step events. Their graph coverage is therefore explicit about being process-only, tool-only, hook-ready, stream-ready, or remote-API-ready.
+Generic process snapshots deliberately do not export raw command lines. Inline prompts, session arguments, and other command payloads are replaced by a stable harness label. Raw working-directory and session values are used only to derive redacted display fields and opaque correlation keys.
+
+Generic discovery uses a short process and usage cache so a fast dashboard poll does not issue a second full process query for every harness. Set `CONSENSUS_GENERIC_PROCESS_CACHE_MS=0` to disable this cache.
+
+## Shared hook collector
+
+The metadata-only collector is:
+
+```text
+node /path/to/consensus-cli/dist/harnessHook.js <harness-id>
+```
+
+Supported hook IDs are:
+
+```text
+claude
+hermes
+kimi
+factory
+gemini
+qwen
+copilot
+```
+
+The collector accepts provider JSON on standard input and writes normalized metadata to `~/.consensus/harness-events.jsonl` by default. It does not retain prompt text, assistant text, tool input or output, shell commands, raw paths, raw session identifiers, raw turn identifiers, or error details.
+
+Gemini CLI and GitHub Copilot CLI require valid JSON on hook stdout. Consensus returns a compact one-line `{}` acknowledgment for those two harnesses, including malformed or ignored input. Passive command-hook providers remain silent.
+
+The shared log:
+
+- Uses mode `0600` in a directory created with mode `0700`.
+- Uses an inter-process lock for append and trim operations.
+- Deduplicates repeat deliveries both in memory and against the recent on-disk tail.
+- Bounds UTF-8 byte size and keeps complete JSON lines.
+- Rejects malformed, expired, and far-future records during replay.
+- Can be disabled with `CONSENSUS_HARNESS_EVENT_LOG=0`.
+
+## Session assignment
+
+Hook history attaches to a process in this order:
+
+1. Exact opaque session key.
+2. A working-directory key only when exactly one unclaimed session matches.
+3. A one-process/one-session fallback only when both sides are unambiguous.
+
+When several sessions share a directory, Consensus leaves them unattached rather than assigning the newest session to an arbitrary process.
 
 ## Adapter order
 
-1. **Shared hook adapter:** Claude-style lifecycle JSON covers Kimi Code, Factory Droid, and Qwen Code with small provider maps. Hermes uses a related hook surface and can feed the same normalized event model through a provider-specific translator.
+1. **Shared hook adapter:** Claude, Hermes, Kimi Code, Factory Droid, Gemini CLI, Qwen Code, and GitHub Copilot CLI feed one normalized, metadata-only event model.
 2. **OpenClaw adapter:** consume Gateway RPC lifecycle, assistant, and tool streams keyed by `runId` and session.
 3. **Cursor adapter:** ingest `--output-format stream-json` for headless runs and use supported CLI hooks where available.
 4. **Warp adapter:** read Oz run status, transcripts, and metadata through the official API/SDK.
@@ -87,12 +133,13 @@ Provider contracts were checked on July 19, 2026:
 - Codex configuration: <https://developers.openai.com/codex/config-reference>
 - Claude Code hooks: <https://code.claude.com/docs/en/hooks>
 - OpenCode server and SSE: <https://opencode.ai/docs/server/>
-- OpenClaw agent loop and runtimes: <https://docs.openclaw.ai/agent-loop> and <https://docs.openclaw.ai/concepts/agent-runtimes>
+- OpenClaw agent loop and runtimes: <https://docs.openclaw.ai/concepts/agent-loop> and <https://docs.openclaw.ai/concepts/agent-runtimes>
 - Hermes hooks: <https://hermes-agent.nousresearch.com/docs/user-guide/features/hooks/>
 - Kimi Code hooks: <https://moonshotai.github.io/kimi-code/en/customization/hooks>
 - MiniMax CLI: <https://platform.minimax.io/docs/token-plan/minimax-cli>
 - Cursor CLI: <https://docs.cursor.com/en/cli/using>
 - Warp Oz CLI/API: <https://docs.warp.dev/reference>
 - Factory Droid hooks: <https://docs.factory.ai/reference/hooks-reference>
+- Gemini CLI hooks: <https://geminicli.com/docs/hooks/>
 - Qwen Code hooks: <https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>
-- Gemini CLI: <https://developers.google.com/gemini-code-assist/docs/gemini-cli>
+- GitHub Copilot hooks: <https://docs.github.com/en/copilot/reference/hooks-reference>
