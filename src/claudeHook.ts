@@ -9,6 +9,9 @@ type NormalizedEvent = {
   cwd?: string;
   transcriptPath?: string;
   notificationType?: string;
+  toolName?: string;
+  agentType?: string;
+  final?: boolean;
   timestamp: number;
 };
 
@@ -16,6 +19,10 @@ function readString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function readBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
 }
 
 async function readStdin(): Promise<string> {
@@ -35,17 +42,18 @@ function normalizePayload(payload: RawPayload): NormalizedEvent | null {
     readString(payload.type);
   const sessionId = readString(payload.session_id) || readString(payload.sessionId);
   if (!hookEvent || !sessionId) return null;
-  const cwd = readString(payload.cwd);
-  const transcriptPath = readString(payload.transcript_path) || readString(payload.transcriptPath);
-  const notificationType =
-    readString(payload.notification_type) || readString(payload.notificationType);
 
   return {
     type: hookEvent,
     sessionId,
-    cwd,
-    transcriptPath,
-    notificationType,
+    cwd: readString(payload.cwd),
+    transcriptPath:
+      readString(payload.transcript_path) || readString(payload.transcriptPath),
+    notificationType:
+      readString(payload.notification_type) || readString(payload.notificationType),
+    toolName: readString(payload.tool_name) || readString(payload.toolName),
+    agentType: readString(payload.agent_type) || readString(payload.agentType),
+    final: readBoolean(payload.final),
     timestamp: Date.now(),
   };
 }

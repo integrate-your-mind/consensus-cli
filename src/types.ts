@@ -1,20 +1,14 @@
+import type { AgentKind } from "./harnesses.js";
+
+export type { AgentKind } from "./harnesses.js";
 export type AgentState = "active" | "idle" | "error";
-export type AgentKind =
-  | "tui"
-  | "exec"
-  | "app-server"
-  | "opencode-tui"
-  | "opencode-cli"
-  | "opencode-server"
-  | "claude-tui"
-  | "claude-cli"
-  | "unknown";
 
 export interface EventSummary {
   ts: number;
   type: string;
   summary: string;
   isError?: boolean;
+  turnId?: string | number;
 }
 
 export interface WorkSummary {
@@ -48,6 +42,8 @@ export interface AgentSnapshot {
   model?: string;
   summary?: WorkSummary;
   events?: EventSummary[];
+  harnessSessionKey?: string;
+  harnessCwdKey?: string;
 }
 
 export interface SnapshotMeta {
