@@ -207,8 +207,10 @@ export function handleNormalizedHarnessEvent(
   event: NormalizedHarnessHookEvent,
   persist = true
 ): void {
-  const now = Math.max(Date.now(), event.timestamp);
-  const next = applyHarnessEvent(pruneState(new Map(stateBySession), now), event);
+  const next = applyHarnessEvent(
+    pruneState(new Map(stateBySession), event.timestamp),
+    event
+  );
   replaceState(next);
   if (persist) void queueHarnessEventPersistence(event);
 }
