@@ -28,67 +28,105 @@ function maxDefined(values: Array<number | undefined>): number | undefined {
   return max;
 }
 
+function sortedAdjacency(
+  nodeIds: string[],
+  edges: AgentGraphEdge[],
+  reverse = false
+): Map<string, string[]> {
+  const targetSets = new Map<string, Set<string>>();
+  for (const nodeId of nodeIds) targetSets.set(nodeId, new Set());
+
+  for (const edge of edges) {
+    const source = reverse ? edge.target : edge.source;
+    const target = reverse ? edge.source : edge.target;
+    const targets = targetSets.get(source);
+    if (!targets || !targetSets.has(target)) continue;
+    targets.add(target);
+  }
+
+  return new Map(
+    [...targetSets.entries()].map(([nodeId, targets]) => [
+      nodeId,
+      [...targets].sort(),
+    ])
+  );
+}
+
 function findStronglyConnectedComponents(
   nodeIds: string[],
   edges: AgentGraphEdge[]
 ): string[][] {
-  const adjacency = new Map<string, string[]>();
-  for (const nodeId of nodeIds) adjacency.set(nodeId, []);
-  for (const edge of edges) {
-    if (edge.kind !== "transition") continue;
-    if (!adjacency.has(edge.source) || !adjacency.has(edge.target)) continue;
-    adjacency.get(edge.source)?.push(edge.target);
-  }
-  for (const targets of adjacency.values()) targets.sort();
+  const uniqueNodeIds = [...new Set(nodeIds)].sort();
+  const adjacency = sortedAdjacency(uniqueNodeIds, edges);
+  const reverseAdjacency = sortedAdjacency(uniqueNodeIds, edges, true);
+  const visited = new Set<string>();
+  const finishOrder: string[] = [];
 
-  let nextIndex = 0;
-  const indexByNode = new Map<string, number>();
-  const lowLinkByNode = new Map<string, number>();
-  const stack: string[] = [];
-  const onStack = new Set<string>();
-  const components: string[][] = [];
+  for (const startNodeId of uniqueNodeIds) {
+    if (visited.has(startNodeId)) continue;
+    visited.add(startNodeId);
+    const stack: Array<{ nodeId: string; nextTargetIndex: number }> = [
+      { nodeId: startNodeId, nextTargetIndex: 0 },
+    ];
 
-  const visit = (nodeId: string): void => {
-    indexByNode.set(nodeId, nextIndex);
-    lowLinkByNode.set(nodeId, nextIndex);
-    nextIndex += 1;
-    stack.push(nodeId);
-    onStack.add(nodeId);
-
-    for (const target of adjacency.get(nodeId) ?? []) {
-      if (!indexByNode.has(target)) {
-        visit(target);
-        lowLinkByNode.set(
-          nodeId,
-          Math.min(lowLinkByNode.get(nodeId) ?? 0, lowLinkByNode.get(target) ?? 0)
-        );
-      } else if (onStack.has(target)) {
-        lowLinkByNode.set(
-          nodeId,
-          Math.min(lowLinkByNode.get(nodeId) ?? 0, indexByNode.get(target) ?? 0)
-        );
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1];
+      const targets = adjacency.get(frame.nodeId) ?? [];
+      if (frame.nextTargetIndex < targets.length) {
+        const target = targets[frame.nextTargetIndex];
+        frame.nextTargetIndex += 1;
+        if (!visited.has(target)) {
+          visited.add(target);
+          stack.push({ nodeId: target, nextTargetIndex: 0 });
+        }
+        continue;
       }
-    }
 
-    if (lowLinkByNode.get(nodeId) !== indexByNode.get(nodeId)) return;
+      stack.pop();
+      finishOrder.push(frame.nodeId);
+    }
+  }
+
+  const assigned = new Set<string>();
+  const components: string[][] = [];
+  for (let index = finishOrder.length - 1; index >= 0; index -= 1) {
+    const startNodeId = finishOrder[index];
+    if (assigned.has(startNodeId)) continue;
 
     const component: string[] = [];
+    const stack = [startNodeId];
+    assigned.add(startNodeId);
     while (stack.length > 0) {
-      const member = stack.pop();
-      if (!member) break;
-      onStack.delete(member);
-      component.push(member);
-      if (member === nodeId) break;
+      const nodeId = stack.pop();
+      if (!nodeId) continue;
+      component.push(nodeId);
+      for (const target of reverseAdjacency.get(nodeId) ?? []) {
+        if (assigned.has(target)) continue;
+        assigned.add(target);
+        stack.push(target);
+      }
     }
     component.sort();
     components.push(component);
-  };
-
-  for (const nodeId of [...nodeIds].sort()) {
-    if (!indexByNode.has(nodeId)) visit(nodeId);
   }
 
-  return components;
+  return components.sort((a, b) => (a[0] ?? "").localeCompare(b[0] ?? ""));
+}
+
+function isTurnScopedTransition(
+  edge: AgentGraphEdge,
+  stepNodeById: Map<string, AgentGraphNode>
+): boolean {
+  if (edge.kind !== "transition") return false;
+  const source = stepNodeById.get(edge.source);
+  const target = stepNodeById.get(edge.target);
+  if (!source || !target) return false;
+  return (
+    source.agentKey === target.agentKey &&
+    source.provider === target.provider &&
+    typeof source.segment === "number" &&
+    source.segment === target.segment
+  );
 }
 
 export function detectGraphLoops(
@@ -97,14 +135,16 @@ export function detectGraphLoops(
 ): AgentGraphLoop[] {
   const stepNodes = nodes.filter((node) => node.kind === "step");
   const stepNodeById = new Map(stepNodes.map((node) => [node.id, node]));
-  const transitionEdges = edges.filter((edge) => edge.kind === "transition");
+  const transitionEdges = edges.filter((edge) =>
+    isTurnScopedTransition(edge, stepNodeById)
+  );
   const selfLoopNodeIds = new Set(
     transitionEdges
       .filter((edge) => edge.source === edge.target)
       .map((edge) => edge.source)
   );
   const components = findStronglyConnectedComponents(
-    stepNodes.map((node) => node.id),
+    [...stepNodeById.keys()],
     transitionEdges
   );
 
