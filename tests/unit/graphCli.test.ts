@@ -1,6 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { loadSnapshot, parseSnapshot } from "../../src/cli/graph.js";
+import {
+  loadSnapshot,
+  MAX_SNAPSHOT_BYTES,
+  parseSnapshot,
+} from "../../src/cli/graph.js";
 import type { SnapshotPayload } from "../../src/types.js";
 
 const validSnapshot: SnapshotPayload = {
@@ -48,6 +52,14 @@ describe("graph CLI snapshot contract", () => {
     assert.throws(
       () => parseSnapshot("{", "test"),
       /invalid snapshot JSON from test/
+    );
+  });
+
+  it("rejects oversized snapshot text before JSON parsing", () => {
+    const oversized = " ".repeat(MAX_SNAPSHOT_BYTES + 1);
+    assert.throws(
+      () => parseSnapshot(oversized, "test"),
+      /snapshot from test exceeds/
     );
   });
 
