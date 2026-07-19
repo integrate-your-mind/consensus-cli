@@ -85,6 +85,20 @@ describe("harness event log", { concurrency: false }, () => {
     });
   });
 
+  it("deduplicates a retry already written by another hook process", async () => {
+    await withLog(async (_directory, logPath) => {
+      const duplicate = event(3);
+      await writeFile(logPath, `${JSON.stringify(duplicate)}\n`, "utf8");
+      void queueHarnessEventPersistence(duplicate);
+      await flushHarnessEventPersistence();
+
+      const lines = (await readFile(logPath, "utf8"))
+        .split(/\r?\n/)
+        .filter(Boolean);
+      assert.equal(lines.length, 1);
+    });
+  });
+
   it("captures the configured path when writes are queued", async () => {
     await withLog(async (directory, firstPath) => {
       const secondPath = path.join(directory, "later.jsonl");
