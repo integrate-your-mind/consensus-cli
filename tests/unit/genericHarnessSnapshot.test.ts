@@ -1,6 +1,9 @@
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { attachGenericHarnessProcesses } from "../../src/genericHarnessSnapshot.js";
+import {
+  attachGenericHarnessProcesses,
+  resetGenericHarnessProcessCacheForTests,
+} from "../../src/genericHarnessSnapshot.js";
 import { buildAgentGraph } from "../../src/graph.js";
 import { harnessCwdKey, harnessSessionKey } from "../../src/harnessKeys.js";
 import type { SnapshotPayload } from "../../src/types.js";
@@ -9,6 +12,10 @@ const emptySnapshot: SnapshotPayload = {
   ts: 10_000,
   agents: [],
 };
+
+beforeEach(() => {
+  resetGenericHarnessProcessCacheForTests();
+});
 
 describe("generic harness snapshot", () => {
   it("adds process-level agents for detected runtimes", async () => {
@@ -37,6 +44,8 @@ describe("generic harness snapshot", () => {
     assert.equal(openclaw?.repo, "project");
     assert.equal(openclaw?.startedAt, 8);
     assert.equal(openclaw?.identity, "openclaw:pid:10:start:8");
+    assert.equal(openclaw?.cmd, "openclaw agent");
+    assert.equal(openclaw?.cmdShort, "openclaw agent");
     assert.equal(
       openclaw?.harnessCwdKey,
       harnessCwdKey("openclaw", "/tmp/project")
@@ -90,27 +99,104 @@ describe("generic harness snapshot", () => {
     assert.equal(snapshot.agents[0].kind, "tui");
   });
 
-  it("keeps command prompts out of titles and doing summaries", async () => {
+  it("does not export command prompts or session values", async () => {
     const secret = "private prompt contents";
+    const sessionSecret = "session-secret-value";
     const snapshot = await attachGenericHarnessProcesses(emptySnapshot, {
       processes: [
         {
           pid: 70,
           name: "cursor-agent",
-          cmd: `cursor-agent --print ${secret}`,
+          cmd: `cursor-agent --print ${secret} --session ${sessionSecret}`,
         },
       ],
       usage: { 70: { cpu: 0, memory: 0 } },
     });
 
     const agent = snapshot.agents[0];
+    const serialized = JSON.stringify(agent);
     assert.equal(agent.title, "Cursor Agent");
     assert.equal(agent.doing, "Cursor Agent agent");
-    assert.equal(agent.title?.includes(secret), false);
-    assert.equal(agent.doing?.includes(secret), false);
+    assert.equal(agent.cmd, "cursor agent");
+    assert.equal(agent.cmdShort, "cursor agent");
+    assert.equal(serialized.includes(secret), false);
+    assert.equal(serialized.includes(sessionSecret), false);
+    assert.match(agent.harnessSessionKey ?? "", /^[a-f0-9]{24}$/);
   });
 
-  it("reports honest process-only coverage in the graph", async () => {
+  it("sanitizes control and bidi characters from exported paths", async () => {
+    const snapshot = await attachGenericHarnessProcesses(emptySnapshot, {
+      processes: [
+        {
+          pid: 71,
+          name: "droid",
+          cmd: "droid --cwd '/tmp/repo\u001b[2J\u202Eevil'",
+        },
+      ],
+      usage: { 71: { cpu: 0, memory: 0 } },
+    });
+    const serialized = JSON.stringify(snapshot.agents[0]);
+
+    assert.equal(
+      /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(
+        serialized
+      ),
+      false
+    );
+  });
+
+  it("caches generic process and usage discovery for short polling windows", async () => {
+    let processLoads = 0;
+    let usageLoads = 0;
+    const processLoader = async () => {
+      processLoads += 1;
+      return [{ pid: 72, name: "gemini", cmd: "gemini" }];
+    };
+    const usageLoader = async () => {
+      usageLoads += 1;
+      return { 72: { cpu: 0, memory: 0 } };
+    };
+
+    const first = await attachGenericHarnessProcesses(emptySnapshot, {
+      cacheMs: 1_000,
+      processLoader,
+      usageLoader,
+    });
+    const second = await attachGenericHarnessProcesses(emptySnapshot, {
+      cacheMs: 1_000,
+      processLoader,
+      usageLoader,
+    });
+
+    assert.equal(first.agents.length, 1);
+    assert.equal(second.agents.length, 1);
+    assert.equal(processLoads, 1);
+    assert.equal(usageLoads, 1);
+  });
+
+  it("can disable generic process caching for deterministic refreshes", async () => {
+    let processLoads = 0;
+    const processLoader = async () => {
+      processLoads += 1;
+      return [{ pid: 73, name: "copilot", cmd: "copilot" }];
+    };
+    const usageLoader = async () => ({ 73: { cpu: 0, memory: 0 } });
+
+    await attachGenericHarnessProcesses(emptySnapshot, {
+      cacheMs: 0,
+      processLoader,
+      usageLoader,
+    });
+    await attachGenericHarnessProcesses(emptySnapshot, {
+      cacheMs: 0,
+      processLoader,
+      usageLoader,
+    });
+
+    assert.equal(processLoads, 2);
+  });
+
+  it("reports honest hook coverage when no hook history is attached", async () => {
     const snapshot = await attachGenericHarnessProcesses(emptySnapshot, {
       processes: [{ pid: 80, name: "gemini", cmd: "gemini" }],
       usage: { 80: { cpu: 0, memory: 0 } },
@@ -122,7 +208,7 @@ describe("generic harness snapshot", () => {
     assert.equal(graph.coverage.providers.gemini.history, "unavailable");
     assert.match(
       graph.coverage.providers.gemini.note ?? "",
-      /process-level coverage only/i
+      /no retained hook events/i
     );
   });
 
