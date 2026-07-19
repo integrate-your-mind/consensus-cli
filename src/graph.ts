@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto";
+import {
+  harnessCoverageNote,
+  harnessDefinitions,
+  harnessIdForKind,
+} from "./harnesses.js";
 import type {
   AgentKind,
   AgentSnapshot,
@@ -77,11 +82,7 @@ function identityForAgent(agent: AgentSnapshot): string {
 }
 
 function providerForKind(kind: AgentKind): string {
-  if (kind.startsWith("opencode")) return "opencode";
-  if (kind.startsWith("claude")) return "claude";
-  if (kind === "app-server") return "server";
-  if (kind === "unknown") return "other";
-  return "codex";
+  return harnessIdForKind(kind);
 }
 
 function opaqueAgentKey(provider: string, identity: string): string {
@@ -309,22 +310,24 @@ function historyStatusForProvider(
       note: "Only some observed agents included retained events.",
     };
   }
-  if (provider === "claude") {
-    return {
-      history: "unavailable",
-      note:
-        "No retained Claude hook events were available; hooks may be unconfigured, history may be disabled, or events may be outside the retention window.",
-    };
-  }
   if (provider === "codex" || provider === "opencode") {
     return {
       history: "available",
       note: "No retained graph events were present in this snapshot window.",
     };
   }
+
+  const harness = harnessDefinitions.find((candidate) => candidate.id === provider);
+  if (harness) {
+    return {
+      history: "unavailable",
+      note: harnessCoverageNote(harness, false),
+    };
+  }
+
   return {
     history: "unavailable",
-    note: "This provider does not expose retained graph events in the current adapter.",
+    note: "This harness does not expose retained graph events in the current adapter.",
   };
 }
 
