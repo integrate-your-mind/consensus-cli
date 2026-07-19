@@ -4,18 +4,24 @@ import http from "node:http";
 import { getOpenCodeSessionActivity } from "../../src/opencodeApi.js";
 import { deriveOpenCodeState } from "../../src/opencodeState.ts";
 
+const originalStale = process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS;
+process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS = "0";
+
 // Helper to create a mock HTTP server that returns specified messages
 function createMockServer(
   responseData: unknown,
   statusCode = 200,
   contentType = "application/json"
 ): Promise<{ server: http.Server; port: number; close: () => Promise<void> }> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       res.writeHead(statusCode, { "Content-Type": contentType });
       res.end(JSON.stringify(responseData));
     });
+    const onError = (err: unknown) => reject(err);
+    server.once("error", onError);
     server.listen(0, "127.0.0.1", () => {
+      server.off("error", onError);
       const addr = server.address() as { port: number };
       resolve({
         server,
@@ -26,7 +32,24 @@ function createMockServer(
   });
 }
 
-test("getOpenCodeSessionActivity returns inFlight=true for incomplete assistant message", async () => {
+async function createMockServerOrSkip(
+  t: any,
+  responseData: unknown,
+  statusCode = 200,
+  contentType = "application/json"
+): Promise<{ server: http.Server; port: number; close: () => Promise<void> } | null> {
+  try {
+    return await createMockServer(responseData, statusCode, contentType);
+  } catch (err: any) {
+    if (err?.code === "EPERM") {
+      t.skip("Sandbox blocks listen(127.0.0.1) for integration tests");
+      return null;
+    }
+    throw err;
+  }
+}
+
+test("getOpenCodeSessionActivity returns inFlight=true for incomplete assistant message", async (t) => {
   const messages = [
     {
       info: {
@@ -38,7 +61,8 @@ test("getOpenCodeSessionActivity returns inFlight=true for incomplete assistant 
       parts: [],
     },
   ];
-  const mock = await createMockServer(messages);
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -51,7 +75,7 @@ test("getOpenCodeSessionActivity returns inFlight=true for incomplete assistant 
   }
 });
 
-test("getOpenCodeSessionActivity returns inFlight=false for completed assistant message", async () => {
+test("getOpenCodeSessionActivity returns inFlight=false for completed assistant message", async (t) => {
   const messages = [
     {
       info: {
@@ -63,7 +87,8 @@ test("getOpenCodeSessionActivity returns inFlight=false for completed assistant 
       parts: [],
     },
   ];
-  const mock = await createMockServer(messages);
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -76,7 +101,7 @@ test("getOpenCodeSessionActivity returns inFlight=false for completed assistant 
   }
 });
 
-test("getOpenCodeSessionActivity returns inFlight=true for pending tool call", async () => {
+test("getOpenCodeSessionActivity returns inFlight=true for pending tool call", async (t) => {
   const messages = [
     {
       info: {
@@ -91,7 +116,8 @@ test("getOpenCodeSessionActivity returns inFlight=true for pending tool call", a
       ],
     },
   ];
-  const mock = await createMockServer(messages);
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -104,7 +130,7 @@ test("getOpenCodeSessionActivity returns inFlight=true for pending tool call", a
   }
 });
 
-test("getOpenCodeSessionActivity returns inFlight=true for running tool call", async () => {
+test("getOpenCodeSessionActivity returns inFlight=true for running tool call", async (t) => {
   const messages = [
     {
       info: {
@@ -118,7 +144,8 @@ test("getOpenCodeSessionActivity returns inFlight=true for running tool call", a
       ],
     },
   ];
-  const mock = await createMockServer(messages);
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -131,7 +158,7 @@ test("getOpenCodeSessionActivity returns inFlight=true for running tool call", a
   }
 });
 
-test("getOpenCodeSessionActivity returns inFlight=false when all tools completed", async () => {
+test("getOpenCodeSessionActivity returns inFlight=false when all tools completed", async (t) => {
   const messages = [
     {
       info: {
@@ -146,7 +173,8 @@ test("getOpenCodeSessionActivity returns inFlight=false when all tools completed
       ],
     },
   ];
-  const mock = await createMockServer(messages);
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -159,7 +187,7 @@ test("getOpenCodeSessionActivity returns inFlight=false when all tools completed
   }
 });
 
-test("getOpenCodeSessionActivity returns inFlight=true for incomplete part (no end time)", async () => {
+test("getOpenCodeSessionActivity returns inFlight=true for incomplete part (no end time)", async (t) => {
   const messages = [
     {
       info: {
@@ -173,7 +201,8 @@ test("getOpenCodeSessionActivity returns inFlight=true for incomplete part (no e
       ],
     },
   ];
-  const mock = await createMockServer(messages);
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -186,8 +215,38 @@ test("getOpenCodeSessionActivity returns inFlight=true for incomplete part (no e
   }
 });
 
-test("getOpenCodeSessionActivity handles empty messages array", async () => {
-  const mock = await createMockServer([]);
+test("getOpenCodeSessionActivity returns inFlight=false when message completed but parts incomplete", async (t) => {
+  const now = Date.now();
+  const messages = [
+    {
+      info: {
+        id: "msg_1",
+        sessionID: "ses_test",
+        role: "assistant",
+        time: { created: now - 2000, completed: now - 1000 },
+      },
+      parts: [
+        { id: "prt_1", type: "reasoning", time: { start: now - 1500 } },
+      ],
+    },
+  ];
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
+  try {
+    const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
+      silent: true,
+      timeoutMs: 5000,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.inFlight, false, "Completed message should end in-flight");
+  } finally {
+    await mock.close();
+  }
+});
+
+test("getOpenCodeSessionActivity handles empty messages array", async (t) => {
+  const mock = await createMockServerOrSkip(t, []);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -200,8 +259,9 @@ test("getOpenCodeSessionActivity handles empty messages array", async () => {
   }
 });
 
-test("getOpenCodeSessionActivity handles non-200 response", async () => {
-  const mock = await createMockServer({ error: "not found" }, 404);
+test("getOpenCodeSessionActivity handles non-200 response", async (t) => {
+  const mock = await createMockServerOrSkip(t, { error: "not found" }, 404);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -215,8 +275,9 @@ test("getOpenCodeSessionActivity handles non-200 response", async () => {
   }
 });
 
-test("getOpenCodeSessionActivity handles non-JSON response", async () => {
-  const mock = await createMockServer("not json", 200, "text/plain");
+test("getOpenCodeSessionActivity handles non-JSON response", async (t) => {
+  const mock = await createMockServerOrSkip(t, "not json", 200, "text/plain");
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -240,7 +301,7 @@ test("getOpenCodeSessionActivity handles connection timeout", async () => {
   assert.equal(result.inFlight, false);
 });
 
-test("getOpenCodeSessionActivity tracks lastActivityAt correctly", async () => {
+test("getOpenCodeSessionActivity tracks lastActivityAt correctly", async (t) => {
   const now = Date.now();
   const messages = [
     {
@@ -263,7 +324,8 @@ test("getOpenCodeSessionActivity tracks lastActivityAt correctly", async () => {
       ],
     },
   ];
-  const mock = await createMockServer(messages);
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -276,7 +338,7 @@ test("getOpenCodeSessionActivity tracks lastActivityAt correctly", async () => {
   }
 });
 
-test("getOpenCodeSessionActivity detects real-world pending tool scenario", async () => {
+test("getOpenCodeSessionActivity detects real-world pending tool scenario", async (t) => {
   // Exact structure from the bug report
   const messages = [
     {
@@ -310,7 +372,8 @@ test("getOpenCodeSessionActivity detects real-world pending tool scenario", asyn
       ],
     },
   ];
-  const mock = await createMockServer(messages);
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -323,7 +386,7 @@ test("getOpenCodeSessionActivity detects real-world pending tool scenario", asyn
   }
 });
 
-test("message API inFlight stays active even when status is idle", async () => {
+test("message API inFlight stays active even when status is idle", async (t) => {
   const now = Date.now();
   const messages = [
     {
@@ -336,7 +399,8 @@ test("message API inFlight stays active even when status is idle", async () => {
       parts: [],
     },
   ];
-  const mock = await createMockServer(messages);
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
   try {
     const activity = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -359,7 +423,7 @@ test("message API inFlight stays active even when status is idle", async () => {
   }
 });
 
-test("getOpenCodeSessionActivity handles completed message with completed tools", async () => {
+test("getOpenCodeSessionActivity handles completed message with completed tools", async (t) => {
   const now = Date.now();
   const messages = [
     {
@@ -377,7 +441,8 @@ test("getOpenCodeSessionActivity handles completed message with completed tools"
       ],
     },
   ];
-  const mock = await createMockServer(messages);
+  const mock = await createMockServerOrSkip(t, messages);
+  if (!mock) return;
   try {
     const result = await getOpenCodeSessionActivity("ses_test", "127.0.0.1", mock.port, {
       silent: true,
@@ -387,5 +452,13 @@ test("getOpenCodeSessionActivity handles completed message with completed tools"
     assert.equal(result.inFlight, false, "Should be idle when message and all tools completed");
   } finally {
     await mock.close();
+  }
+});
+
+process.on("exit", () => {
+  if (originalStale === undefined) {
+    delete process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS;
+  } else {
+    process.env.CONSENSUS_OPENCODE_INFLIGHT_STALE_MS = originalStale;
   }
 });

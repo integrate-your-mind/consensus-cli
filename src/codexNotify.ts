@@ -1,6 +1,33 @@
 #!/usr/bin/env node
 import { Effect } from "effect";
 import { pathToFileURL } from "node:url";
+import os from "node:os";
+import path from "node:path";
+
+function resolveCodexHome(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.CONSENSUS_CODEX_HOME || env.CODEX_HOME;
+  if (!override) return path.join(os.homedir(), ".codex");
+  if (override === "~") {
+    return os.homedir();
+  }
+  if (override.startsWith("~/")) {
+    return path.join(os.homedir(), override.slice(2));
+  }
+  return path.resolve(override);
+}
+
+const appendNotifyPayload = (payload: NotifyPayload) =>
+  Effect.tryPromise({
+    try: async () => {
+      if (!payload) return;
+      const fs = await import("node:fs/promises");
+      const codexHome = resolveCodexHome();
+      const notifyPath = path.join(codexHome, "consensus", "codex-notify.jsonl");
+      await fs.mkdir(path.dirname(notifyPath), { recursive: true });
+      await fs.appendFile(notifyPath, `${JSON.stringify(payload)}\n`, "utf8");
+    },
+    catch: () => undefined,
+  });
 
 export type NotifyPayload = Record<string, unknown> | null;
 
@@ -125,12 +152,16 @@ export const runCodexNotify = (
       catch: () => "",
     });
     const payloadText = argPayload || stdinPayload;
-
-    if (!endpoint || !payloadText) return false;
+    if (!payloadText) return false;
 
     const payload = normalizePayload(payloadText);
+    if (!payload) return false;
+
+    yield* appendNotifyPayload(payload);
+
+    if (!endpoint) return true;
     const event = extractWebhookEvent(payload);
-    if (!event) return false;
+    if (!event) return true;
 
     yield* postEvent(endpoint, event, payload, fetchImpl);
 

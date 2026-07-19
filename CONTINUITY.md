@@ -34,6 +34,7 @@ Key decisions:
 - React UI is primary; server should serve React build when present.
 - Agent lane follows vanilla JS behavior: show all open sessions (active + idle) and sort by state rank then CPU.
 - Layout uses pinned positions per agent identity; only new agents are placed; existing tiles never move; placement uses max-height bounds to prevent overlap.
+- Scale placement with spatial hash buckets (cell -> occupants) and persistent per-group spiral frontier; collisions checked by bounds against bucket occupants.
 - Codex prompt-like titles containing temp paths/turn markers are ignored for lane labels; fallback to repo or codex#pid.
 - Agent lane now shows only active/error sessions and uses stable sort (state rank then identity) to prevent reordering.
 - Active lane items now glow via `is-active` class (lane item box-shadow) to make active codex sessions visibly highlighted.
@@ -133,6 +134,11 @@ State:
     - Tests re-run: `npm run test:unit` (149 pass), `npm run test:integration` (54 pass), `npm run test:ui` (19 pass).
     - Build run after pinned layout changes: `npm run build` (pass).
     - Copied edited files to clipboard via pbcopy; temp bundle at `/tmp/consensus-edited-files.txt`.
+    - Implemented spatial hash buckets + persistent group spiral frontier; fixed cell packing and bounds-based collision checks (public/src/lib/layout.ts).
+    - Renderer now keeps a single RAF loop, exposes hit list, and uses correct view transform for hit tests (public/src/hooks/useCanvasRenderer.ts).
+    - CanvasScene no longer rebuilds hit list; uses renderer hit list and stable render loop (public/src/components/CanvasScene.tsx).
+    - Obstruction detection checks only front occluders with AABB guard (public/src/hooks/useCanvasRenderer.ts).
+    - Tests run after layout/renderer updates: `npm run test:unit` (152 pass), `npm run test:integration` (58 pass), `npm run test:ui` (19 pass).
   - Now:
     - Answer user question about hot reload configuration (Vite HMR + server watch + live reload SSE).
     - Answer whether any additional setup is missing when using Vite.
@@ -161,6 +167,7 @@ State:
     - Claude CLI hooks not firing for real sessions; user reports Claude does not show active when working.
     - Need to validate live Claude session while recording via agent-browser and inspect hook delivery.
     - Copy edited layout/test files to clipboard via pbcopy. (DONE)
+    - Implement spatial hash buckets + persistent group frontier with correct cell packing and bounds checks. (DONE)
     - User requested a best-practice plan (no code edits) to address review comment: `npm run dev` no longer starts Vite, so TSX client fails unless dev:client or build is run.
     - Q&A answered for dev workflow: always start Vite; use CONSENSUS_UI_PORT for port; on port conflict try next port.
     - Review plan requested for new P2/P3 items: Codex in-flight timeout default in codexLogs; TOML [tui] notifications insertion in cli/setup.

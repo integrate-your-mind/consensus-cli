@@ -67,7 +67,7 @@ const program = pipe(
         if (!payload || typeof payload !== "object") return Effect.succeed(null);
         const event = normalizePayload(payload);
         if (!event) return Effect.succeed(null);
-        return Effect.promise(() =>
+        return Effect.tryPromise(() =>
           fetch(endpoint, {
             method: "POST",
             headers: { "Content-Type": "application/json" },

@@ -7,6 +7,7 @@ export const CodexEventType = Schema.Literal(
   "thread.started",
   "turn.started",
   "agent-turn-complete",
+  "approval-requested",
   "item.started",
   "item.completed"
 );

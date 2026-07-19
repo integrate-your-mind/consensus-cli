@@ -73,7 +73,7 @@ function App() {
         onSelect={select}
         onMouseDown={viewHandlers.onMouseDown}
         onKeyDown={viewHandlers.onKeyDown}
-        onWheel={viewHandlers.onWheel}
+        onCanvasWheel={viewHandlers.onCanvasWheel}
       />
       
       <HUD

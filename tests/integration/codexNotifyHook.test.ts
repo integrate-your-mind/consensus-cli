@@ -35,8 +35,13 @@ async function startServer(): Promise<{
     res.end();
   });
 
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", resolve);
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: unknown) => reject(err);
+    server.once("error", onError);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", onError);
+      resolve();
+    });
   });
 
   const address = server.address();
@@ -44,8 +49,18 @@ async function startServer(): Promise<{
   return { server, port, received };
 }
 
-test("codex notify forwards payload to endpoint", async () => {
-  const { server, port, received } = await startServer();
+test("codex notify forwards payload to endpoint", async (t) => {
+  let started: Awaited<ReturnType<typeof startServer>> | undefined;
+  try {
+    started = await startServer();
+  } catch (err: any) {
+    if (err?.code === "EPERM") {
+      t.skip("Sandbox blocks listen(127.0.0.1) for integration tests");
+      return;
+    }
+    throw err;
+  }
+  const { server, port, received } = started;
   const endpoint = `http://127.0.0.1:${port}/api/codex-event`;
   const payload = {
     type: "turn.started",
@@ -76,8 +91,18 @@ test("codex notify forwards payload to endpoint", async () => {
   }
 });
 
-test("codex notify forwards argv payload to endpoint", async () => {
-  const { server, port, received } = await startServer();
+test("codex notify forwards argv payload to endpoint", async (t) => {
+  let started: Awaited<ReturnType<typeof startServer>> | undefined;
+  try {
+    started = await startServer();
+  } catch (err: any) {
+    if (err?.code === "EPERM") {
+      t.skip("Sandbox blocks listen(127.0.0.1) for integration tests");
+      return;
+    }
+    throw err;
+  }
+  const { server, port, received } = started;
   const endpoint = `http://127.0.0.1:${port}/api/codex-event`;
   const payload = {
     type: "turn.started",

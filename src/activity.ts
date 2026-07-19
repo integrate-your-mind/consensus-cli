@@ -14,6 +14,17 @@ export interface ActivityInput {
   eventWindowMs?: number;
 }
 
+function isFreshSignal(
+  lastEventAt: number | undefined,
+  now: number,
+  eventWindowMs: number
+): boolean {
+  if (typeof lastEventAt !== "number" || !Number.isFinite(lastEventAt)) return false;
+  if (!Number.isFinite(eventWindowMs) || eventWindowMs <= 0) return true;
+  const ageMs = now - lastEventAt;
+  return ageMs >= 0 && ageMs <= eventWindowMs;
+}
+
 export function deriveState(input: ActivityInput): AgentState {
   if (input.hasError) return "error";
   const now = input.now ?? Date.now();
@@ -23,10 +34,10 @@ export function deriveState(input: ActivityInput): AgentState {
     input.eventWindowMs ??
     Number(process.env.CONSENSUS_EVENT_ACTIVE_MS || DEFAULT_EVENT_WINDOW_MS);
   const cpuActive = input.cpu > cpuThreshold;
-  const eventActive =
-    typeof input.lastEventAt === "number" &&
-    now - input.lastEventAt <= eventWindowMs;
-  const inFlight = !!input.inFlight;
+  const eventActive = isFreshSignal(input.lastEventAt, now, eventWindowMs);
+  // In-flight is evidence about a specific observed event. Do not let a stale
+  // structural marker keep a process active after its evidence window closes.
+  const inFlight = !!input.inFlight && eventActive;
   return cpuActive || eventActive || inFlight ? "active" : "idle";
 }
 
@@ -51,9 +62,8 @@ export function deriveStateWithHold(input: ActivityHoldInput): ActivityHoldResul
   const eventWindowMs =
     input.eventWindowMs ?? Number(process.env.CONSENSUS_EVENT_ACTIVE_MS || DEFAULT_EVENT_WINDOW_MS);
   const cpuActive = input.cpu > cpuThreshold;
-  const eventActive =
-    typeof input.lastEventAt === "number" && now - input.lastEventAt <= eventWindowMs;
-  const inFlight = !!input.inFlight;
+  const eventActive = isFreshSignal(input.lastEventAt, now, eventWindowMs);
+  const inFlight = !!input.inFlight && eventActive;
   const baseState = deriveState({ ...input, now, cpuThreshold, eventWindowMs });
   let reason = "idle";
   if (input.hasError) {

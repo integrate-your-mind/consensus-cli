@@ -7,7 +7,7 @@ const STALE_TTL_MS = 30 * 60 * 1000;
 const RECONNECT_MIN_MS = 10_000;
 const isDebugActivity = () => process.env.CONSENSUS_DEBUG_ACTIVITY === "1";
 const INFLIGHT_TIMEOUT_MS = Number(
-  process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS || 15000
+  process.env.CONSENSUS_OPENCODE_INFLIGHT_TIMEOUT_MS || 2500
 );
 const ACTIVITY_KINDS = new Set<string>(["command", "edit", "message", "prompt", "tool"]);
 // Meta events that don't indicate real activity
@@ -24,6 +24,7 @@ const DELTA_EVENT_RE =
   /(response\.((output_text|function_call_arguments|content_part|text)\.delta)|message\.part\.updated)/i;
 // OpenCode session status values that indicate busy
 const BUSY_STATUS_RE = /^(busy|running|generating|processing)$/i;
+const IDLE_STATUS_RE = /^(idle|paused|stopped)$/i;
 
 interface ActivityState {
   events: EventSummary[];
@@ -31,6 +32,8 @@ interface ActivityState {
   lastEventAt?: number;
   lastActivityAt?: number;
   lastInFlightSignalAt?: number;
+  lastStatus?: string;
+  lastStatusAt?: number;
   lastCommand?: EventSummary;
   lastEdit?: EventSummary;
   lastMessage?: EventSummary;
@@ -87,6 +90,13 @@ function logDebug(message: string): void {
 
 function expireInFlight(state: ActivityState, now: number): void {
   if (!state.inFlight) return;
+  if (typeof state.lastStatusAt === "number") {
+    if (now - state.lastStatusAt <= INFLIGHT_TIMEOUT_MS) {
+      return;
+    }
+    state.lastStatusAt = undefined;
+    state.lastStatus = undefined;
+  }
   const lastSignal = state.lastInFlightSignalAt ?? state.lastActivityAt ?? state.lastEventAt;
   if (typeof lastSignal === "number" && now - lastSignal > INFLIGHT_TIMEOUT_MS) {
     state.inFlight = false;
@@ -191,6 +201,7 @@ function summarizeEvent(raw: any): {
   isError?: boolean;
   type?: string;
   inFlight?: boolean;
+  status?: string;
 } {
   const typeRaw =
     raw?.type ||
@@ -204,8 +215,8 @@ function summarizeEvent(raw: any): {
   const normalizedType = lowerType.startsWith("tui.")
     ? lowerType.slice(4)
     : lowerType;
-  const status = raw?.status || raw?.state || raw?.properties?.status;
-  const statusStr = typeof status === "string" ? status.toLowerCase() : "";
+  const statusRaw = raw?.status || raw?.state || raw?.properties?.status;
+  const statusStr = typeof statusRaw === "string" ? statusRaw.toLowerCase() : "";
   const isError =
     !!raw?.error || lowerType.includes("error") || statusStr.includes("error");
   let inFlight: boolean | undefined;
@@ -226,6 +237,12 @@ function summarizeEvent(raw: any): {
   // Handle session.status event with status property
   const sessionStatus = raw?.properties?.status?.type || raw?.properties?.status;
   const sessionStatusStr = typeof sessionStatus === "string" ? sessionStatus : "";
+  const status =
+    normalizedType === "session.status"
+      ? sessionStatusStr
+      : normalizedType === "session.idle"
+        ? "idle"
+        : undefined;
   
   if (normalizedType === "session.status") {
     // session.status event: check if status is "busy" for in-flight
@@ -234,6 +251,8 @@ function summarizeEvent(raw: any): {
     } else {
       inFlight = false;
     }
+  } else if (normalizedType === "session.idle") {
+    inFlight = false;
   } else if (START_EVENT_RE.test(normalizedType) || DELTA_EVENT_RE.test(normalizedType)) {
     if (!isMessagePartUpdated || shouldTreatMessagePartActive) {
       inFlight = true;
@@ -245,7 +264,7 @@ function summarizeEvent(raw: any): {
   if (normalizedType.includes("compaction")) {
     const phase = statusStr || raw?.phase || raw?.properties?.phase;
     const summary = phase ? `compaction: ${phase}` : "compaction";
-    return { summary, kind: "other", isError, type, inFlight };
+    return { summary, kind: "other", isError, type, inFlight, status };
   }
 
   const cmd =
@@ -258,7 +277,7 @@ function summarizeEvent(raw: any): {
     (Array.isArray(raw?.args) ? raw.args.join(" ") : undefined);
   if (typeof cmd === "string" && cmd.trim()) {
     const summary = redactText(`cmd: ${cmd.trim()}`) || `cmd: ${cmd.trim()}`;
-    return { summary, kind: "command", isError, type, inFlight };
+    return { summary, kind: "command", isError, type, inFlight, status };
   }
 
   const pathHint =
@@ -270,7 +289,7 @@ function summarizeEvent(raw: any): {
     raw?.properties?.file;
   if (typeof pathHint === "string" && pathHint.trim() && normalizedType.includes("file")) {
     const summary = redactText(`edit: ${pathHint.trim()}`) || `edit: ${pathHint.trim()}`;
-    return { summary, kind: "edit", isError, type, inFlight };
+    return { summary, kind: "edit", isError, type, inFlight, status };
   }
 
   const tool =
@@ -281,7 +300,7 @@ function summarizeEvent(raw: any): {
     raw?.properties?.tool_name;
   if (typeof tool === "string" && tool.trim() && lowerType.includes("tool")) {
     const summary = redactText(`tool: ${tool.trim()}`) || `tool: ${tool.trim()}`;
-    return { summary, kind: "tool", isError, type, inFlight };
+    return { summary, kind: "tool", isError, type, inFlight, status };
   }
 
   const promptText =
@@ -293,7 +312,7 @@ function summarizeEvent(raw: any): {
     const trimmed = promptText.replace(/\s+/g, " ").trim();
     const snippet = trimmed.slice(0, 120);
     const summary = redactText(`prompt: ${snippet}`) || `prompt: ${snippet}`;
-    return { summary, kind: "prompt", isError, type, inFlight };
+    return { summary, kind: "prompt", isError, type, inFlight, status };
   }
 
   const roleRaw =
@@ -320,20 +339,27 @@ function summarizeEvent(raw: any): {
     const snippet = trimmed.slice(0, 80);
     if (role === "assistant" || role === "agent") {
       const summary = redactText(snippet) || snippet;
-      return { summary, kind: "message", isError, type, inFlight: isMessagePartUpdated ? true : undefined };
+      return {
+        summary,
+        kind: "message",
+        isError,
+        type,
+        inFlight: isMessagePartUpdated ? true : undefined,
+        status,
+      };
     }
     if (role === "user") {
       const summary = redactText(`prompt: ${snippet}`) || `prompt: ${snippet}`;
-      return { summary, kind: "prompt", isError, type, inFlight };
+      return { summary, kind: "prompt", isError, type, inFlight, status };
     }
   }
 
   if (type && type !== "event") {
     const summary = redactText(`event: ${type}`) || `event: ${type}`;
-    return { summary, kind: "other", isError, type, inFlight };
+    return { summary, kind: "other", isError, type, inFlight, status };
   }
 
-  return { kind: "other", isError, type, inFlight };
+  return { kind: "other", isError, type, inFlight, status };
 }
 
 function isActivityEvent(input: {
@@ -422,7 +448,7 @@ function handleRawEvent(raw: any): void {
   const ts = parsedTs ?? now;
   const sessionId = getSessionId(raw);
   const pid = getPid(raw);
-  const { summary, kind, isError, type, inFlight } = summarizeEvent(raw);
+  const { summary, kind, isError, type, inFlight, status } = summarizeEvent(raw);
   const activity = isActivityEvent({
     kind,
     type: typeof type === "string" ? type : undefined,
@@ -468,6 +494,17 @@ function handleRawEvent(raw: any): void {
     } else if (activity && state.inFlight) {
       state.lastInFlightSignalAt = now;
     }
+    if (typeof status === "string" && status.trim()) {
+      state.lastStatus = status;
+      state.lastStatusAt = now;
+      if (IDLE_STATUS_RE.test(status)) {
+        state.inFlight = false;
+        state.lastInFlightSignalAt = undefined;
+      } else {
+        state.inFlight = true;
+        state.lastInFlightSignalAt = now;
+      }
+    }
     if (prevInFlight !== state.inFlight) {
       logDebug(
         `inFlight ${prevInFlight ? "on" : "off"} -> ${state.inFlight ? "on" : "off"} ` +
@@ -504,6 +541,17 @@ function handleRawEvent(raw: any): void {
       }
     } else if (activity && state.inFlight) {
       state.lastInFlightSignalAt = now;
+    }
+    if (typeof status === "string" && status.trim()) {
+      state.lastStatus = status;
+      state.lastStatusAt = now;
+      if (IDLE_STATUS_RE.test(status)) {
+        state.inFlight = false;
+        state.lastInFlightSignalAt = undefined;
+      } else {
+        state.inFlight = true;
+        state.lastInFlightSignalAt = now;
+      }
     }
   }
   if (touched) notifyListeners();
@@ -619,6 +667,8 @@ export function getOpenCodeActivityBySession(
   lastActivityAt?: number;
   hasError?: boolean;
   inFlight?: boolean;
+  lastStatus?: string;
+  lastStatusAt?: number;
 } | null {
   if (!sessionId) return null;
   const state = sessionActivity.get(sessionId);
@@ -626,15 +676,17 @@ export function getOpenCodeActivityBySession(
   expireInFlight(state, nowMs());
   const events = state.events.slice(-20);
   const hasError = !!state.lastError || events.some((ev) => ev.isError);
-  return {
-    events,
-    summary: state.summary,
-    lastEventAt: state.lastEventAt,
-    lastActivityAt: state.lastActivityAt,
-    hasError,
-    inFlight: state.inFlight,
-  };
-}
+    return {
+      events,
+      summary: state.summary,
+      lastEventAt: state.lastEventAt,
+      lastActivityAt: state.lastActivityAt,
+      hasError,
+      inFlight: state.inFlight,
+      lastStatus: state.lastStatus,
+      lastStatusAt: state.lastStatusAt,
+    };
+  }
 
 export function getOpenCodeActivityByPid(
   pid?: number
@@ -645,6 +697,8 @@ export function getOpenCodeActivityByPid(
   lastActivityAt?: number;
   hasError?: boolean;
   inFlight?: boolean;
+  lastStatus?: string;
+  lastStatusAt?: number;
 } | null {
   if (typeof pid !== "number") return null;
   const state = pidActivity.get(pid);
@@ -652,12 +706,14 @@ export function getOpenCodeActivityByPid(
   expireInFlight(state, nowMs());
   const events = state.events.slice(-20);
   const hasError = !!state.lastError || events.some((ev) => ev.isError);
-  return {
-    events,
-    summary: state.summary,
-    lastEventAt: state.lastEventAt,
-    lastActivityAt: state.lastActivityAt,
-    hasError,
-    inFlight: state.inFlight,
-  };
-}
+    return {
+      events,
+      summary: state.summary,
+      lastEventAt: state.lastEventAt,
+      lastActivityAt: state.lastActivityAt,
+      hasError,
+      inFlight: state.inFlight,
+      lastStatus: state.lastStatus,
+      lastStatusAt: state.lastStatusAt,
+    };
+  }

@@ -50,6 +50,47 @@ test("drops to idle just past the event window", () => {
   assert.equal(state, "idle");
 });
 
+test("does not let stale in-flight evidence keep an agent active", () => {
+  const now = 100_000;
+  const state = deriveState({
+    cpu: 0,
+    hasError: false,
+    inFlight: true,
+    lastEventAt: now - 5001,
+    now,
+    eventWindowMs: 5000,
+  });
+  assert.equal(state, "idle");
+});
+
+test("keeps fresh in-flight evidence active at the boundary", () => {
+  const now = 100_000;
+  const state = deriveStateWithHold({
+    cpu: 0,
+    hasError: false,
+    inFlight: true,
+    lastEventAt: now - 5000,
+    now,
+    eventWindowMs: 5000,
+    holdMs: 0,
+  });
+  assert.equal(state.state, "active");
+  assert.equal(state.reason, "in_flight");
+});
+
+test("rejects future-dated activity evidence", () => {
+  const now = 100_000;
+  const state = deriveState({
+    cpu: 0,
+    hasError: false,
+    inFlight: true,
+    lastEventAt: now + 1,
+    now,
+    eventWindowMs: 5000,
+  });
+  assert.equal(state, "idle");
+});
+
 test("marks error when hasError true", () => {
   const state = deriveState({ cpu: 20, hasError: true, lastEventAt: Date.now() });
   assert.equal(state, "error");
