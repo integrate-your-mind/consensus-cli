@@ -1,8 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  MAX_HOOK_FUTURE_SKEW_MS,
   harnessHookEventKey,
   harnessHookEventSummary,
+  isHookHarnessId,
   normalizeHarnessHookPayload,
 } from "../../src/harnessHookModel.js";
 
@@ -177,5 +179,168 @@ describe("shared harness hook model", () => {
 
     assert.equal(key.includes("secret"), false);
     assert.equal(key, harnessHookEventKey(event!));
+  });
+
+  it("normalizes Gemini agent, model, and tool hooks without payload content", () => {
+    const now = Date.parse("2026-07-19T01:00:00.000Z");
+    const beforeAgent = normalizeHarnessHookPayload(
+      "gemini",
+      {
+        hook_event_name: "BeforeAgent",
+        session_id: "gemini-session",
+        cwd: "/Users/alice/private-project",
+        timestamp: new Date(now).toISOString(),
+        prompt: "private prompt",
+      },
+      now
+    );
+    const afterModel = normalizeHarnessHookPayload(
+      "gemini",
+      {
+        hook_event_name: "AfterModel",
+        session_id: "gemini-session",
+        timestamp: new Date(now + 1_000).toISOString(),
+        llm_response: { candidates: [{ content: "private response" }] },
+      },
+      now + 1_000
+    );
+    const beforeTool = normalizeHarnessHookPayload(
+      "gemini",
+      {
+        hook_event_name: "BeforeTool",
+        session_id: "gemini-session",
+        timestamp: new Date(now + 2_000).toISOString(),
+        tool_name: "write_file",
+        tool_input: { path: "/private/file" },
+      },
+      now + 2_000
+    );
+    const afterAgent = normalizeHarnessHookPayload(
+      "gemini",
+      {
+        hook_event_name: "AfterAgent",
+        session_id: "gemini-session",
+        timestamp: new Date(now + 3_000).toISOString(),
+        prompt_response: "private final response",
+      },
+      now + 3_000
+    );
+
+    assert.equal(isHookHarnessId("gemini"), true);
+    assert.equal(beforeAgent?.type, "UserPromptSubmit");
+    assert.equal(afterModel?.type, "MessageDisplay");
+    assert.equal(beforeTool?.type, "PreToolUse");
+    assert.equal(beforeTool?.toolName, "write_file");
+    assert.equal(afterAgent?.type, "Stop");
+    const serialized = JSON.stringify([
+      beforeAgent,
+      afterModel,
+      beforeTool,
+      afterAgent,
+    ]);
+    assert.equal(serialized.includes("private"), false);
+  });
+
+  it("normalizes Copilot camelCase and Claude-compatible hooks", () => {
+    const now = 1_800_000_000_000;
+    const prompt = normalizeHarnessHookPayload(
+      "copilot",
+      {
+        event: "userPromptSubmitted",
+        sessionId: "copilot-session",
+        timestamp: now,
+        cwd: "/private/repo",
+        prompt: "private prompt",
+      },
+      now
+    );
+    const tool = normalizeHarnessHookPayload(
+      "copilot",
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "copilot-session",
+        timestamp: new Date(now + 1_000).toISOString(),
+        tool_name: "bash",
+        tool_input: { command: "cat ~/.ssh/id_ed25519" },
+      },
+      now + 1_000
+    );
+    const subagent = normalizeHarnessHookPayload(
+      "copilot",
+      {
+        event: "subagentStart",
+        sessionId: "copilot-session",
+        timestamp: now + 2_000,
+        agentName: "reviewer",
+      },
+      now + 2_000
+    );
+    const failure = normalizeHarnessHookPayload(
+      "copilot",
+      {
+        event: "errorOccurred",
+        sessionId: "copilot-session",
+        timestamp: now + 3_000,
+        error: "private stack trace",
+      },
+      now + 3_000
+    );
+    const stop = normalizeHarnessHookPayload(
+      "copilot",
+      {
+        event: "agentStop",
+        sessionId: "copilot-session",
+        timestamp: now + 4_000,
+      },
+      now + 4_000
+    );
+
+    assert.equal(isHookHarnessId("copilot"), true);
+    assert.equal(prompt?.type, "UserPromptSubmit");
+    assert.equal(tool?.type, "PreToolUse");
+    assert.equal(subagent?.agentType, "reviewer");
+    assert.equal(failure?.type, "ErrorOccurred");
+    assert.equal(harnessHookEventSummary(failure!)?.type, "error.occurred");
+    assert.equal(harnessHookEventSummary(failure!)?.isError, true);
+    assert.equal(stop?.type, "Stop");
+    const serialized = JSON.stringify([prompt, tool, subagent, failure, stop]);
+    assert.equal(serialized.includes("private prompt"), false);
+    assert.equal(serialized.includes("id_ed25519"), false);
+    assert.equal(serialized.includes("private stack trace"), false);
+  });
+
+  it("clamps hook timestamps beyond the allowed receive-time skew", () => {
+    const receivedAt = 1_800_000_000_000;
+    const tooFar = normalizeHarnessHookPayload(
+      "kimi",
+      {
+        hook_event_name: "UserPromptSubmit",
+        session_id: "future",
+        timestamp: receivedAt + MAX_HOOK_FUTURE_SKEW_MS + 1,
+      },
+      receivedAt
+    );
+    const allowed = normalizeHarnessHookPayload(
+      "kimi",
+      {
+        hook_event_name: "UserPromptSubmit",
+        session_id: "allowed",
+        timestamp: receivedAt + MAX_HOOK_FUTURE_SKEW_MS,
+      },
+      receivedAt
+    );
+    const negative = normalizeHarnessHookPayload(
+      "kimi",
+      {
+        hook_event_name: "UserPromptSubmit",
+        session_id: "negative",
+        timestamp: -1,
+      },
+      receivedAt
+    );
+
+    assert.equal(tooFar?.timestamp, receivedAt);
+    assert.equal(allowed?.timestamp, receivedAt + MAX_HOOK_FUTURE_SKEW_MS);
+    assert.equal(negative, undefined);
   });
 });
