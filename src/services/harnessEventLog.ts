@@ -2,14 +2,18 @@ import {
   appendFile,
   chmod,
   mkdir,
+  open,
   readFile,
   rename,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
+  MAX_HOOK_FUTURE_SKEW_MS,
   harnessHookEventKey,
   isHookHarnessId,
   type CanonicalHarnessHookType,
@@ -20,6 +24,9 @@ const DEFAULT_LOG_MAX_BYTES = 2 * 1024 * 1024;
 const MIN_LOG_MAX_BYTES = 64 * 1024;
 const DEFAULT_RETENTION_MS = 30 * 60 * 1000;
 const MAX_SEEN_EVENTS = 10_000;
+const LOCK_WAIT_MS = 1_000;
+const LOCK_RETRY_MS = 10;
+const LOCK_STALE_MS = 30_000;
 const KEY_RE = /^[a-f0-9]{24}$/;
 const LABEL_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
 const CANONICAL_TYPES = new Set<CanonicalHarnessHookType>([
@@ -40,6 +47,7 @@ const CANONICAL_TYPES = new Set<CanonicalHarnessHookType>([
   "TaskCreated",
   "TaskCompleted",
   "PreVerify",
+  "ErrorOccurred",
   "Stop",
   "StopFailure",
   "Interrupt",
@@ -119,6 +127,46 @@ async function trimLog(filePath: string, maxBytes: number): Promise<void> {
   await chmod(filePath, 0o600).catch(() => undefined);
 }
 
+async function removeStaleLock(lockPath: string): Promise<boolean> {
+  try {
+    const info = await stat(lockPath);
+    if (Date.now() - info.mtimeMs <= LOCK_STALE_MS) return false;
+    await unlink(lockPath);
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+async function withLogLock<T>(
+  filePath: string,
+  action: () => Promise<T>
+): Promise<T> {
+  await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const lockPath = `${filePath}.lock`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+
+  while (true) {
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      try {
+        return await action();
+      } finally {
+        await handle.close().catch(() => undefined);
+        await unlink(lockPath).catch(() => undefined);
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw error;
+      if (await removeStaleLock(lockPath)) continue;
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out acquiring harness event log lock: ${lockPath}`);
+      }
+      await delay(LOCK_RETRY_MS);
+    }
+  }
+}
+
 function isSafeLabel(value: unknown): boolean {
   return (
     value === undefined ||
@@ -158,13 +206,14 @@ async function persistEvent(
   filePath: string,
   event: NormalizedHarnessHookEvent
 ): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  await appendFile(filePath, `${JSON.stringify(event)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
+  await withLogLock(filePath, async () => {
+    await appendFile(filePath, `${JSON.stringify(event)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await chmod(filePath, 0o600).catch(() => undefined);
+    await trimLog(filePath, resolveLogMaxBytes());
   });
-  await chmod(filePath, 0o600).catch(() => undefined);
-  await trimLog(filePath, resolveLogMaxBytes());
 }
 
 export function queueHarnessEventPersistence(
@@ -188,6 +237,33 @@ export function flushHarnessEventPersistence(): Promise<void> {
   return persistenceQueue;
 }
 
+async function readLogText(filePath: string): Promise<string> {
+  const maxReadBytes = Math.max(
+    DEFAULT_LOG_MAX_BYTES * 2,
+    resolveLogMaxBytes() * 2
+  );
+  const info = await stat(filePath);
+  if (info.size <= maxReadBytes) return readFile(filePath, "utf8");
+
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(maxReadBytes);
+    const position = Math.max(0, info.size - maxReadBytes);
+    const { bytesRead } = await handle.read(
+      buffer,
+      0,
+      maxReadBytes,
+      position
+    );
+    const tail = buffer.subarray(0, bytesRead);
+    const firstNewline = tail.indexOf(0x0a);
+    if (firstNewline < 0) return "";
+    return tail.subarray(firstNewline + 1).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function readStoredHarnessEvents(): Promise<
   NormalizedHarnessHookEvent[]
 > {
@@ -197,18 +273,26 @@ export async function readStoredHarnessEvents(): Promise<
 
   let input: string;
   try {
-    input = await readFile(filePath, "utf8");
+    input = await readLogText(filePath);
   } catch {
     return [];
   }
 
-  const cutoff = Date.now() - resolveRetentionMs();
+  const now = Date.now();
+  const cutoff = now - resolveRetentionMs();
+  const latestAcceptedAt = now + MAX_HOOK_FUTURE_SKEW_MS;
   const events: NormalizedHarnessHookEvent[] = [];
   for (const line of input.split(/\r?\n/)) {
     if (!line.trim()) continue;
     try {
       const parsed: unknown = JSON.parse(line);
-      if (!isStoredHarnessHookEvent(parsed) || parsed.timestamp < cutoff) continue;
+      if (
+        !isStoredHarnessHookEvent(parsed) ||
+        parsed.timestamp < cutoff ||
+        parsed.timestamp > latestAcceptedAt
+      ) {
+        continue;
+      }
       events.push(parsed);
     } catch {
       // Ignore malformed and partially written lines.
@@ -216,7 +300,8 @@ export async function readStoredHarnessEvents(): Promise<
   }
   events.sort(
     (a, b) =>
-      a.timestamp - b.timestamp || harnessHookEventKey(a).localeCompare(harnessHookEventKey(b))
+      a.timestamp - b.timestamp ||
+      harnessHookEventKey(a).localeCompare(harnessHookEventKey(b))
   );
 
   const result: NormalizedHarnessHookEvent[] = [];
