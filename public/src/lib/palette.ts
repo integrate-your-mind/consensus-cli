@@ -49,6 +49,22 @@ export const cliPalettes: Record<CliType, CliPalette> = {
     accentSoft: 'rgba(127, 183, 255, 0.35)',
     glow: '127, 183, 255',
   },
+  other: {
+    agent: {
+      active: { top: '#6f5b91', left: '#55456f', right: '#46395c', stroke: '#b89be8' },
+      idle: { top: '#3d3a49', left: '#302d3a', right: '#282530', stroke: '#756d88' },
+      error: { top: '#814143', left: '#693436', right: '#562b2d', stroke: '#dc6c72' },
+    },
+    server: {
+      active: { top: '#665d78', left: '#4f485e', right: '#423c4e', stroke: '#aa9bc3' },
+      idle: { top: '#393742', left: '#2d2b34', right: '#25232b', stroke: '#6b6578' },
+      error: { top: '#814143', left: '#693436', right: '#562b2d', stroke: '#dc6c72' },
+    },
+    accent: '#b89be8',
+    accentStrong: 'rgba(184, 155, 232, 0.6)',
+    accentSoft: 'rgba(184, 155, 232, 0.35)',
+    glow: '184, 155, 232',
+  },
 };
 
 export const stateOpacity: Record<AgentState, number> = {
@@ -61,7 +77,8 @@ export function cliForAgent(agent: AgentSnapshot): CliType {
   const kind = agent.kind || '';
   if (kind.startsWith('opencode')) return 'opencode';
   if (kind.startsWith('claude')) return 'claude';
-  return 'codex';
+  if (kind === 'tui' || kind === 'exec' || kind === 'app-server') return 'codex';
+  return 'other';
 }
 
 export function isServerKind(kind: string): boolean {
@@ -71,29 +88,29 @@ export function isServerKind(kind: string): boolean {
 
 export function paletteFor(agent: AgentSnapshot): TileColors {
   const cli = cliForAgent(agent);
-  const palette = cliPalettes[cli] ?? cliPalettes.codex;
+  const palette = cliPalettes[cli] ?? cliPalettes.other;
   const scope = isServerKind(agent.kind) ? palette.server : palette.agent;
   return scope[agent.state] ?? scope.idle;
 }
 
 export function accentFor(agent: AgentSnapshot): string {
   const cli = cliForAgent(agent);
-  return (cliPalettes[cli] ?? cliPalettes.codex).accent;
+  return (cliPalettes[cli] ?? cliPalettes.other).accent;
 }
 
 export function accentStrongFor(agent: AgentSnapshot): string {
   const cli = cliForAgent(agent);
-  return (cliPalettes[cli] ?? cliPalettes.codex).accentStrong;
+  return (cliPalettes[cli] ?? cliPalettes.other).accentStrong;
 }
 
 export function accentSoftFor(agent: AgentSnapshot): string {
   const cli = cliForAgent(agent);
-  return (cliPalettes[cli] ?? cliPalettes.codex).accentSoft;
+  return (cliPalettes[cli] ?? cliPalettes.other).accentSoft;
 }
 
 export function accentGlow(agent: AgentSnapshot, alpha: number): string {
   const cli = cliForAgent(agent);
-  const tint = (cliPalettes[cli] ?? cliPalettes.codex).glow;
+  const tint = (cliPalettes[cli] ?? cliPalettes.other).glow;
   return `rgba(${tint}, ${alpha})`;
 }
 
