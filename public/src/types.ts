@@ -1,5 +1,5 @@
 export type AgentState = 'active' | 'idle' | 'error';
-export type CliType = 'codex' | 'opencode' | 'claude';
+export type CliType = 'codex' | 'opencode' | 'claude' | 'other';
 
 export interface AgentSummary {
   current?: string;
@@ -43,23 +43,24 @@ export interface AgentSnapshot {
 }
 
 export interface ActivityCounts {
-  active?: number;
-  idle?: number;
-  error?: number;
+  active: number;
+  idle: number;
+  error: number;
 }
 
 export interface ActivityTransitionSummary {
-  total?: number;
-  byReason?: Record<string, number>;
-  byState?: Record<string, number>;
+  total: number;
+  byReason: Record<string, number>;
+  byState: Record<string, number>;
 }
 
 export interface SnapshotMeta {
+  pollMs?: number;
   opencode?: {
-    ok?: boolean;
+    ok: boolean;
     reachable?: boolean;
-    error?: string;
     status?: number;
+    error?: string;
   };
   activity?: {
     counts?: Record<string, ActivityCounts>;
@@ -73,59 +74,6 @@ export interface SnapshotPayload {
   agents: AgentSnapshot[];
   meta?: SnapshotMeta;
 }
-
-export type DeltaOp =
-  | { op: 'upsert'; id: string; value: AgentSnapshot }
-  | { op: 'remove'; id: string }
-  | { op: 'meta'; value: SnapshotMeta | null }
-  | { op: 'ts'; value: number };
-
-export interface WsHelloMessage {
-  v: 1;
-  t: 'hello';
-  role: 'viewer';
-  enc: 'json';
-  lastSeq?: number;
-}
-
-export interface WsWelcomeMessage {
-  v: 1;
-  t: 'welcome';
-  enc: 'json';
-  serverTime: number;
-}
-
-export interface WsSnapshotMessage {
-  v: 1;
-  t: 'snapshot';
-  seq: number;
-  data: SnapshotPayload;
-}
-
-export interface WsDeltaMessage {
-  v: 1;
-  t: 'delta';
-  seq: number;
-  ops: DeltaOp[];
-}
-
-export interface WsPingMessage {
-  v: 1;
-  t: 'ping';
-}
-
-export interface WsPongMessage {
-  v: 1;
-  t: 'pong';
-  ts: number;
-}
-
-export type WsClientMessage = WsHelloMessage | WsPongMessage;
-export type WsServerMessage =
-  | WsWelcomeMessage
-  | WsSnapshotMessage
-  | WsDeltaMessage
-  | WsPingMessage;
 
 export interface TileColors {
   top: string;
@@ -143,20 +91,53 @@ export interface CliPalette {
   glow: string;
 }
 
-export type WsStatus = 'connecting' | 'live' | 'stale' | 'error' | 'disconnected';
-
-export interface ViewState {
-  x: number;
-  y: number;
-  scale: number;
+export interface WsHelloMessage {
+  v: 1;
+  t: 'hello';
+  protocol: 'json';
 }
 
-export interface Coordinate {
-  x: number;
-  y: number;
+export interface WsWelcomeMessage {
+  v: 1;
+  t: 'welcome';
+  seq: number;
 }
 
-export interface ScreenPoint {
-  x: number;
-  y: number;
+export interface WsSnapshotMessage {
+  v: 1;
+  t: 'snapshot';
+  seq: number;
+  payload: SnapshotPayload;
 }
+
+export type DeltaOp =
+  | { op: 'upsert'; id: string; value: AgentSnapshot }
+  | { op: 'remove'; id: string }
+  | { op: 'meta'; value: SnapshotMeta | null }
+  | { op: 'ts'; value: number };
+
+export interface WsDeltaMessage {
+  v: 1;
+  t: 'delta';
+  seq: number;
+  ops: DeltaOp[];
+}
+
+export interface WsPingMessage {
+  v: 1;
+  t: 'ping';
+  seq: number;
+}
+
+export interface WsPongMessage {
+  v: 1;
+  t: 'pong';
+  seq: number;
+}
+
+export type WsClientMessage = WsHelloMessage | WsPongMessage;
+export type WsServerMessage =
+  | WsWelcomeMessage
+  | WsSnapshotMessage
+  | WsDeltaMessage
+  | WsPingMessage;
