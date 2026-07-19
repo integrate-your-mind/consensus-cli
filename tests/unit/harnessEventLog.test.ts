@@ -4,6 +4,7 @@ import {
   readFile,
   rm,
   stat,
+  writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -116,21 +117,38 @@ describe("harness event log", { concurrency: false }, () => {
     });
   });
 
-  it("ignores malformed, expired, and duplicate disk records", async () => {
+  it("ignores malformed, expired, future-skewed, and duplicate disk records", async () => {
     await withLog(async (_directory, logPath) => {
       process.env.CONSENSUS_HARNESS_EVENT_TTL_MS = "1000";
       const current = event(900);
       const expired = event(901, { timestamp: Date.now() - 2_000 });
+      const future = event(902, { timestamp: Date.now() + 10 * 60_000 });
       await appendFile(
         logPath,
         [
           JSON.stringify(current),
           JSON.stringify(current),
           JSON.stringify(expired),
+          JSON.stringify(future),
           JSON.stringify({ ...current, sessionKey: "raw-session" }),
           "{",
           "",
         ].join("\n")
+      );
+
+      const events = await readStoredHarnessEvents();
+      assert.deepEqual(events, [current]);
+    });
+  });
+
+  it("reads only a bounded complete-line tail from an oversized log", async () => {
+    await withLog(async (_directory, logPath) => {
+      const current = event(950);
+      const oversizedPrefix = "x".repeat(5 * 1024 * 1024);
+      await writeFile(
+        logPath,
+        `${oversizedPrefix}\n${JSON.stringify(current)}\n`,
+        "utf8"
       );
 
       const events = await readStoredHarnessEvents();
@@ -156,6 +174,14 @@ describe("harness event log", { concurrency: false }, () => {
     assert.equal(
       isStoredHarnessHookEvent({ ...valid, toolName: "Bash\nforged" }),
       false
+    );
+    assert.equal(
+      isStoredHarnessHookEvent({
+        ...valid,
+        harnessId: "copilot",
+        type: "ErrorOccurred",
+      }),
+      true
     );
   });
 });
