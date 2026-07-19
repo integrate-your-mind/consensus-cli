@@ -27,6 +27,7 @@ const MAX_SEEN_EVENTS = 10_000;
 const LOCK_WAIT_MS = 1_000;
 const LOCK_RETRY_MS = 10;
 const LOCK_STALE_MS = 30_000;
+const DEDUP_TAIL_BYTES = 256 * 1024;
 const KEY_RE = /^[a-f0-9]{24}$/;
 const LABEL_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
 const CANONICAL_TYPES = new Set<CanonicalHarnessHookType>([
@@ -202,11 +203,61 @@ export function isStoredHarnessHookEvent(
   );
 }
 
+async function tailContainsEventKey(
+  filePath: string,
+  key: string
+): Promise<boolean> {
+  let info;
+  try {
+    info = await stat(filePath);
+  } catch {
+    return false;
+  }
+  if (info.size <= 0) return false;
+
+  const bytesToRead = Math.min(info.size, DEDUP_TAIL_BYTES);
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(bytesToRead);
+    const position = Math.max(0, info.size - bytesToRead);
+    const { bytesRead } = await handle.read(
+      buffer,
+      0,
+      bytesToRead,
+      position
+    );
+    let input = buffer.subarray(0, bytesRead).toString("utf8");
+    if (position > 0) {
+      const firstNewline = input.indexOf("\n");
+      input = firstNewline >= 0 ? input.slice(firstNewline + 1) : "";
+    }
+    for (const line of input.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const parsed: unknown = JSON.parse(line);
+        if (
+          isStoredHarnessHookEvent(parsed) &&
+          harnessHookEventKey(parsed) === key
+        ) {
+          return true;
+        }
+      } catch {
+        // Ignore malformed or partially written lines.
+      }
+    }
+    return false;
+  } finally {
+    await handle.close();
+  }
+}
+
 async function persistEvent(
   filePath: string,
-  event: NormalizedHarnessHookEvent
+  event: NormalizedHarnessHookEvent,
+  key: string
 ): Promise<void> {
   await withLogLock(filePath, async () => {
+    if (await tailContainsEventKey(filePath, key)) return;
     await appendFile(filePath, `${JSON.stringify(event)}\n`, {
       encoding: "utf8",
       mode: 0o600,
@@ -226,7 +277,7 @@ export function queueHarnessEventPersistence(
   if (!rememberEvent(key)) return persistenceQueue;
 
   persistenceQueue = persistenceQueue
-    .then(() => persistEvent(filePath, event))
+    .then(() => persistEvent(filePath, event, key))
     .catch(() => {
       if (seenPath === filePath) seenEvents.delete(key);
     });
