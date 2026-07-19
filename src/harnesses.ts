@@ -131,7 +131,7 @@ export const harnessDefinitions: readonly HarnessDefinition[] = [
     kinds: ["openclaw-cli", "openclaw-server"],
     class: "local-server",
     telemetry: "native-events",
-    docs: "https://docs.openclaw.ai/agent-loop",
+    docs: "https://docs.openclaw.ai/concepts/agent-loop",
     processRules: [
       {
         binaries: ["openclaw"],
@@ -188,9 +188,7 @@ export const harnessDefinitions: readonly HarnessDefinition[] = [
     class: "local-cli",
     telemetry: "structured-stream",
     docs: "https://docs.cursor.com/en/cli/using",
-    processRules: [
-      { binaries: ["cursor-agent"], kind: "cursor-cli" },
-    ],
+    processRules: [{ binaries: ["cursor-agent"], kind: "cursor-cli" }],
     note:
       "Cursor CLI exposes structured stream output and a partial hook set; coverage must state which source was observed.",
   },
@@ -223,8 +221,8 @@ export const harnessDefinitions: readonly HarnessDefinition[] = [
     displayName: "Gemini CLI",
     kinds: ["gemini-cli"],
     class: "local-cli",
-    telemetry: "process-only",
-    docs: "https://developers.google.com/gemini-code-assist/docs/gemini-cli",
+    telemetry: "hooks",
+    docs: "https://geminicli.com/docs/hooks/",
     processRules: [{ binaries: ["gemini"], kind: "gemini-cli" }],
   },
   {
@@ -244,16 +242,15 @@ export const harnessDefinitions: readonly HarnessDefinition[] = [
     class: "local-cli",
     telemetry: "hooks",
     docs: "https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/",
-    processRules: [
-      { binaries: ["qwen", "qwen-code"], kind: "qwen-cli" },
-    ],
+    processRules: [{ binaries: ["qwen", "qwen-code"], kind: "qwen-cli" }],
   },
   {
     id: "copilot",
     displayName: "GitHub Copilot CLI",
     kinds: ["copilot-cli"],
     class: "local-cli",
-    telemetry: "process-only",
+    telemetry: "hooks",
+    docs: "https://docs.github.com/en/copilot/reference/hooks-reference",
     processRules: [{ binaries: ["copilot"], kind: "copilot-cli" }],
   },
   {
@@ -300,9 +297,7 @@ export const harnessDefinitions: readonly HarnessDefinition[] = [
     kinds: ["kiro-cli"],
     class: "local-cli",
     telemetry: "process-only",
-    processRules: [
-      { binaries: ["kiro", "kiro-cli"], kind: "kiro-cli" },
-    ],
+    processRules: [{ binaries: ["kiro", "kiro-cli"], kind: "kiro-cli" }],
   },
   {
     id: "openhands",
@@ -380,7 +375,9 @@ function stripQuotes(value: string): string {
 
 function basename(value: string): string {
   const parts = stripQuotes(value).split(/[\\/]/);
-  return (parts[parts.length - 1] || value).toLowerCase();
+  return (parts[parts.length - 1] || value)
+    .toLowerCase()
+    .replace(/\.exe$/, "");
 }
 
 function commandTokens(command: string | undefined): string[] {
@@ -398,12 +395,16 @@ function ruleMatches(
   const tokens = commandTokens(command);
   const executable = tokens[0] ? basename(tokens[0]) : undefined;
   const name = processName ? basename(processName) : undefined;
-  const binaries = new Set(rule.binaries.map((binary) => binary.toLowerCase()));
+  const binaries = new Set(
+    rule.binaries.map((binary) => binary.toLowerCase().replace(/\.exe$/, ""))
+  );
   if (!((executable && binaries.has(executable)) || (name && binaries.has(name)))) {
     return false;
   }
   if (!rule.requiredAnyToken?.length) return true;
-  const commandTokensLower = new Set(tokens.slice(1).map((token) => token.toLowerCase()));
+  const commandTokensLower = new Set(
+    tokens.slice(1).map((token) => token.toLowerCase())
+  );
   return rule.requiredAnyToken.some((token) =>
     commandTokensLower.has(token.toLowerCase())
   );
@@ -435,7 +436,11 @@ export function detectGenericHarnessProcess(
   processName: string | undefined
 ): DetectedHarnessProcess | undefined {
   for (const harness of harnessDefinitions) {
-    if (harness.id === "codex" || harness.id === "opencode" || harness.id === "claude") {
+    if (
+      harness.id === "codex" ||
+      harness.id === "opencode" ||
+      harness.id === "claude"
+    ) {
       continue;
     }
     for (const rule of harness.processRules ?? []) {
