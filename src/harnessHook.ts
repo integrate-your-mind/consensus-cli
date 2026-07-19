@@ -3,6 +3,7 @@ import {
   isHookHarnessId,
   normalizeHarnessHookPayload,
 } from "./harnessHookModel.js";
+import { harnessHookAcknowledgement } from "./harnessHookOutput.js";
 import {
   flushHarnessEventPersistence,
   queueHarnessEventPersistence,
@@ -26,20 +27,32 @@ async function readStdin(): Promise<string> {
 async function main(): Promise<void> {
   const harnessId = process.argv[2];
   if (!isHookHarnessId(harnessId)) return;
-  const input = await readStdin();
-  if (!input.trim()) return;
 
-  let payload: unknown;
   try {
-    payload = JSON.parse(input);
+    const input = await readStdin();
+    if (input.trim()) {
+      let payload: unknown;
+      try {
+        payload = JSON.parse(input);
+      } catch {
+        payload = undefined;
+      }
+      const event = normalizeHarnessHookPayload(
+        harnessId,
+        payload,
+        Date.now()
+      );
+      if (event) {
+        await queueHarnessEventPersistence(event);
+        await flushHarnessEventPersistence();
+      }
+    }
   } catch {
-    return;
+    // Hooks must never block or fail the owning harness.
+  } finally {
+    const acknowledgement = harnessHookAcknowledgement(harnessId);
+    if (acknowledgement) process.stdout.write(acknowledgement);
   }
-
-  const event = normalizeHarnessHookPayload(harnessId, payload);
-  if (!event) return;
-  await queueHarnessEventPersistence(event);
-  await flushHarnessEventPersistence();
 }
 
-void main().catch(() => undefined);
+void main();
