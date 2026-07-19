@@ -1,7 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
 import { buildAgentGraph, formatAgentGraph } from "../graph.js";
+import { isAgentKind } from "../harnesses.js";
 import type {
-  AgentKind,
   AgentSnapshot,
   AgentState,
   EventSummary,
@@ -18,17 +18,6 @@ export type GraphScanLoader = () => Promise<{
   scanCodexProcesses: SnapshotScanner;
 }>;
 
-const agentKinds = new Set<AgentKind>([
-  "tui",
-  "exec",
-  "app-server",
-  "opencode-tui",
-  "opencode-cli",
-  "opencode-server",
-  "claude-tui",
-  "claude-cli",
-  "unknown",
-]);
 const agentStates = new Set<AgentState>(["active", "idle", "error"]);
 export const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 const MAX_AGENTS = 10_000;
@@ -157,8 +146,7 @@ function isAgentSnapshot(value: unknown): value is AgentSnapshot {
     !isNonNegativeInteger(value.pid) ||
     !isNonEmptySafeString(value.cmd) ||
     !isNonEmptySafeString(value.cmdShort) ||
-    typeof value.kind !== "string" ||
-    !agentKinds.has(value.kind as AgentKind) ||
+    !isAgentKind(value.kind) ||
     typeof value.state !== "string" ||
     !agentStates.has(value.state as AgentState) ||
     !isNonNegativeFiniteNumber(value.cpu) ||
