@@ -17,6 +17,7 @@ const DEFAULT_INFLIGHT_TIMEOUT_MS = 30_000;
 const MAX_EVENTS = 50;
 const INFLIGHT_TYPES = new Set<NormalizedHarnessHookEvent["type"]>([
   "UserPromptSubmit",
+  "UserPromptExpansion",
   "MessageDisplay",
   "PreToolUse",
   "PostToolUse",
@@ -39,6 +40,7 @@ const IDLE_TYPES = new Set<NormalizedHarnessHookEvent["type"]>([
 ]);
 const ERROR_TYPES = new Set<NormalizedHarnessHookEvent["type"]>([
   "PostToolUseFailure",
+  "ErrorOccurred",
   "StopFailure",
 ]);
 const NON_ACTIVITY_TYPES = new Set<NormalizedHarnessHookEvent["type"]>([
