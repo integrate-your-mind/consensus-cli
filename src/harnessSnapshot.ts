@@ -97,7 +97,8 @@ function selectState(
     const cwdMatches = states.filter(
       (state) => state.cwdKey === agent.harnessCwdKey
     );
-    if (cwdMatches.length > 0) return cwdMatches[0];
+    if (cwdMatches.length === 1) return cwdMatches[0];
+    if (cwdMatches.length > 1) return undefined;
   }
   return singleAgent && states.length === 1 ? states[0] : undefined;
 }
