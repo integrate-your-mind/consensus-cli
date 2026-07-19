@@ -5,6 +5,7 @@ import {
   detectGenericHarnessProcess,
   type DetectedHarnessProcess,
 } from "./harnesses.js";
+import { harnessCwdKey, harnessSessionKey } from "./harnessKeys.js";
 import { redactText } from "./redact.js";
 import type { AgentSnapshot, SnapshotPayload } from "./types.js";
 
@@ -41,9 +42,10 @@ function commandTokens(command: string): string[] {
   );
 }
 
-function extractCwd(command: string): string | undefined {
-  const tokens = commandTokens(command);
-  const flags = new Set(["--cwd", "--working-dir", "--workdir", "--dir"]);
+function extractFlagValue(
+  tokens: string[],
+  flags: ReadonlySet<string>
+): string | undefined {
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (flags.has(token)) {
@@ -56,6 +58,31 @@ function extractCwd(command: string): string | undefined {
         if (value) return value;
       }
     }
+  }
+  return undefined;
+}
+
+function extractCwd(command: string): string | undefined {
+  return extractFlagValue(
+    commandTokens(command),
+    new Set(["--cwd", "--working-dir", "--workdir", "--dir"])
+  );
+}
+
+function extractSessionId(command: string): string | undefined {
+  const tokens = commandTokens(command);
+  const direct = extractFlagValue(
+    tokens,
+    new Set(["--session", "--session-id", "--conversation-id", "-s"])
+  );
+  if (direct) return direct;
+
+  const resumeIndex = tokens.findIndex(
+    (token) => token === "resume" || token === "--resume"
+  );
+  if (resumeIndex >= 0) {
+    const value = tokens[resumeIndex + 1];
+    if (value && !value.startsWith("-")) return value;
   }
   return undefined;
 }
@@ -74,7 +101,7 @@ async function loadUsage(
     ) {
       return { [pids[0]]: result as GenericHarnessUsage };
     }
-    return result as Record<number, GenericHarnessUsage>;
+    return result as unknown as Record<number, GenericHarnessUsage>;
   } catch {
     return {};
   }
@@ -94,6 +121,7 @@ function toAgentSnapshot(
   const commandRaw = process.cmd || process.name || detected.harness.displayName;
   const command = redactText(commandRaw) || commandRaw;
   const cwdRaw = extractCwd(commandRaw);
+  const sessionId = extractSessionId(commandRaw);
   const cwd = redactText(cwdRaw) || cwdRaw;
   const cpu = typeof usage.cpu === "number" && Number.isFinite(usage.cpu) ? usage.cpu : 0;
   const mem =
@@ -101,16 +129,22 @@ function toAgentSnapshot(
       ? usage.memory
       : 0;
   const elapsed =
-    typeof usage.elapsed === "number" && Number.isFinite(usage.elapsed)
+    typeof usage.elapsed === "number" &&
+    Number.isFinite(usage.elapsed) &&
+    usage.elapsed >= 0
       ? usage.elapsed
       : undefined;
   const startedAt =
-    typeof elapsed === "number" ? Math.floor((now - elapsed) / 1000) : undefined;
+    typeof elapsed === "number"
+      ? Math.max(0, Math.floor((now - elapsed) / 1000))
+      : undefined;
   const state = processState(cpu);
   const role = detected.kind.endsWith("server") ? "server" : "agent";
+  const startIdentity =
+    typeof startedAt === "number" ? `:start:${startedAt}` : "";
 
   return {
-    identity: `${detected.harness.id}:pid:${process.pid}`,
+    identity: `${detected.harness.id}:pid:${process.pid}${startIdentity}`,
     id: String(process.pid),
     pid: process.pid,
     startedAt,
@@ -125,6 +159,12 @@ function toAgentSnapshot(
     doing: `${detected.harness.displayName} ${role}`,
     cwd,
     repo: cwdRaw ? path.basename(path.resolve(cwdRaw)) : undefined,
+    harnessCwdKey: cwdRaw
+      ? harnessCwdKey(detected.harness.id, cwdRaw)
+      : undefined,
+    harnessSessionKey: sessionId
+      ? harnessSessionKey(detected.harness.id, sessionId)
+      : undefined,
   };
 }
 
