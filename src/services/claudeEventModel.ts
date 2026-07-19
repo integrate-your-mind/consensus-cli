@@ -1,4 +1,4 @@
-import { createHash } from "crypto";
+import { createHash } from "node:crypto";
 import type { EventSummary, WorkSummary } from "../types.js";
 import type { ClaudeEvent, ClaudeSessionState } from "../claude/types.js";
 
@@ -10,6 +10,8 @@ const INFLIGHT_TIMEOUT_MS = Number(
 );
 const MAX_EVENTS = 50;
 const MAX_METADATA_LABEL_LENGTH = 160;
+const MAX_SESSION_ID_LENGTH = 512;
+const METADATA_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
 export const CLAUDE_EVENT_LOG_VERSION = 1 as const;
 
 const CANONICAL_TYPES: Record<string, string> = {
@@ -113,16 +115,33 @@ export interface StoredClaudeEvent {
 
 export type ClaudeStateMap = Map<string, ClaudeSessionState>;
 
+function normalizeMetadataText(
+  value: string | undefined,
+  maxLength: number
+): string | undefined {
+  const normalized = value
+    ?.replace(METADATA_CONTROL_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+  return normalized || undefined;
+}
+
 export function boundedClaudeLabel(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed.slice(0, MAX_METADATA_LABEL_LENGTH) : undefined;
+  return normalizeMetadataText(value, MAX_METADATA_LABEL_LENGTH);
+}
+
+function validClaudeSessionId(value: string | undefined): string | undefined {
+  if (!value || value.length > MAX_SESSION_ID_LENGTH) return undefined;
+  const normalized = normalizeMetadataText(value, MAX_SESSION_ID_LENGTH);
+  return normalized === value.trim() ? normalized : undefined;
 }
 
 export function normalizeClaudeEventType(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) return trimmed;
   const key = trimmed.replace(/[^a-z0-9]/gi, "").toLowerCase();
-  return CANONICAL_TYPES[key] ?? trimmed;
+  return CANONICAL_TYPES[key] ?? boundedClaudeLabel(trimmed) ?? "";
 }
 
 export function stableClaudePathKey(value: string | undefined): string | undefined {
@@ -181,6 +200,36 @@ function summarizeClaudeEvent(event: ClaudeEvent, type: string): EventSummary {
   };
 }
 
+function eventSummaryKey(event: EventSummary): string {
+  return JSON.stringify([
+    event.ts,
+    event.type,
+    event.summary,
+    event.isError === true,
+    event.turnId ?? null,
+  ]);
+}
+
+function mergeRetainedEvents(
+  previous: EventSummary[],
+  entry: EventSummary,
+  retain: boolean
+): EventSummary[] {
+  if (!retain) return previous;
+  const seen = new Set<string>();
+  return [...previous, entry]
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => {
+      const key = eventSummaryKey(event);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => a.event.ts - b.event.ts || a.index - b.index)
+    .slice(-MAX_EVENTS)
+    .map(({ event }) => event);
+}
+
 function updateSummary(
   previous: WorkSummary,
   entry: EventSummary,
@@ -227,25 +276,47 @@ export function applyClaudeEvent(
   event: ClaudeEvent,
   storedCwdKey?: string
 ): ClaudeStateMap {
-  const now = typeof event.timestamp === "number" ? event.timestamp : Date.now();
+  const sessionId = validClaudeSessionId(event.sessionId);
+  const now = event.timestamp;
+  if (
+    !sessionId ||
+    !Number.isFinite(now) ||
+    now < 0
+  ) {
+    return map;
+  }
+
   const type = normalizeClaudeEventType(event.type);
+  if (!type) return map;
   const isIdleNotification =
     type === "Notification" &&
     event.notificationType?.trim().toLowerCase() === "idle_prompt";
-  const previous = map.get(event.sessionId);
+  const previous = map.get(sessionId);
   const entry = summarizeClaudeEvent(event, type);
   const activity = isActivityEvent(type);
   const retain = shouldRetainGraphEvent(event, type);
-  const events = retain
-    ? [...(previous?.events ?? []), entry].slice(-MAX_EVENTS)
-    : previous?.events ?? [];
+  const events = mergeRetainedEvents(previous?.events ?? [], entry, retain);
+  const eventCwdKey = stableClaudePathKey(event.cwd);
+
+  if (previous && now < previous.lastSeenAt) {
+    const nextMap = new Map(map);
+    nextMap.set(sessionId, {
+      ...previous,
+      cwd: previous.cwd ?? event.cwd,
+      cwdKey: previous.cwdKey ?? eventCwdKey ?? storedCwdKey,
+      transcriptPath: previous.transcriptPath ?? event.transcriptPath,
+      events,
+    });
+    return nextMap;
+  }
+
   const next: ClaudeSessionState = {
-    sessionId: event.sessionId,
+    sessionId,
     inFlight: previous?.inFlight ?? false,
-    lastSeenAt: now,
-    lastEventAt: now,
+    lastSeenAt: Math.max(previous?.lastSeenAt ?? now, now),
+    lastEventAt: Math.max(previous?.lastEventAt ?? now, now),
     cwd: event.cwd ?? previous?.cwd,
-    cwdKey: stableClaudePathKey(event.cwd) ?? storedCwdKey ?? previous?.cwdKey,
+    cwdKey: eventCwdKey ?? storedCwdKey ?? previous?.cwdKey,
     transcriptPath: event.transcriptPath ?? previous?.transcriptPath,
     lastEvent: type,
     lastActivityAt: previous?.lastActivityAt,
@@ -263,19 +334,28 @@ export function applyClaudeEvent(
   }
 
   const nextMap = new Map(map);
-  nextMap.set(event.sessionId, next);
+  nextMap.set(sessionId, next);
   return nextMap;
 }
 
 export function toStoredClaudeEvent(
   event: ClaudeEvent
 ): StoredClaudeEvent | undefined {
+  const sessionId = validClaudeSessionId(event.sessionId);
   const type = normalizeClaudeEventType(event.type);
-  if (!shouldPersistClaudeEvent(event, type)) return undefined;
+  if (
+    !sessionId ||
+    !type ||
+    !Number.isFinite(event.timestamp) ||
+    event.timestamp < 0 ||
+    !shouldPersistClaudeEvent(event, type)
+  ) {
+    return undefined;
+  }
   return {
     version: CLAUDE_EVENT_LOG_VERSION,
     type,
-    sessionId: event.sessionId,
+    sessionId,
     timestamp: event.timestamp,
     cwdKey: stableClaudePathKey(event.cwd),
     notificationType: boundedClaudeLabel(event.notificationType),
@@ -299,20 +379,30 @@ export function storedClaudeEventKey(event: StoredClaudeEvent): string {
   ].join("\0");
 }
 
+function isOptionalBoundedLabel(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (typeof value === "string" && boundedClaudeLabel(value) === value)
+  );
+}
+
 export function isStoredClaudeEvent(value: unknown): value is StoredClaudeEvent {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const event = value as Record<string, unknown>;
   return (
     event.version === CLAUDE_EVENT_LOG_VERSION &&
     typeof event.type === "string" &&
+    normalizeClaudeEventType(event.type) === event.type &&
     typeof event.sessionId === "string" &&
+    validClaudeSessionId(event.sessionId) === event.sessionId &&
     typeof event.timestamp === "number" &&
     Number.isFinite(event.timestamp) &&
-    (event.cwdKey === undefined || typeof event.cwdKey === "string") &&
-    (event.notificationType === undefined ||
-      typeof event.notificationType === "string") &&
-    (event.toolName === undefined || typeof event.toolName === "string") &&
-    (event.agentType === undefined || typeof event.agentType === "string") &&
+    event.timestamp >= 0 &&
+    (event.cwdKey === undefined ||
+      (typeof event.cwdKey === "string" && /^[a-f0-9]{24}$/.test(event.cwdKey))) &&
+    isOptionalBoundedLabel(event.notificationType) &&
+    isOptionalBoundedLabel(event.toolName) &&
+    isOptionalBoundedLabel(event.agentType) &&
     (event.final === undefined || typeof event.final === "boolean")
   );
 }
