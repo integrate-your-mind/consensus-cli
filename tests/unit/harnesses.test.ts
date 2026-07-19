@@ -4,6 +4,7 @@ import {
   agentKinds,
   detectGenericHarnessProcess,
   harnessDefinitions,
+  harnessForId,
   harnessIdForKind,
   isAgentKind,
 } from "../../src/harnesses.js";
@@ -38,6 +39,7 @@ describe("harness registry", () => {
       ["droid", "factory", "factory-cli"],
       ["gemini", "gemini", "gemini-cli"],
       ["qwen-code", "qwen", "qwen-cli"],
+      ["copilot", "copilot", "copilot-cli"],
       ["q chat", "amazon-q", "amazon-q-cli"],
       ["kiro-cli", "kiro", "kiro-cli"],
       ["openhands", "openhands", "openhands-cli"],
@@ -50,9 +52,43 @@ describe("harness registry", () => {
     }
   });
 
+  it("normalizes Windows executable aliases", () => {
+    assert.equal(
+      detectGenericHarnessProcess(
+        '"C:\\Tools\\gemini.exe"',
+        "gemini.exe"
+      )?.kind,
+      "gemini-cli"
+    );
+    assert.equal(
+      detectGenericHarnessProcess(
+        "C:\\Tools\\copilot.exe",
+        "copilot.exe"
+      )?.kind,
+      "copilot-cli"
+    );
+  });
+
+  it("declares Gemini and Copilot as hook-backed harnesses", () => {
+    assert.equal(harnessForId("gemini").telemetry, "hooks");
+    assert.equal(harnessForId("copilot").telemetry, "hooks");
+    assert.match(
+      harnessForId("gemini").docs ?? "",
+      /geminicli\.com\/docs\/hooks/
+    );
+    assert.match(
+      harnessForId("copilot").docs ?? "",
+      /docs\.github\.com/
+    );
+  });
+
   it("uses the executable token instead of matching names mentioned in prompts", () => {
     assert.equal(
       detectGenericHarnessProcess("node runner.js --prompt 'use openclaw'", "node"),
+      undefined
+    );
+    assert.equal(
+      detectGenericHarnessProcess("node runner.js --prompt 'use gemini'", "node"),
       undefined
     );
     assert.equal(detectGenericHarnessProcess("oz config list", "oz"), undefined);
