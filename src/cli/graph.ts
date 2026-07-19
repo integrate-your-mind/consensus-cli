@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { buildAgentGraph, formatAgentGraph } from "../graph.js";
 import type {
   AgentKind,
@@ -30,6 +30,7 @@ const agentKinds = new Set<AgentKind>([
   "unknown",
 ]);
 const agentStates = new Set<AgentState>(["active", "idle", "error"]);
+export const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
 const MAX_AGENTS = 10_000;
 const MAX_EVENTS_PER_AGENT = 10_000;
 const MAX_TEXT_LENGTH = 16_384;
@@ -54,15 +55,25 @@ function graphHelp(): string {
   ].join("\n");
 }
 
+function snapshotTooLarge(source: string): Error {
+  return new Error(
+    `snapshot from ${source} exceeds ${MAX_SNAPSHOT_BYTES} bytes`
+  );
+}
+
 async function readStdin(): Promise<string> {
   if (process.stdin.isTTY) {
     throw new Error("--snapshot - requires JSON piped on stdin");
   }
-  let input = "";
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
   for await (const chunk of process.stdin) {
-    input += String(chunk);
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.length;
+    if (totalBytes > MAX_SNAPSHOT_BYTES) throw snapshotTooLarge("stdin");
+    chunks.push(buffer);
   }
-  return input;
+  return Buffer.concat(chunks, totalBytes).toString("utf8");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -78,7 +89,7 @@ function isNonNegativeFiniteNumber(value: unknown): value is number {
 }
 
 function isNonNegativeInteger(value: unknown): value is number {
-  return Number.isInteger(value) && (value as number) >= 0;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
 function isSafeString(value: unknown, maxLength: number = MAX_TEXT_LENGTH): value is string {
@@ -188,6 +199,10 @@ function isAgentSnapshot(value: unknown): value is AgentSnapshot {
 }
 
 export function parseSnapshot(input: string, source: string): SnapshotPayload {
+  if (Buffer.byteLength(input, "utf8") > MAX_SNAPSHOT_BYTES) {
+    throw snapshotTooLarge(source);
+  }
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(input);
@@ -230,6 +245,12 @@ async function loadLiveSnapshot(
   }
 }
 
+async function readSnapshotFile(snapshotPath: string): Promise<string> {
+  const info = await stat(snapshotPath);
+  if (info.size > MAX_SNAPSHOT_BYTES) throw snapshotTooLarge(snapshotPath);
+  return readFile(snapshotPath, "utf8");
+}
+
 export async function loadSnapshot(
   snapshotPath: string | undefined,
   loadScan: GraphScanLoader = defaultScanLoader
@@ -237,7 +258,7 @@ export async function loadSnapshot(
   if (!snapshotPath) return loadLiveSnapshot(loadScan);
 
   const input =
-    snapshotPath === "-" ? await readStdin() : await readFile(snapshotPath, "utf8");
+    snapshotPath === "-" ? await readStdin() : await readSnapshotFile(snapshotPath);
   return parseSnapshot(input, snapshotPath === "-" ? "stdin" : snapshotPath);
 }
 
