@@ -1,6 +1,7 @@
 import type { ScanOptions } from "./scan.js";
 import { scanCodexProcesses } from "./scan.js";
 import { attachClaudeEvents } from "./claudeSnapshot.js";
+import { attachGenericHarnessProcesses } from "./genericHarnessSnapshot.js";
 import { hydrateClaudeEventsFromDisk } from "./services/claudeEvents.js";
 import type { SnapshotPayload } from "./types.js";
 
@@ -9,7 +10,8 @@ export async function scanSnapshot(
 ): Promise<SnapshotPayload> {
   await hydrateClaudeEventsFromDisk();
   const snapshot = await scanCodexProcesses(options);
-  return attachClaudeEvents(snapshot);
+  const withClaudeEvents = attachClaudeEvents(snapshot);
+  return attachGenericHarnessProcesses(withClaudeEvents);
 }
 
 const isDirectRun =
