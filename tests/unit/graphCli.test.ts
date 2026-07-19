@@ -10,12 +10,20 @@ const validSnapshot: SnapshotPayload = {
       identity: "/Users/alice/.codex/sessions/secret.jsonl",
       id: "101",
       pid: 101,
+      startedAt: 100,
+      lastEventAt: 900,
+      lastActivityAt: 900,
+      activityReason: "tail_event",
       cmd: "codex",
       cmdShort: "codex",
       kind: "tui",
       cpu: 0,
       mem: 100,
       state: "idle",
+      summary: {
+        current: "message",
+        lastMessage: "message",
+      },
       events: [
         {
           ts: 900,
@@ -64,6 +72,96 @@ describe("graph CLI snapshot contract", () => {
         },
       ],
     };
+    assert.throws(
+      () => parseSnapshot(JSON.stringify(malformed), "test"),
+      /invalid snapshot payload from test/
+    );
+  });
+
+  it("rejects non-finite and negative timestamps", () => {
+    assert.throws(
+      () => parseSnapshot('{"ts":1e400,"agents":[]}', "test"),
+      /invalid snapshot payload from test/
+    );
+    assert.throws(
+      () =>
+        parseSnapshot(
+          JSON.stringify({ ...validSnapshot, ts: -1 }),
+          "test"
+        ),
+      /invalid snapshot payload from test/
+    );
+    assert.throws(
+      () =>
+        parseSnapshot(
+          JSON.stringify({
+            ...validSnapshot,
+            agents: [{ ...validSnapshot.agents[0], lastEventAt: null }],
+          }),
+          "test"
+        ),
+      /invalid snapshot payload from test/
+    );
+  });
+
+  it("rejects invalid process metrics", () => {
+    for (const patch of [
+      { pid: 1.5 },
+      { pid: -1 },
+      { cpu: -0.1 },
+      { mem: -1 },
+    ]) {
+      assert.throws(
+        () =>
+          parseSnapshot(
+            JSON.stringify({
+              ...validSnapshot,
+              agents: [{ ...validSnapshot.agents[0], ...patch }],
+            }),
+            "test"
+          ),
+        /invalid snapshot payload from test/
+      );
+    }
+  });
+
+  it("rejects terminal control characters in exported labels", () => {
+    const malformedTitle = {
+      ...validSnapshot,
+      agents: [{ ...validSnapshot.agents[0], title: "worker\u001b[2J" }],
+    };
+    const malformedEvent = {
+      ...validSnapshot,
+      agents: [
+        {
+          ...validSnapshot.agents[0],
+          events: [{ ts: 900, type: "message\nforged", summary: "message" }],
+        },
+      ],
+    };
+
+    assert.throws(
+      () => parseSnapshot(JSON.stringify(malformedTitle), "test"),
+      /invalid snapshot payload from test/
+    );
+    assert.throws(
+      () => parseSnapshot(JSON.stringify(malformedEvent), "test"),
+      /invalid snapshot payload from test/
+    );
+  });
+
+  it("rejects unbounded retained event arrays", () => {
+    const event = { ts: 900, type: "message", summary: "message" };
+    const malformed = {
+      ...validSnapshot,
+      agents: [
+        {
+          ...validSnapshot.agents[0],
+          events: Array.from({ length: 10_001 }, () => event),
+        },
+      ],
+    };
+
     assert.throws(
       () => parseSnapshot(JSON.stringify(malformed), "test"),
       /invalid snapshot payload from test/
