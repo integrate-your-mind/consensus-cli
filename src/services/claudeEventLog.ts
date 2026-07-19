@@ -112,7 +112,7 @@ export function queueClaudeEventPersistence(event: ClaudeEvent): Promise<void> {
   persistenceQueue = persistenceQueue
     .then(() => persistStoredEvent(filePath, stored))
     .catch(() => {
-      seenStoredEvents.delete(key);
+      if (seenEventLogPath === filePath) seenStoredEvents.delete(key);
     });
   return persistenceQueue;
 }
