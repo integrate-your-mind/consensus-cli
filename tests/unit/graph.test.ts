@@ -266,7 +266,7 @@ describe("agent graph", () => {
     assert.match(agentNode?.agentKey ?? "", /^codex:[a-f0-9]{20}$/);
   });
 
-  it("marks Claude graph history unavailable instead of claiming phase coverage", () => {
+  it("marks Claude graph history unavailable when no retained events exist", () => {
     const graph = buildAgentGraph({
       ts: 1_000,
       agents: [
@@ -279,7 +279,7 @@ describe("agent graph", () => {
     assert.equal(graph.coverage.providers.claude.history, "unavailable");
     assert.match(
       graph.coverage.providers.claude.note ?? "",
-      /hook history is not yet retained/i
+      /No retained Claude hook events were available/i
     );
   });
 
