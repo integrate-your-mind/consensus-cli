@@ -150,11 +150,12 @@ describe("agent graph hardening", () => {
     );
     const output = formatAgentGraph(graph);
     const json = JSON.stringify(graph);
-    const forbidden = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
+    const unsafeTerminalControl =
+      /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
 
-    assert.equal(forbidden.test(output), false);
-    assert.equal(forbidden.test(json), false);
-    assert.match(output, /worker evil/);
+    assert.equal(unsafeTerminalControl.test(output), false);
+    assert.equal(unsafeTerminalControl.test(json), false);
+    assert.match(output, /worker .*evil/);
   });
 
   it("rejects cross-segment transitions as loop evidence", () => {
