@@ -40,6 +40,38 @@ interface IndexedEvent {
   index: number;
 }
 
+const LIFECYCLE_OR_META_TYPES = new Set([
+  "agentturncomplete",
+  "sessionstart",
+  "sessionend",
+  "setup",
+  "stop",
+  "stopfailure",
+  "userpromptexpansion",
+  "precompact",
+  "postcompact",
+  "notification",
+  "instructionsloaded",
+  "configchange",
+  "cwdchanged",
+  "filechanged",
+  "worktreecreate",
+  "worktreeremove",
+  "teammateidle",
+  "serverconnected",
+  "serverdisconnected",
+  "heartbeat",
+  "connected",
+  "ready",
+  "ping",
+  "pong",
+  "snapshot",
+  "history",
+  "tokencount",
+]);
+const GRAPH_TEXT_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+const MAX_GRAPH_LABEL_LENGTH = 240;
+
 function identityForAgent(agent: AgentSnapshot): string {
   return agent.identity || agent.id;
 }
@@ -60,6 +92,21 @@ function opaqueAgentKey(provider: string, identity: string): string {
     .digest("hex")
     .slice(0, 20);
   return `${provider}:${digest}`;
+}
+
+function graphText(value: string | undefined, fallback: string): string {
+  const normalized = value
+    ?.replace(GRAPH_TEXT_CONTROL_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_GRAPH_LABEL_LENGTH);
+  return normalized || fallback;
+}
+
+function optionalGraphText(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = graphText(value, "");
+  return normalized || undefined;
 }
 
 function idPart(value: string): string {
@@ -104,38 +151,7 @@ function isLifecycleOrMetaEvent(event: EventSummary): boolean {
     return true;
   }
 
-  if (
-    new Set([
-      "agentturncomplete",
-      "sessionstart",
-      "sessionend",
-      "setup",
-      "stop",
-      "stopfailure",
-      "precompact",
-      "postcompact",
-      "notification",
-      "instructionsloaded",
-      "configchange",
-      "cwdchanged",
-      "filechanged",
-      "worktreecreate",
-      "worktreeremove",
-      "teammateidle",
-      "serverconnected",
-      "serverdisconnected",
-      "heartbeat",
-      "connected",
-      "ready",
-      "ping",
-      "pong",
-      "snapshot",
-      "history",
-      "tokencount",
-    ]).has(compact)
-  ) {
-    return true;
-  }
+  if (LIFECYCLE_OR_META_TYPES.has(compact)) return true;
 
   return (
     summary.startsWith("event:") &&
@@ -146,6 +162,8 @@ function isLifecycleOrMetaEvent(event: EventSummary): boolean {
 }
 
 function phaseForEvent(event: EventSummary): string | undefined {
+  if (isLifecycleOrMetaEvent(event)) return undefined;
+
   const summary = normalizedSummary(event);
   const eventType = normalizedEventType(event);
   const lowerType = eventType.toLowerCase();
@@ -175,11 +193,10 @@ function phaseForEvent(event: EventSummary): string | undefined {
   ) {
     return "model";
   }
-  if (isLifecycleOrMetaEvent(event)) return undefined;
   if (summary && !summary.startsWith("event:") && !summary.startsWith("compaction:")) {
     return "model";
   }
-  return eventType;
+  return graphText(eventType, "event");
 }
 
 function isTurnStartEvent(event: EventSummary): boolean {
@@ -296,7 +313,7 @@ function historyStatusForProvider(
     return {
       history: "unavailable",
       note:
-        "Claude activity is visible, but Claude hook history is not yet retained in SnapshotPayload.events.",
+        "No retained Claude hook events were available; hooks may be unconfigured, history may be disabled, or events may be outside the retention window.",
     };
   }
   if (provider === "codex" || provider === "opencode") {
@@ -427,11 +444,11 @@ export function buildAgentGraph(snapshot: SnapshotPayload): AgentGraphSnapshot {
     nodes.set(rootNodeId, {
       id: rootNodeId,
       kind: "agent",
-      label: agent.title || agent.doing || `${provider} agent`,
+      label: graphText(agent.title || agent.doing, `${provider} agent`),
       state: agent.state,
       agentKey,
       provider,
-      repo: agent.repo,
+      repo: optionalGraphText(agent.repo),
       firstSeenAt:
         typeof agent.startedAt === "number" ? agent.startedAt * 1000 : undefined,
       lastSeenAt: maxDefined([agent.lastActivityAt, agent.lastEventAt, snapshot.ts]),
@@ -451,6 +468,7 @@ export function buildAgentGraph(snapshot: SnapshotPayload): AgentGraphSnapshot {
       activeTurnId = turnId;
       previousStepNodeId = undefined;
       segmentHasPhase = false;
+      latestStepNodeId = undefined;
       return activeSegment;
     };
 
@@ -507,7 +525,7 @@ export function buildAgentGraph(snapshot: SnapshotPayload): AgentGraphSnapshot {
             state: "idle",
             agentKey,
             provider,
-            repo: agent.repo,
+            repo: optionalGraphText(agent.repo),
             phase,
             segment: activeSegment,
             hadError: !!event.isError,
