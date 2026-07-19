@@ -21,18 +21,33 @@ export interface GenericHarnessUsage {
   elapsed?: number;
 }
 
+type ProcessLoader = () => Promise<readonly GenericHarnessProcess[]>;
+type UsageLoader = (
+  pids: number[]
+) => Promise<Record<number, GenericHarnessUsage>>;
+
 export interface GenericHarnessSnapshotOptions {
   processes?: readonly GenericHarnessProcess[];
   usage?: Readonly<Record<number, GenericHarnessUsage>>;
   now?: number;
+  cacheMs?: number;
+  processLoader?: ProcessLoader;
+  usageLoader?: UsageLoader;
 }
 
-function shortenCommand(command: string, maxLength = 120): string {
-  const normalized = command.replace(/\s+/g, " ").trim();
-  return normalized.length <= maxLength
-    ? normalized
-    : `${normalized.slice(0, maxLength - 3)}...`;
+interface DetectedProcess {
+  process: GenericHarnessProcess;
+  detected: DetectedHarnessProcess;
 }
+
+interface GenericProcessCache {
+  at: number;
+  matches: DetectedProcess[];
+  usage: Record<number, GenericHarnessUsage>;
+}
+
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+let genericProcessCache: GenericProcessCache | undefined;
 
 function commandTokens(command: string): string[] {
   return (
@@ -107,9 +122,86 @@ async function loadUsage(
   }
 }
 
+function resolveCacheMs(override?: number): number {
+  if (typeof override === "number" && Number.isFinite(override)) {
+    return Math.max(0, Math.floor(override));
+  }
+  const parsed = Number(process.env.CONSENSUS_GENERIC_PROCESS_CACHE_MS);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? Math.floor(parsed)
+    : 1_000;
+}
+
 function processState(cpu: number): AgentSnapshot["state"] {
   const threshold = Number(process.env.CONSENSUS_GENERIC_CPU_ACTIVE || 1);
   return Number.isFinite(threshold) && cpu > threshold ? "active" : "idle";
+}
+
+function safeSnapshotText(
+  value: string | undefined,
+  maxLength = 4_096
+): string | undefined {
+  if (!value) return undefined;
+  const sanitized = value
+    .replace(CONTROL_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+  return sanitized || undefined;
+}
+
+function detectProcesses(
+  processes: readonly GenericHarnessProcess[]
+): DetectedProcess[] {
+  return processes.flatMap((process) => {
+    if (!Number.isInteger(process.pid) || process.pid < 0) return [];
+    const detected = detectGenericHarnessProcess(process.cmd, process.name);
+    return detected ? [{ process, detected }] : [];
+  });
+}
+
+async function loadDetectedProcesses(
+  options: GenericHarnessSnapshotOptions
+): Promise<{
+  matches: DetectedProcess[];
+  usage: Readonly<Record<number, GenericHarnessUsage>>;
+}> {
+  if (options.processes) {
+    const matches = detectProcesses(options.processes);
+    const usage =
+      options.usage ??
+      (await (options.usageLoader ?? loadUsage)(
+        matches.map(({ process }) => process.pid)
+      ));
+    return { matches, usage };
+  }
+
+  const cacheMs = resolveCacheMs(options.cacheMs);
+  const cacheNow = Date.now();
+  if (
+    genericProcessCache &&
+    cacheMs > 0 &&
+    cacheNow - genericProcessCache.at <= cacheMs
+  ) {
+    return {
+      matches: genericProcessCache.matches,
+      usage: genericProcessCache.usage,
+    };
+  }
+
+  const processes = await (options.processLoader ?? psList)();
+  const matches = detectProcesses(processes);
+  const usage =
+    options.usage ??
+    (await (options.usageLoader ?? loadUsage)(
+      matches.map(({ process }) => process.pid)
+    ));
+  genericProcessCache = {
+    at: cacheNow,
+    matches,
+    usage: { ...usage },
+  };
+  return { matches, usage };
 }
 
 function toAgentSnapshot(
@@ -119,14 +211,16 @@ function toAgentSnapshot(
   now: number
 ): AgentSnapshot {
   const commandRaw = process.cmd || process.name || detected.harness.displayName;
-  const command = redactText(commandRaw) || commandRaw;
   const cwdRaw = extractCwd(commandRaw);
   const sessionId = extractSessionId(commandRaw);
-  const cwd = redactText(cwdRaw) || cwdRaw;
-  const cpu = typeof usage.cpu === "number" && Number.isFinite(usage.cpu) ? usage.cpu : 0;
+  const cwd = safeSnapshotText(redactText(cwdRaw) || cwdRaw);
+  const cpu =
+    typeof usage.cpu === "number" && Number.isFinite(usage.cpu)
+      ? Math.max(0, usage.cpu)
+      : 0;
   const mem =
     typeof usage.memory === "number" && Number.isFinite(usage.memory)
-      ? usage.memory
+      ? Math.max(0, usage.memory)
       : 0;
   const elapsed =
     typeof usage.elapsed === "number" &&
@@ -142,6 +236,10 @@ function toAgentSnapshot(
   const role = detected.kind.endsWith("server") ? "server" : "agent";
   const startIdentity =
     typeof startedAt === "number" ? `:start:${startedAt}` : "";
+  const safeCommand = `${detected.harness.id} ${role}`;
+  const repo = cwdRaw
+    ? safeSnapshotText(path.basename(path.resolve(cwdRaw)), 255)
+    : undefined;
 
   return {
     identity: `${detected.harness.id}:pid:${process.pid}${startIdentity}`,
@@ -149,8 +247,8 @@ function toAgentSnapshot(
     pid: process.pid,
     startedAt,
     title: detected.harness.displayName,
-    cmd: command,
-    cmdShort: shortenCommand(command),
+    cmd: safeCommand,
+    cmdShort: safeCommand,
     kind: detected.kind,
     cpu,
     mem,
@@ -158,7 +256,7 @@ function toAgentSnapshot(
     activityReason: state === "active" ? "process_cpu" : "process_detected",
     doing: `${detected.harness.displayName} ${role}`,
     cwd,
-    repo: cwdRaw ? path.basename(path.resolve(cwdRaw)) : undefined,
+    repo,
     harnessCwdKey: cwdRaw
       ? harnessCwdKey(detected.harness.id, cwdRaw)
       : undefined,
@@ -172,21 +270,15 @@ export async function attachGenericHarnessProcesses(
   snapshot: SnapshotPayload,
   options: GenericHarnessSnapshotOptions = {}
 ): Promise<SnapshotPayload> {
-  const processes = options.processes ?? (await psList());
+  const { matches, usage } = await loadDetectedProcesses(options);
   const existingPids = new Set(snapshot.agents.map((agent) => agent.pid));
-  const matches = processes.flatMap((process) => {
-    if (!Number.isInteger(process.pid) || process.pid < 0 || existingPids.has(process.pid)) {
-      return [];
-    }
-    const detected = detectGenericHarnessProcess(process.cmd, process.name);
-    return detected ? [{ process, detected }] : [];
-  });
-  if (matches.length === 0) return snapshot;
+  const uniqueMatches = matches.filter(
+    ({ process }) => !existingPids.has(process.pid)
+  );
+  if (uniqueMatches.length === 0) return snapshot;
 
-  const usage =
-    options.usage ?? (await loadUsage(matches.map(({ process }) => process.pid)));
   const now = options.now ?? snapshot.ts;
-  const additionalAgents = matches.map(({ process, detected }) =>
+  const additionalAgents = uniqueMatches.map(({ process, detected }) =>
     toAgentSnapshot(process, detected, usage[process.pid] ?? {}, now)
   );
 
@@ -194,4 +286,8 @@ export async function attachGenericHarnessProcesses(
     ...snapshot,
     agents: [...snapshot.agents, ...additionalAgents],
   };
+}
+
+export function resetGenericHarnessProcessCacheForTests(): void {
+  genericProcessCache = undefined;
 }
