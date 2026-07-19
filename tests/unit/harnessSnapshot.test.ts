@@ -30,8 +30,8 @@ function agent(overrides: Partial<AgentSnapshot> = {}): AgentSnapshot {
     identity: "factory:pid:10:start:1",
     id: "10",
     pid: 10,
-    cmd: "droid",
-    cmdShort: "droid",
+    cmd: "factory agent",
+    cmdShort: "factory agent",
     kind: "factory-cli",
     cpu: 0,
     mem: 0,
@@ -90,6 +90,66 @@ describe("harness snapshot attachment", () => {
 
     assert.equal(attached.agents[0].harnessSessionKey, "d".repeat(24));
     assert.equal(attached.agents[0].state, "active");
+  });
+
+  it("rejects cwd matching when several hook sessions share the directory", () => {
+    handleNormalizedHarnessEvent(
+      event("UserPromptSubmit", 90, {
+        sessionKey: "d".repeat(24),
+        cwdKey: "b".repeat(24),
+      }),
+      false
+    );
+    handleNormalizedHarnessEvent(
+      event("UserPromptSubmit", 91, {
+        sessionKey: "e".repeat(24),
+        cwdKey: "b".repeat(24),
+      }),
+      false
+    );
+
+    const attached = attachHarnessEvents(
+      snapshot([
+        agent({ harnessSessionKey: undefined, harnessCwdKey: "b".repeat(24) }),
+      ])
+    );
+
+    assert.equal(attached.agents[0].events, undefined);
+    assert.equal(attached.agents[0].harnessSessionKey, undefined);
+    assert.equal(attached.agents[0].state, "idle");
+  });
+
+  it("uses an exact session key even when cwd matching is ambiguous", () => {
+    handleNormalizedHarnessEvent(
+      event("UserPromptSubmit", 90, {
+        sessionKey: "d".repeat(24),
+        cwdKey: "b".repeat(24),
+      }),
+      false
+    );
+    handleNormalizedHarnessEvent(
+      event("Stop", 91, {
+        sessionKey: "e".repeat(24),
+        cwdKey: "b".repeat(24),
+      }),
+      false
+    );
+
+    const attached = attachHarnessEvents(
+      snapshot([
+        agent({
+          harnessSessionKey: "d".repeat(24),
+          harnessCwdKey: "b".repeat(24),
+        }),
+      ])
+    );
+
+    assert.equal(attached.agents[0].harnessSessionKey, "d".repeat(24));
+    assert.equal(attached.agents[0].state, "active");
+    assert.deepEqual(
+      attached.agents[0].events?.map((entry) => entry.summary),
+      ["prompt"]
+    );
   });
 
   it("uses one-to-one fallback only when assignment is unambiguous", () => {
