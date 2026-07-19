@@ -7,7 +7,9 @@ export const hookHarnessIds = [
   "hermes",
   "kimi",
   "factory",
+  "gemini",
   "qwen",
+  "copilot",
 ] as const satisfies readonly HarnessId[];
 
 export type HookHarnessId = (typeof hookHarnessIds)[number];
@@ -29,6 +31,7 @@ export type CanonicalHarnessHookType =
   | "TaskCreated"
   | "TaskCompleted"
   | "PreVerify"
+  | "ErrorOccurred"
   | "Stop"
   | "StopFailure"
   | "Interrupt"
@@ -52,11 +55,13 @@ export interface NormalizedHarnessHookEvent {
 
 const MAX_LABEL_LENGTH = 160;
 const MAX_IDENTIFIER_LENGTH = 512;
+export const MAX_HOOK_FUTURE_SKEW_MS = 5 * 60_000;
 const SAFE_TEXT_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
 const DIRECT_TYPES = new Map<string, CanonicalHarnessHookType>([
   ["sessionstart", "SessionStart"],
   ["sessionend", "SessionEnd"],
   ["userpromptsubmit", "UserPromptSubmit"],
+  ["userpromptsubmitted", "UserPromptSubmit"],
   ["userpromptexpansion", "UserPromptExpansion"],
   ["messagedisplay", "MessageDisplay"],
   ["pretooluse", "PreToolUse"],
@@ -70,6 +75,9 @@ const DIRECT_TYPES = new Map<string, CanonicalHarnessHookType>([
   ["subagentstop", "SubagentStop"],
   ["taskcreated", "TaskCreated"],
   ["taskcompleted", "TaskCompleted"],
+  ["preverify", "PreVerify"],
+  ["erroroccurred", "ErrorOccurred"],
+  ["agentstop", "Stop"],
   ["stop", "Stop"],
   ["stopfailure", "StopFailure"],
   ["interrupt", "Interrupt"],
@@ -91,6 +99,17 @@ const HERMES_TYPES = new Map<string, CanonicalHarnessHookType>([
   ["subagentstop", "SubagentStop"],
   ["agentstart", "UserPromptSubmit"],
   ["agentend", "Stop"],
+]);
+const GEMINI_TYPES = new Map<string, CanonicalHarnessHookType>([
+  ["sessionstart", "SessionStart"],
+  ["sessionend", "SessionEnd"],
+  ["beforeagent", "UserPromptSubmit"],
+  ["afteragent", "Stop"],
+  ["aftermodel", "MessageDisplay"],
+  ["beforetool", "PreToolUse"],
+  ["aftertool", "PostToolUse"],
+  ["precompress", "PreCompact"],
+  ["notification", "Notification"],
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -160,9 +179,11 @@ function parseTimestamp(value: unknown, receivedAt: number): number | undefined 
       if (!Number.isNaN(asDate)) parsed = asDate;
     }
   }
-  const fallback = Number.isFinite(receivedAt) && receivedAt >= 0 ? receivedAt : Date.now();
+  const fallback =
+    Number.isFinite(receivedAt) && receivedAt >= 0 ? receivedAt : Date.now();
   if (parsed === undefined) return fallback;
-  return parsed >= 0 ? parsed : undefined;
+  if (parsed < 0) return undefined;
+  return parsed > fallback + MAX_HOOK_FUTURE_SKEW_MS ? fallback : parsed;
 }
 
 function opaqueKey(scope: string, value: string): string {
@@ -180,6 +201,7 @@ function canonicalType(
 ): CanonicalHarnessHookType | undefined {
   const compact = compactName(rawType);
   if (harnessId === "hermes") return HERMES_TYPES.get(compact);
+  if (harnessId === "gemini") return GEMINI_TYPES.get(compact);
   return DIRECT_TYPES.get(compact);
 }
 
@@ -264,10 +286,19 @@ export function normalizeHarnessHookPayload(
     firstLabel(input, ["tool_name", "toolName", "matcher"]) ??
     nestedLabel(input, "extra", ["tool_name", "toolName"]);
   const agentType =
-    firstLabel(input, ["agent_type", "agentType", "subagent_type", "subagentType"]) ??
+    firstLabel(input, [
+      "agent_type",
+      "agentType",
+      "agent_name",
+      "agentName",
+      "subagent_type",
+      "subagentType",
+    ]) ??
     nestedLabel(input, "extra", [
       "agent_type",
       "agentType",
+      "agent_name",
+      "agentName",
       "child_role",
       "childRole",
     ]);
@@ -276,6 +307,7 @@ export function normalizeHarnessHookPayload(
     "notificationType",
     "reason",
   ]);
+  const final = extractBoolean(input, ["final", "is_final", "isFinal"]);
 
   return {
     version: 1,
@@ -284,14 +316,13 @@ export function normalizeHarnessHookPayload(
     sessionKey: opaqueKey(`session:${harnessId}`, sessionId),
     timestamp,
     ...(cwd ? { cwdKey: opaqueKey(`cwd:${harnessId}`, cwd) } : {}),
-    ...(turnId ? { turnKey: opaqueKey(`turn:${harnessId}`, `${sessionId}\0${turnId}`) } : {}),
+    ...(turnId
+      ? { turnKey: opaqueKey(`turn:${harnessId}`, `${sessionId}\0${turnId}`) }
+      : {}),
     ...(toolName ? { toolName } : {}),
     ...(agentType ? { agentType } : {}),
     ...(notificationType ? { notificationType } : {}),
-    ...(() => {
-      const final = extractBoolean(input, ["final", "is_final", "isFinal"]);
-      return final === undefined ? {} : { final };
-    })(),
+    ...(final === undefined ? {} : { final }),
   };
 }
 
@@ -336,6 +367,10 @@ export function harnessHookEventSummary(
       break;
     case "PreVerify":
       summary = "tool: verify";
+      break;
+    case "ErrorOccurred":
+      type = "error.occurred";
+      isError = true;
       break;
     case "StopFailure":
       type = "turn.failed";
