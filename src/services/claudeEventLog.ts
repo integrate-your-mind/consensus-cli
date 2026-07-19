@@ -6,9 +6,9 @@ import {
   rename,
   stat,
   writeFile,
-} from "fs/promises";
-import { homedir } from "os";
-import path from "path";
+} from "node:fs/promises";
+import { homedir } from "node:os";
+import path from "node:path";
 import type { ClaudeEvent } from "../claude/types.js";
 import {
   CLAUDE_STALE_TTL_MS,
@@ -22,16 +22,24 @@ import {
 const DEFAULT_EVENT_LOG_MAX_BYTES = 1024 * 1024;
 const MAX_SEEN_STORED_EVENTS = 5000;
 const seenStoredEvents = new Set<string>();
+let seenEventLogPath: string | undefined;
 let persistenceQueue: Promise<void> = Promise.resolve();
 
-function rememberStoredEvent(key: string): void {
-  if (seenStoredEvents.has(key)) return;
+function useSeenEventLogPath(filePath: string): void {
+  if (seenEventLogPath === filePath) return;
+  seenStoredEvents.clear();
+  seenEventLogPath = filePath;
+}
+
+function rememberStoredEvent(key: string): boolean {
+  if (seenStoredEvents.has(key)) return false;
   seenStoredEvents.add(key);
   while (seenStoredEvents.size > MAX_SEEN_STORED_EVENTS) {
     const oldest = seenStoredEvents.values().next().value;
     if (typeof oldest !== "string") break;
     seenStoredEvents.delete(oldest);
   }
+  return true;
 }
 
 function resolveEventLogPath(): string | undefined {
@@ -41,7 +49,7 @@ function resolveEventLogPath(): string | undefined {
     if (lowered === "0" || lowered === "false" || lowered === "off") {
       return undefined;
     }
-    return configured;
+    return path.resolve(configured);
   }
   return path.join(homedir(), ".consensus", "claude-events.jsonl");
 }
@@ -50,6 +58,13 @@ function resolveEventLogMaxBytes(): number {
   const parsed = Number(process.env.CONSENSUS_CLAUDE_EVENT_LOG_MAX_BYTES);
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_EVENT_LOG_MAX_BYTES;
   return Math.max(64 * 1024, Math.floor(parsed));
+}
+
+function newestCompleteLines(buffer: Buffer, keepBytes: number): Buffer {
+  if (buffer.length <= keepBytes) return buffer;
+  const tail = buffer.subarray(Math.max(0, buffer.length - keepBytes));
+  const firstNewline = tail.indexOf(0x0a);
+  return firstNewline >= 0 ? tail.subarray(firstNewline + 1) : Buffer.alloc(0);
 }
 
 async function trimEventLog(filePath: string, maxBytes: number): Promise<void> {
@@ -61,24 +76,21 @@ async function trimEventLog(filePath: string, maxBytes: number): Promise<void> {
   }
   if (info.size <= maxBytes) return;
 
-  const content = await readFile(filePath, "utf8");
-  const keepCharacters = Math.max(32 * 1024, Math.floor(maxBytes / 2));
-  let trimmed = content.slice(-keepCharacters);
-  if (trimmed.length < content.length) {
-    const firstNewline = trimmed.indexOf("\n");
-    if (firstNewline >= 0) trimmed = trimmed.slice(firstNewline + 1);
-  }
+  const content = await readFile(filePath);
+  const keepBytes = Math.max(32 * 1024, Math.floor(maxBytes / 2));
+  const trimmed = newestCompleteLines(content, keepBytes);
   const tempPath = `${filePath}.tmp-${Date.now()}-${Math.random()
     .toString(16)
     .slice(2)}`;
-  await writeFile(tempPath, trimmed, { encoding: "utf8", mode: 0o600 });
+  await writeFile(tempPath, trimmed, { mode: 0o600 });
   await rename(tempPath, filePath);
   await chmod(filePath, 0o600).catch(() => undefined);
 }
 
-async function persistStoredEvent(event: StoredClaudeEvent): Promise<void> {
-  const filePath = resolveEventLogPath();
-  if (!filePath) return;
+async function persistStoredEvent(
+  filePath: string,
+  event: StoredClaudeEvent
+): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   await appendFile(filePath, `${JSON.stringify(event)}\n`, {
     encoding: "utf8",
@@ -90,12 +102,18 @@ async function persistStoredEvent(event: StoredClaudeEvent): Promise<void> {
 
 export function queueClaudeEventPersistence(event: ClaudeEvent): Promise<void> {
   const stored = toStoredClaudeEvent(event);
-  if (!stored) return persistenceQueue;
+  const filePath = resolveEventLogPath();
+  if (!stored || !filePath) return persistenceQueue;
+
+  useSeenEventLogPath(filePath);
   const key = storedClaudeEventKey(stored);
-  rememberStoredEvent(key);
+  if (!rememberStoredEvent(key)) return persistenceQueue;
+
   persistenceQueue = persistenceQueue
-    .then(() => persistStoredEvent(stored))
-    .catch(() => undefined);
+    .then(() => persistStoredEvent(filePath, stored))
+    .catch(() => {
+      seenStoredEvents.delete(key);
+    });
   return persistenceQueue;
 }
 
@@ -108,6 +126,8 @@ export async function readStoredClaudeEvents(): Promise<
 > {
   const filePath = resolveEventLogPath();
   if (!filePath) return [];
+  useSeenEventLogPath(filePath);
+
   let input: string;
   try {
     input = await readFile(filePath, "utf8");
@@ -132,8 +152,7 @@ export async function readStoredClaudeEvents(): Promise<
   const result: Array<{ event: ClaudeEvent; cwdKey?: string }> = [];
   for (const stored of storedEvents) {
     const key = storedClaudeEventKey(stored);
-    if (seenStoredEvents.has(key)) continue;
-    rememberStoredEvent(key);
+    if (!rememberStoredEvent(key)) continue;
     result.push({ event: fromStoredClaudeEvent(stored), cwdKey: stored.cwdKey });
   }
   return result;
