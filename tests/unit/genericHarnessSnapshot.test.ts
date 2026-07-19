@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { attachGenericHarnessProcesses } from "../../src/genericHarnessSnapshot.js";
 import { buildAgentGraph } from "../../src/graph.js";
+import { harnessCwdKey, harnessSessionKey } from "../../src/harnessKeys.js";
 import type { SnapshotPayload } from "../../src/types.js";
 
 const emptySnapshot: SnapshotPayload = {
@@ -14,7 +15,11 @@ describe("generic harness snapshot", () => {
     const snapshot = await attachGenericHarnessProcesses(emptySnapshot, {
       now: 10_000,
       processes: [
-        { pid: 10, name: "openclaw", cmd: "openclaw agent --cwd /tmp/project" },
+        {
+          pid: 10,
+          name: "openclaw",
+          cmd: "openclaw agent --cwd /tmp/project --session session-1",
+        },
         { pid: 11, name: "droid", cmd: "droid" },
         { pid: 12, name: "node", cmd: "node server.js" },
       ],
@@ -30,9 +35,29 @@ describe("generic harness snapshot", () => {
     assert.equal(openclaw?.kind, "openclaw-cli");
     assert.equal(openclaw?.state, "active");
     assert.equal(openclaw?.repo, "project");
-    assert.equal(openclaw?.identity, "openclaw:pid:10");
+    assert.equal(openclaw?.startedAt, 8);
+    assert.equal(openclaw?.identity, "openclaw:pid:10:start:8");
+    assert.equal(
+      openclaw?.harnessCwdKey,
+      harnessCwdKey("openclaw", "/tmp/project")
+    );
+    assert.equal(
+      openclaw?.harnessSessionKey,
+      harnessSessionKey("openclaw", "session-1")
+    );
     assert.equal(factory?.kind, "factory-cli");
     assert.equal(factory?.state, "idle");
+  });
+
+  it("clamps impossible process start times instead of exporting negatives", async () => {
+    const snapshot = await attachGenericHarnessProcesses(emptySnapshot, {
+      now: 1_000,
+      processes: [{ pid: 15, name: "droid", cmd: "droid" }],
+      usage: { 15: { cpu: 0, memory: 0, elapsed: 10_000 } },
+    });
+
+    assert.equal(snapshot.agents[0].startedAt, 0);
+    assert.equal(snapshot.agents[0].identity, "factory:pid:15:start:0");
   });
 
   it("does not duplicate a process already represented by a specialized adapter", async () => {
