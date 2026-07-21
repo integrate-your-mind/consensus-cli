@@ -1,5 +1,5 @@
 import type { AgentSnapshot } from '../types';
-import { agentIdentity, labelFor, truncate } from '../lib/format';
+import { agentIdentity, labelFor, truncate, formatRelativeTime } from '../lib/format';
 import { accentFor, accentSoftFor, cliForAgent } from '../lib/palette';
 
 interface AgentListItemProps {
@@ -12,6 +12,12 @@ export function AgentListItem({ agent, isSelected, onClick }: AgentListItemProps
   const doingRaw = agent.summary?.current || agent.doing || agent.cmdShort || '';
   const doing = truncate(doingRaw, 80);
   const label = labelFor(agent);
+  const eventCount = agent.events?.length ?? 0;
+  const relTime = formatRelativeTime(agent.lastActivityAt ?? agent.lastEventAt);
+  const meta = doing || [
+    eventCount > 0 ? `${eventCount} events` : null,
+    relTime,
+  ].filter((x): x is string => x !== null).join(' · ');
   const accent = accentFor(agent);
   const accentGlow = accentSoftFor(agent);
   const cli = cliForAgent(agent);
@@ -36,7 +42,7 @@ export function AgentListItem({ agent, isSelected, onClick }: AgentListItemProps
       <div className={`lane-pill ${agent.state}`} />
       <div className="lane-copy">
         <div className="lane-label">{label}</div>
-        <div className="lane-meta">{doing}</div>
+        <div className="lane-meta">{meta}</div>
       </div>
     </button>
   );

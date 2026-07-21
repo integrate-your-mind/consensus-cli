@@ -407,6 +407,35 @@ body {
   }
 }
 
+.lane-item.is-skeleton {
+  pointer-events: none;
+  opacity: 0.5;
+}
+
+.lane-skel {
+  border-radius: 4px;
+  background: rgba(62, 78, 89, 0.5);
+  animation: laneSkelPulse 1.5s ease-in-out infinite;
+  height: 13px;
+  width: 75%;
+}
+
+.lane-skel-short {
+  width: 50%;
+  height: 11px;
+}
+
+@keyframes laneSkelPulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 0.7; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lane-skel {
+    animation: none;
+  }
+}
+
 .lane-copy {
   display: flex;
   flex-direction: column;
