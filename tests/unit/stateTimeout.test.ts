@@ -223,6 +223,37 @@ test("turnOpen suppresses stale timeout until an explicit end marker arrives", a
   );
 });
 
+test("stale turnOpen markers expire even when state.inFlight is false", async () => {
+  await withEnv(
+    {
+      CONSENSUS_CODEX_INFLIGHT_TIMEOUT_MS: "80",
+      CONSENSUS_CODEX_SIGNAL_MAX_AGE_MS: "50",
+      CONSENSUS_CODEX_FILE_FRESH_MS: "0",
+      CONSENSUS_CODEX_STALE_FILE_MS: "0",
+    },
+    async () => {
+      const { sessionPath, cleanup } = await setupSessionFile();
+      try {
+        const ts = Date.now() - 200;
+        await appendFile(sessionPath, makeEvent({ type: "turn.started", ts }), "utf8");
+
+        const first = await updateTail(sessionPath);
+        assert.ok(first);
+        assert.equal(first.turnOpen, true);
+        assert.equal(summarizeTail(first).inFlight, true);
+
+        await sleep(140);
+        const second = await updateTail(sessionPath);
+        assert.ok(second);
+        assert.equal(second.turnOpen, false);
+        assert.equal(summarizeTail(second).inFlight, undefined);
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+});
+
 test("assistant message acts as an end marker for TUI sessions (no explicit completion events)", async () => {
   await withEnv(
     {

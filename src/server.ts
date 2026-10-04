@@ -636,9 +636,6 @@ function checkScanStall(): void {
 
 async function tick(): Promise<void> {
   if (scanning) return;
-  if (!codexWatcher && fs.existsSync(codexSessionsDir)) {
-    startCodexWatcher();
-  }
   const mode = pendingMode ?? "fast";
   const includeActivity = true;
   pendingMode = null;

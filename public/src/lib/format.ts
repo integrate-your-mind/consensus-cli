@@ -66,7 +66,8 @@ export function labelFor(agent: AgentSnapshot): string {
     isCodex && !!title && (looksLikeTempPath || looksLikeTurnMarker || looksTooLong);
   if (title && !shouldIgnoreTitle) return title;
   if (agent.repo) return agent.repo;
-  return `codex#${agent.pid}`;
+  if (typeof agent.pid === 'number') return `codex#${agent.pid}`;
+  return agent.id || agent.identity || agent.sessionPath || 'codex';
 }
 
 export function formatDate(timestamp: number | undefined): string | null {

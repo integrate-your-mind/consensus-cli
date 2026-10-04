@@ -40,6 +40,14 @@ async function tmuxNewSession(session: string, command: string): Promise<void> {
   ]);
 }
 
+async function tmuxSendPrompt(session: string, prompt: string): Promise<void> {
+  // Codex TUI: `Tab` queues the message; `Enter` submits the queued message.
+  // (The shortcuts pane shows `ctrl + j` for newline, so `Enter` is not a newline.)
+  await execFileAsync("tmux", ["send-keys", "-t", session, "-l", prompt]);
+  await execFileAsync("tmux", ["send-keys", "-t", session, "Tab"]);
+  await execFileAsync("tmux", ["send-keys", "-t", session, "Enter"]);
+}
+
 async function tmuxKill(session: string): Promise<void> {
   try {
     await execFileAsync("tmux", ["kill-session", "-t", session]);
@@ -65,7 +73,7 @@ function codexCommand(cwd: string, prompt?: string): string {
   return parts.join(" ");
 }
 
-test("live demo: 3 codex TUI sessions go idle -> active -> idle (30s capture)", async ({ page }, testInfo) => {
+test("live demo: 3 codex TUI sessions go idle -> active -> idle -> gone (30s capture)", async ({ page }, testInfo) => {
   test.setTimeout(240_000);
 
   if (process.env.RUN_LIVE_CODEX !== "1") {
@@ -120,32 +128,51 @@ test("live demo: 3 codex TUI sessions go idle -> active -> idle (30s capture)", 
     await sleep(2000);
 
     const promptA = [
-      "Run bash: sleep 2.",
+      "Run bash: sleep 1.",
       "Then run bash: ls.",
       'Then reply with exactly: "A done".',
     ].join(" ");
     const promptB = [
-      "Run bash: sleep 3.",
+      "Run bash: sleep 1.",
       'Then run bash: echo "search 1 completed".',
       'Then reply with exactly: "B done".',
     ].join(" ");
     const promptC = [
-      "Run bash: sleep 4.",
+      "Run bash: sleep 1.",
       "Then run bash: pwd.",
       'Then reply with exactly: "C done".',
     ].join(" ");
 
-    // Start three interactive Codex TUI sessions with an initial prompt.
-    // This avoids relying on UI keybindings for "submit" in the TUI.
-    await tmuxNewSession(sessions.a, codexCommand(dirs.a, promptA));
-    await tmuxNewSession(sessions.b, codexCommand(dirs.b, promptB));
-    await tmuxNewSession(sessions.c, codexCommand(dirs.c, promptC));
+    // Start three interactive Codex TUI sessions without prompting.
+    // The demo video should show:
+    // 1) empty (no sessions)
+    // 2) idle sessions (Codex started but not working yet)
+    // 3) active while tools run
+    // 4) idle after completion
+    // 5) gone after termination
+    await tmuxNewSession(sessions.a, codexCommand(dirs.a));
+    await tmuxNewSession(sessions.b, codexCommand(dirs.b));
+    await tmuxNewSession(sessions.c, codexCommand(dirs.c));
 
-    // Wait for agents to appear in the UI list (server side polling is 250ms).
-    // Note: if OpenCode is enabled, this list may contain non-Codex sessions too.
+    // Wait for sessions to appear in the UI list (server side polling is 250ms).
     await page.waitForFunction(() => {
       return document.querySelectorAll("#active-list .lane-item").length >= 3;
     }, undefined, { timeout: 30_000 });
+
+    // Capture the "idle sessions" state briefly before triggering prompts.
+    await page.waitForFunction(() => {
+      return (
+        document.querySelectorAll('#active-list .lane-item[aria-busy="true"]')
+          .length === 0
+      );
+    }, undefined, { timeout: 30_000 });
+    await sleep(2000);
+
+    // Trigger work in each session by sending a prompt via tmux.
+    // This exercises the same path as a user typing into the TUI.
+    await tmuxSendPrompt(sessions.a, promptA);
+    await tmuxSendPrompt(sessions.b, promptB);
+    await tmuxSendPrompt(sessions.c, promptC);
 
     // Ensure each session becomes active at least once.
     await page.evaluate(() => {
@@ -170,7 +197,18 @@ test("live demo: 3 codex TUI sessions go idle -> active -> idle (30s capture)", 
     }, undefined, { timeout: 120_000 });
 
     // Keep the capture running long enough to visually confirm idle state.
-    await sleep(10_000);
+    await sleep(2000);
+
+    // Terminate sessions and ensure they are removed from the UI (gone).
+    await tmuxKill(sessions.a);
+    await tmuxKill(sessions.b);
+    await tmuxKill(sessions.c);
+    await page.waitForFunction(() => {
+      return document.querySelectorAll("#active-list .lane-item").length === 0;
+    }, undefined, { timeout: 30_000 });
+
+    // Keep the capture running long enough to visually confirm the empty state.
+    await sleep(2000);
 
     const elapsed = Date.now() - demoStartedAt;
     if (elapsed < 30_000) {
