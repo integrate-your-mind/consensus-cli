@@ -174,7 +174,7 @@ gwt() {
 
   "$mkdir_bin" -p "$wt_root" || return 1
 
-  "$git_bin" worktree add -b "$branch" "$path" HEAD || return 1
+  HUSKY=0 "$git_bin" worktree add -b "$branch" "$path" HEAD || return 1
 
   cd "$path" || return 1
 }

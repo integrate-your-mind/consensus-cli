@@ -853,9 +853,15 @@ async function updateTailLegacy(
     if (process.env.CODEX_TEST_HOOKS === "1") {
       "TEST_HOOK_EXPIRE_CHECK";
     }
-    if (!state.inFlight && !state.pendingEndAt) return;
     if (!Number.isFinite(inflightTimeoutMs) || inflightTimeoutMs <= 0) return;
     const openCallCount = (state.openCallIds?.size ?? 0) + (state.openItemCount ?? 0);
+    const hasMarkers =
+      !!state.inFlight ||
+      typeof state.pendingEndAt === "number" ||
+      !!state.reviewMode ||
+      !!state.turnOpen ||
+      openCallCount > 0;
+    if (!hasMarkers) return;
     if (state.pendingEndAt) {
       if (openCallCount > 0) return;
       // Use event timestamps (not ingest time) so we don't cancel the end marker
@@ -877,36 +883,35 @@ async function updateTailLegacy(
       }
       return;
     }
-    if (state.reviewMode) return;
-    if (state.turnOpen) return;
-    if (openCallCount > 0) return;
-    if (state.lastEndAt) {
-      state.inFlight = false;
-      state.inFlightStart = false;
-      state.pendingEndAt = undefined;
-      clearActivitySignals();
-      return;
+    // Preserve existing behavior for live sessions: while a turn is explicitly open or
+    // tools are still running, don't time out. (Unit tests rely on this.)
+    if (state.inFlight) {
+      if (state.reviewMode) return;
+      if (state.turnOpen) return;
+      if (openCallCount > 0) return;
+      if (state.lastEndAt) {
+        state.inFlight = false;
+        state.inFlightStart = false;
+        state.pendingEndAt = undefined;
+        clearActivitySignals();
+        return;
+      }
     }
     const lastSignal =
       state.lastInFlightSignalAt ??
       state.lastIngestAt ??
       state.lastActivityAt ??
       state.lastEventAt;
-    if (
-      typeof lastSignal === "number" &&
-      nowMs - lastSignal >= inflightTimeoutMs
-    ) {
+    if (typeof lastSignal !== "number") {
+      // No timestamp anchor; clear markers rather than getting stuck active.
+      finalizeEnd(nowMs, { clearReview: true });
+      return;
+    }
+    if (nowMs - lastSignal >= inflightTimeoutMs) {
       if (process.env.CODEX_TEST_HOOKS === "1") {
         "TEST_HOOK_EXPIRE_TIMEOUT";
       }
-      state.inFlight = false;
-      state.inFlightStart = false;
-      state.turnOpen = false;
-      state.pendingEndAt = undefined;
-      state.lastEndAt = nowMs;
-      clearActivitySignals();
-      if (state.openCallIds) state.openCallIds.clear();
-      state.openItemCount = 0;
+      finalizeEnd(nowMs, { clearReview: true });
     }
   };
 
